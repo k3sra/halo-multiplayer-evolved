@@ -91,7 +91,8 @@ set SOURCES=^
  "%ROOT%src\Lobby\LobbyManager.cpp"^
  "%ROOT%src\Map\MapVariant.cpp"^
  "%ROOT%src\Map\MapVariantParser.cpp"^
- "%ROOT%src\Map\MapVariantInjector.cpp"
+ "%ROOT%src\Map\MapVariantInjector.cpp"^
+ "%ROOT%src\Update\UpdateCheck.cpp"
 
 echo.
 echo === Building ForgeEvolved.dll (%CONFIG%) ===

@@ -38,6 +38,7 @@
 #include "Unreal/FNameTrampoline.h"
 #include "Unreal/GameThread.h"
 #include "Unreal/LobbyUI.h"
+#include "Update/UpdateCheck.h"
 #include "Engine/InertEngineControl.h"
 #include "Lobby/LobbyManager.h"
 #include "Lobby/SteamMatchmakingHooks.h"
@@ -256,7 +257,40 @@ bool g_invite_pending = false;
 constexpr const char* kModVersion = "0.1.0";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
+///
+/// Written by a one shot background thread and read by the status panel, so it is guarded
+/// rather than shared raw: the two run on different threads from the moment the check
+/// starts.
+std::mutex  g_version_mutex;
 std::string g_latest_version;
+
+/// Where releases are published. A mod that talks to other players is only useful when
+/// everyone agrees on the protocol, so an out of date copy is worth saying out loud.
+constexpr const char* kReleaseRepository = "k3sra/halo-multiplayer-evolved";
+
+/// Asks GitHub for the newest release, once, off the game's threads.
+///
+/// Failure is not reported to the player. Being unable to reach GitHub means the version is
+/// unknown, not that anything is wrong, and a mod that complains about its own update check
+/// on a flaky connection is worse than one that stays quiet.
+void StartUpdateCheck() {
+    std::thread([] {
+        const Expected<update::ReleaseInfo> release =
+            update::FetchLatestRelease(kReleaseRepository);
+        if (!release.ok()) {
+            FE_LOG_INFO("update check skipped: {}", release.message());
+            return;
+        }
+        std::lock_guard lock(g_version_mutex);
+        g_latest_version = release.value().version;
+        if (update::IsNewer(g_latest_version, kModVersion)) {
+            FE_LOG_INFO("an update is available: {} (this build is {})", g_latest_version,
+                        kModVersion);
+        } else {
+            FE_LOG_INFO("this build is current ({})", kModVersion);
+        }
+    }).detach();
+}
 
 /// The campaign asset a match is begun against.
 ///
@@ -1325,9 +1359,14 @@ void RefreshLobbyStatus() {
         status.invitable = false;
     }
 
-    status.update_available = !g_latest_version.empty() && g_latest_version != kModVersion;
+    std::string latest;
+    {
+        std::lock_guard lock(g_version_mutex);
+        latest = g_latest_version;
+    }
+    status.update_available = !latest.empty() && update::IsNewer(latest, kModVersion);
     status.version = status.update_available
-                         ? std::format("v{}  UPDATE {} READY", kModVersion, g_latest_version)
+                         ? std::format("v{}  UPDATE {} READY", kModVersion, latest)
                          : std::format("v{}  UP TO DATE", kModVersion);
 
     unreal::LobbyUIContext ui = g_lobby_ui;
@@ -2580,6 +2619,10 @@ void Initialize() {
 
     FE_LOG_INFO("ForgeEvolved ready ({})",
                 network_failure.empty() ? "lobby available" : "lobby unavailable");
+
+    // Asked once, in the background. The answer is only used to tell the player their copy
+    // is behind, so nothing waits on it.
+    StartUpdateCheck();
 
     // Engine binding last. Waiting for the module is lock free; only the commit takes
     // the lock, and it must happen with the ModuleImage already in its final home
