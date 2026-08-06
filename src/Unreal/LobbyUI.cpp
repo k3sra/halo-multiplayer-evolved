@@ -2173,15 +2173,18 @@ Result BuildStatusOverlay(const LobbyUIContext& context) {
     constexpr float kTextX  = 1414.0F;
     constexpr float kTextW  = 452.0F;
 
-    (void)builder.Panel(root, kPanelX, 20.0F, kPanelW, kPanelH, kStatusPanel);
+    const std::uintptr_t status_panel =
+        builder.Panel(root, kPanelX, 20.0F, kPanelW, kPanelH, kStatusPanel);
     // A rule down the left edge, because a translucent panel over a starfield has no edge
     // of its own to read against and simply disappears.
-    (void)builder.Panel(root, kPanelX, 20.0F, 3.0F, kPanelH, kAccent);
+    const std::uintptr_t status_rule =
+        builder.Panel(root, kPanelX, 20.0F, 3.0F, kPanelH, kAccent);
 
     // The mod's own name, so a player who has forgotten what put this here can tell.
-    (void)builder.Text(root, kTextX, 28.0F, kTextW, 26.0F, "MULTIPLAYER EVOLVED", kAccent,
-                       18.0F);
-    (void)builder.Panel(root, kTextX, 56.0F, kTextW - 8.0F, 2.0F, kAccentDim);
+    const std::uintptr_t status_title = builder.Text(
+        root, kTextX, 28.0F, kTextW, 26.0F, "MULTIPLAYER EVOLVED", kAccent, 18.0F);
+    const std::uintptr_t status_divider =
+        builder.Panel(root, kTextX, 56.0F, kTextW - 8.0F, 2.0F, kAccentDim);
 
     for (std::size_t line = 0; line < kStatusLines; ++line) {
         g_status_line[line] =
@@ -2203,6 +2206,17 @@ Result BuildStatusOverlay(const LobbyUIContext& context) {
     for (const std::uintptr_t widget : {g_notice_panel, g_notice_rule, g_notice_title,
                                         g_notice_detail[0], g_notice_detail[1]}) {
         builder.SetVisibilityOf(widget, kCollapsedValue);
+    }
+
+    // Nothing in this overlay is clickable, so nothing in it may absorb a click.
+    //
+    // A Border is Visible by default, which means it hit tests itself. Two panels sitting
+    // in the top corners of a full screen canvas would quietly eat every press that landed
+    // on them, and this overlay is above the lobby, so it would be eating the lobby's.
+    // That exact mistake has killed the main menu twice.
+    for (const std::uintptr_t widget : {status_panel, status_rule, status_title,
+                                        status_divider}) {
+        builder.SetVisibilityOf(widget, kHitTestInvisible);
     }
 
     g_status_root = root;
