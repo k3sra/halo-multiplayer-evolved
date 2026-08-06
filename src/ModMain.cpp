@@ -1762,6 +1762,7 @@ void RefreshLobbyStatus() {
     status.online = steam::IsInitialized() && steam::IsLoggedOn();
     /// Why the session failed, when it has. Read under the lock, shown outside it.
     std::string session_error;
+    bool        faulted = false;
 
     {
         std::lock_guard lock(g_state_mutex);
@@ -1819,6 +1820,7 @@ void RefreshLobbyStatus() {
                     // panel, which has the width to show all of it.
                     status.session = "ERROR";
                     session_error  = snapshot.last_error;
+                    faulted        = true;
                     break;
             }
 
@@ -1847,6 +1849,37 @@ void RefreshLobbyStatus() {
     if (!status.online) {
         status.session   = "OFFLINE";
         status.invitable = false;
+    }
+
+    // A dead session recovers on its own, with the player watching it happen.
+    //
+    // When the host leaves, the client faults and the manager stays faulted forever: the
+    // error stayed on screen and there was no session left to be in, so the lobby was a
+    // screen showing a failure with nothing to do about it but press BACK.
+    //
+    // The failure is worth reading, so it is left up for a few seconds and counted down
+    // rather than cleared instantly, and then this machine hosts its own session again.
+    // That is the state a player expects to land in: their own empty lobby, ready to
+    // invite somebody, exactly as if they had just opened the screen.
+    constexpr auto kFaultLinger = std::chrono::seconds(10);
+    static std::chrono::steady_clock::time_point s_faulted_at{};
+    bool                                         recover_now = false;
+    if (faulted) {
+        if (s_faulted_at == std::chrono::steady_clock::time_point{}) {
+            s_faulted_at = now;
+        }
+        const auto elapsed = now - s_faulted_at;
+        if (elapsed >= kFaultLinger) {
+            recover_now = true;
+        } else {
+            const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                                  kFaultLinger - elapsed)
+                                  .count() +
+                              1;
+            session_error += std::format("  Starting your own session in {}s.", left);
+        }
+    } else {
+        s_faulted_at = {};
     }
 
     std::string latest;
@@ -1893,6 +1926,21 @@ void RefreshLobbyStatus() {
         return;
     }
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyStatus(ui, status); }, 5000);
+
+    // Done last, and outside the state lock, because both of these take it themselves.
+    // The status above is written first so the final second of the countdown is drawn
+    // before the session it describes is replaced.
+    if (recover_now) {
+        s_faulted_at = {};
+        MPE_LOG_INFO("the session failed; leaving it and hosting a new one");
+        {
+            std::lock_guard lock(g_state_mutex);
+            if (g_state && g_state->manager) {
+                g_state->manager->LeaveSession();
+            }
+        }
+        EnsureSessionHosted();
+    }
 }
 
 /// Applies the current filter to the live listing and rewrites the table.
