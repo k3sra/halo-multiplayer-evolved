@@ -17,19 +17,17 @@
 // AUTHORITY MODEL
 //
 // The host is authoritative over everything a player can see: roster, settings,
-// ready state, map selection, countdown, launch. A client never mutates shared
+// map selection, countdown, launch. A client never mutates shared
 // state directly; it sends a request and waits for the host's snapshot to come
-// back. That is why ReadyStateChange is a request rather than an assignment, and
-// why RosterUpdate is a full snapshot rather than a delta. A client that tries to
+// back. That is why RosterUpdate is a full snapshot rather than a delta. A client that tries to
 // act with authority is disconnected by the protocol gate in PacketProtocol
 // before its message body is even parsed.
 //
 // LAUNCH SEQUENCE, mirroring the original Combat Evolved transition
 //
-//   1. Host verifies every peer is ready and holds the selected map.
-//   2. Host broadcasts LaunchCountdown once per second. Any peer going unready,
-//      any peer losing the map, or any peer disconnecting cancels it with a
-//      reason everyone sees.
+//   1. Host verifies every peer holds the selected map.
+//   2. Host broadcasts LaunchCountdown once per second. Any peer losing the map
+//      or disconnecting cancels it with a reason everyone sees.
 //   3. At zero the host broadcasts LaunchNow carrying the scenario, the map
 //      content hash and a shared random seed, then begins loading itself.
 //   4. Every peer loads and reports LoadProgress. Nobody starts simulating.
@@ -76,7 +74,7 @@ enum class LobbyPhase : std::uint8_t {
     Joining,         ///< Client: entering the platform lobby.
     Connecting,      ///< Client: transport connecting to the host.
     Handshaking,     ///< Client: transport up, awaiting HandshakeAccept.
-    InLobby,         ///< Client: in the lobby, choosing ready state.
+    InLobby,         ///< Client: in the lobby, waiting for the host to start.
     Countdown,       ///< Launch countdown running.
     Loading,         ///< Every peer loading the scenario.
     InMatch,
@@ -86,8 +84,7 @@ enum class LobbyPhase : std::uint8_t {
 
 [[nodiscard]] std::string_view ToString(LobbyPhase phase) noexcept;
 
-/// One player as the lobby sees them. Merges platform identity with transport
-/// and readiness state.
+/// One player as the lobby sees them. Merges platform identity with transport state.
 struct PlayerSlot {
     PlatformId       platform_id{0};
     std::string      display_name;
@@ -96,7 +93,9 @@ struct PlayerSlot {
     std::uint8_t     team{0};
     bool             is_host{false};
     bool             is_local{false};
-    bool             is_ready{false};
+    /// Always true. Readiness was removed and this is kept only because the roster
+    /// carries one byte for it on the wire, which an older build still expects.
+    bool             is_ready{true};
     bool             has_map{false};
     float            load_progress{0.0f};
     std::uint16_t    ping_milliseconds{0};
@@ -114,6 +113,8 @@ struct LobbySnapshot {
     std::string              last_error;       ///< Empty when there is no error.
     float                    map_transfer_progress{0.0f}; ///< Zero to one.
 
+    /// Both are now trivially true. Readiness was removed: everybody in a session is
+    /// ready, always. Kept because callers outside this file still ask.
     [[nodiscard]] std::size_t ReadyCount() const noexcept;
     [[nodiscard]] bool EveryoneReady() const noexcept;
 };
@@ -186,6 +187,8 @@ public:
     /// Tears down cleanly from any phase, including Faulted. Idempotent.
     void LeaveSession();
 
+    /// Does nothing. Readiness was removed; everybody in a session is ready, always.
+    /// Kept so an older caller still links.
     [[nodiscard]] Result SetLocalReady(bool ready);
     [[nodiscard]] Result SendChat(std::string_view text);
     [[nodiscard]] Result OpenInviteOverlay();

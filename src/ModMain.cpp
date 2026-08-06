@@ -99,9 +99,9 @@ public:
     void OnSnapshotChanged(const lobby::LobbySnapshot& snapshot) override {
         // Logged at trace: this fires on every roster or progress change and would
         // drown the log at a higher level.
-        MPE_LOG_TRACE("snapshot: phase={} players={} ready={} countdown={} map={:.0f}%",
+        MPE_LOG_TRACE("snapshot: phase={} players={} countdown={} map={:.0f}%",
                      lobby::ToString(snapshot.phase), snapshot.players.size(),
-                     snapshot.ReadyCount(), snapshot.countdown_seconds,
+                     snapshot.countdown_seconds,
                      snapshot.map_transfer_progress * 100.0f);
     }
 
@@ -3908,16 +3908,16 @@ __declspec(dllexport) int MPE_LobbySelfTest(int timeout_seconds) {
         }
     }
 
-    // Member data is the path a ready flag travels before a transport connection
-    // exists, so it is worth proving too.
-    if (const mpe::Result member = backend->SetMemberData(mpe::lobby::keys::kMemberReady, "1");
-        member.ok()) {
+    // Member data still has to round trip, because the roster's display names travel that
+    // way before a transport connection exists. The key used to be a ready flag, which no
+    // longer exists, so the probe writes its own.
+    if (const mpe::Result member = backend->SetMemberData("mpe.probe", "1"); member.ok()) {
         const auto local = backend->LocalId();
         if (local.ok()) {
             const auto read_back =
-                backend->GetMemberData(local.value(), mpe::lobby::keys::kMemberReady);
+                backend->GetMemberData(local.value(), "mpe.probe");
             mpe::log::Write(mpe::log::Level::Info, "Mod",
-                           std::format("lobby self test:   member ready flag round trip: {}",
+                           std::format("lobby self test:   member data round trip: {}",
                                        read_back.ok() ? read_back.value() : "MISSING"));
             if (!read_back.ok()) {
                 ++failures;
