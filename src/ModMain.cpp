@@ -200,6 +200,7 @@ void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
 void PrepareLobby();
+void PrepareStatusOverlay();
 void InviteFriendAt(int row);
 void CloseInviteList();
 void PageFriendList(int direction);
@@ -730,6 +731,7 @@ void TickLoop() {
         // than a hundred widget creations. Called from here rather than from the entry
         // being added, because the buttons it creates can only be watched once the watch
         // they share a virtual table with exists, and that is established last.
+        PrepareStatusOverlay();
         PrepareLobby();
 
         // Kept current while a session is up: the name, mode and map a player picks have to
@@ -1749,7 +1751,11 @@ void RefreshLobbyRoster() {
 void RefreshLobbyStatus() {
     static auto s_last = std::chrono::steady_clock::time_point{};
 
-    if (!g_lobby_ui_ready || !unreal::LobbyIsBuilt() || g_lobby_root == 0) {
+    // Gated on the status overlay, not on the lobby.
+    //
+    // The panel is on the main menu too now, so waiting for the lobby to be built would
+    // leave it blank exactly where a player is most likely to be looking at it.
+    if (!g_lobby_ui_ready || !unreal::StatusOverlayIsBuilt()) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1823,6 +1829,37 @@ void RefreshLobbyStatus() {
                     faulted        = true;
                     break;
             }
+
+            // Who else is here, how far away they are, and what is being played.
+            //
+            // The ping shown is the round trip to the other side of the session, which is
+            // the only one a player can do anything about. A host measures each client
+            // once a second and reports the worst, because a lobby is only as good as its
+            // furthest member; a client is told its own by the host's roster, which is the
+            // same round trip seen from the other end.
+            //
+            // Left at minus one when this machine is alone, so the panel shows nothing
+            // rather than a made up zero.
+            for (const lobby::PlayerSlot& player : snapshot.players) {
+                if (player.is_host && !player.is_local) {
+                    status.host_name = player.display_name;
+                }
+                const bool remote = !player.is_local;
+                if (remote && player.ping_milliseconds > 0) {
+                    status.ping_ms = std::max(status.ping_ms,
+                                              static_cast<int>(player.ping_milliseconds));
+                }
+                if (player.is_local && !snapshot.is_host && player.ping_milliseconds > 0) {
+                    status.ping_ms = std::max(status.ping_ms,
+                                              static_cast<int>(player.ping_milliseconds));
+                }
+            }
+            if (snapshot.players.size() < 2) {
+                status.ping_ms = -1;
+            }
+
+            status.mode = engine::ToString(snapshot.settings.mode);
+            status.map  = snapshot.settings.scenario;
 
             // A phase that is going nowhere says so.
             //
@@ -2018,6 +2055,30 @@ void SelectLobbyMap(int map_index) {
 /// that when the player presses MULTIPLAYER is work they sit and wait through. Done here it
 /// happens while they are still looking at the main menu, and pressing the entry then costs
 /// one visibility change.
+/// Puts the status panel on screen, once, as soon as there is a menu to host it against.
+///
+/// Separate from the lobby because it outlives it: the panel reports on the mod rather than
+/// on whichever screen is showing, and a player on the main menu wants to know they are
+/// signed in and whether the build is current without opening anything.
+void PrepareStatusOverlay() {
+    if (!g_lobby_ui_ready || g_live_menu == 0 || unreal::StatusOverlayIsBuilt()) {
+        return;
+    }
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    Result outcome = Result::Success();
+    (void)unreal::RunOnGameThread([&]() { outcome = unreal::BuildStatusOverlay(ui); }, 10000);
+    if (!outcome.ok()) {
+        static bool s_complained = false;
+        if (!s_complained) {
+            s_complained = true;
+            MPE_LOG_WARN("the status overlay could not be built: {}", outcome.message());
+        }
+    }
+}
+
 void PrepareLobby() {
     if (!g_lobby_ui_ready || g_live_menu == 0 || unreal::LobbyIsBuilt()) {
         return;

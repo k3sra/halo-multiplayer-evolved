@@ -8,6 +8,10 @@
 #include "Unreal/GameThread.h"
 #include "Unreal/ProcessMemory.h"
 
+// For MultiByteToWideChar: Steam hands back UTF-8 and the engine's text wants UTF-16.
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -97,6 +101,9 @@ struct ServerRowWidgets {
     std::uintptr_t map{0};
     std::uintptr_t players{0};
     std::uintptr_t ping{0};
+    /// LOBBY or IN GAME, under the server's name. Small on purpose: it qualifies the row
+    /// rather than competing with it.
+    std::uintptr_t status{0};
 };
 constexpr std::size_t kServerRows = 8;
 ServerRowWidgets g_server_row[kServerRows];
@@ -108,8 +115,72 @@ std::uintptr_t g_filter_slots[3]  = {0, 0, 0};
 std::uintptr_t g_filter_ping[3]   = {0, 0, 0};
 std::uintptr_t g_empty_notice     = 0;
 
-/// The status panel's three lines, top right of the screen.
-std::uintptr_t g_status_line[3] = {0, 0, 0};
+/// The status panel's lines, top right of the screen.
+///
+/// Five now rather than three, at a smaller size in a wider box. Three lines of nineteen
+/// point in a box three hundred and ten points wide could not hold a sentence: a session
+/// line reading "CONNECTING TO HOST  STALLED" ran off the right of the screen, because a
+/// text block given more than it can draw simply keeps going.
+constexpr std::size_t kStatusLines = 5;
+std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0};
+
+/// Turns UTF-8 into the wide string the engine's text conversion expects.
+///
+/// Every one of these used to widen by casting each byte to a wchar_t. That is correct for
+/// ASCII and wrong for everything else: a Steam persona name is UTF-8, so a name with any
+/// character outside ASCII arrived as one garbage glyph per byte. A player called Nessie
+/// with decorated brackets around the name rendered as "£T? Nessie £T?" on the team card,
+/// which looks like the mod corrupting somebody's name, because it was.
+///
+/// Falls back to the old byte for byte widening only if the conversion fails outright,
+/// which keeps a name on screen rather than blanking the card.
+[[nodiscard]] std::wstring WidenUtf8(std::string_view text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int needed = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                             static_cast<int>(text.size()), nullptr, 0);
+    if (needed > 0) {
+        std::wstring wide(static_cast<std::size_t>(needed), wchar_t{});
+        if (::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                  wide.data(), needed) == needed) {
+            return wide;
+        }
+    }
+    std::wstring fallback;
+    fallback.reserve(text.size());
+    for (const char character : text) {
+        fallback.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
+    }
+    return fallback;
+}
+
+/// Green under a hundred, amber to a hundred and fifty, red past it.
+///
+/// The thresholds are what a player can feel rather than anything measured: under a
+/// hundred plays like a local game, past a hundred and fifty the shots stop landing where
+/// they were aimed. Shared with the server browser so a number means the same thing in
+/// both places.
+[[nodiscard]] LinearColour PingColour(int ping_ms) {
+    if (ping_ms < 0) {
+        return kTextDim;
+    }
+    if (ping_ms <= 100) {
+        return kGood;
+    }
+    if (ping_ms <= 150) {
+        return kWarn;
+    }
+    return kBad;
+}
+
+/// The overlay that carries the status and notice panels.
+///
+/// Its own viewport widget, above the lobby's and never hidden, so the panel is on the
+/// main menu as well as over the lobby.
+std::uintptr_t g_status_host    = 0;
+std::uintptr_t g_status_scaler  = 0;
+std::uintptr_t g_status_root    = 0;
 
 /// The notice panel, top left. Empty and collapsed unless there is something to say.
 ///
@@ -286,11 +357,7 @@ public:
         }
 
         if (context_.convert_function != 0 && context_.text_library != 0) {
-            std::wstring wide;
-            wide.reserve(label.size() + 1);
-            for (const char character : label) {
-                wide.push_back(static_cast<wchar_t>(character));
-            }
+            std::wstring wide = WidenUtf8(label);
             wide.push_back(L'\0');
             struct ConvertParameters {
                 struct {
@@ -369,11 +436,7 @@ public:
         if (button == 0 || context_.convert_function == 0 || context_.text_library == 0) {
             return;
         }
-        std::wstring wide;
-        wide.reserve(text.size() + 1);
-        for (const char character : text) {
-            wide.push_back(static_cast<wchar_t>(character));
-        }
+        std::wstring wide = WidenUtf8(text);
         wide.push_back(L'\0');
         struct ConvertParameters {
             struct {
@@ -417,11 +480,7 @@ public:
             context_.text_library == 0) {
             return;
         }
-        std::wstring wide;
-        wide.reserve(value.size() + 1);
-        for (const char character : value) {
-            wide.push_back(static_cast<wchar_t>(character));
-        }
+        std::wstring wide = WidenUtf8(value);
         wide.push_back(L'\0');
 
         struct ConvertParameters {
@@ -529,11 +588,7 @@ public:
     void SetFieldTextAt(std::uintptr_t field, std::uintptr_t offset,
                         std::string_view value) const {
         const std::uintptr_t kFieldText = offset;
-        std::wstring wide;
-        wide.reserve(value.size() + 1);
-        for (const char character : value) {
-            wide.push_back(static_cast<wchar_t>(character));
-        }
+        std::wstring wide = WidenUtf8(value);
         wide.push_back(L'\0');
         struct ConvertParameters {
             struct {
@@ -601,11 +656,7 @@ public:
         // ambiguity, and the offset comes from the class's own reflection.
         constexpr std::uintptr_t kTextOffset = 0x188;
 
-        std::wstring wide;
-        wide.reserve(value.size() + 1);
-        for (const char character : value) {
-            wide.push_back(static_cast<wchar_t>(character));
-        }
+        std::wstring wide = WidenUtf8(value);
 
         struct FStringLayout {
             wchar_t*     data;
@@ -909,6 +960,12 @@ void DrawBrowseTab(const Builder& builder, std::uintptr_t canvas, const LobbyVie
                                    kTextDim, 22.0F);
         row.ping    = builder.Text(canvas, columns[4], row_y + 18.0F, widths[4], 26.0F, "",
                                    kTextDim, 22.0F);
+
+        // Under the name rather than in a column of its own. The table is already as wide
+        // as the design allows, and this qualifies the server rather than being another
+        // field of it: a row that says IN GAME is the same server, differently joinable.
+        row.status  = builder.Text(canvas, columns[0] + 10.0F, row_y + 42.0F, widths[0],
+                                   20.0F, "", kTextDim, 15.0F);
         for (const std::uintptr_t block : {row.name, row.mode, row.map, row.players,
                                            row.ping}) {
             builder.SetVisibilityOf(block, kHitTestInvisible);
@@ -1228,7 +1285,18 @@ void UnfoldMenu(const LobbyUIContext& context) {
     g_folded.clear();
 }
 
-[[nodiscard]] std::uintptr_t CreateHostedCanvas(const LobbyUIContext& context) {
+/// Builds a design sized canvas, scales it to the viewport and adds it as a widget.
+///
+/// z_order decides what draws over what. The lobby sits at 1000; anything meant to stay
+/// visible while the lobby is hidden, and to sit above it while it is not, goes higher.
+///
+/// out_host receives the user widget the viewport holds, which is the handle for removing
+/// it again or changing its visibility. out_scaler receives the scale box, which is what
+/// reports the laid out size.
+[[nodiscard]] std::uintptr_t CreateHostedCanvasAt(const LobbyUIContext& context,
+                                                  std::int32_t          z_order,
+                                                  std::uintptr_t&       out_host,
+                                                  std::uintptr_t&       out_scaler) {
     constexpr std::uintptr_t kWidthOverride   = 0x190;
     constexpr std::uintptr_t kHeightOverride  = 0x194;
     constexpr std::uintptr_t kOverrideFlags   = 0x1B0;
@@ -1341,14 +1409,13 @@ void UnfoldMenu(const LobbyUIContext& context) {
     struct ViewportParameters {
         std::int32_t z_order;
     };
-    ViewportParameters viewport{1000};
+    ViewportParameters viewport{z_order};
     if (!CallFunction(created.return_value, context.add_to_viewport, &viewport).ok()) {
         MPE_LOG_WARN("the lobby host was not accepted by the viewport");
         return 0;
     }
-    g_open_host_widget = created.return_value;
-
-    g_open_lobby_widget = scaler;
+    out_host   = created.return_value;
+    out_scaler = scaler;
 
     // What the viewport is actually handing out, which is the number that decides whether
     // the design scales up or down. Guessing at this is what produced a half sized screen.
@@ -1381,7 +1448,8 @@ Result ProbeLobbyUI(const LobbyUIContext& context) {
     }
     RemoveLobbyUI(context);
 
-    const std::uintptr_t canvas = CreateHostedCanvas(context);
+    const std::uintptr_t canvas =
+        CreateHostedCanvasAt(context, 1000, g_open_host_widget, g_open_lobby_widget);
     if (canvas == 0) {
         return Result::Fail(ErrorCode::InvalidState, "could not host a canvas");
     }
@@ -1413,11 +1481,6 @@ void RemoveLobbyUI(const LobbyUIContext& context) {
     g_browse_tab        = 0;
     g_invite_panel      = 0;
     g_invite_open       = false;
-    g_notice_panel      = 0;
-    g_notice_rule       = 0;
-    g_notice_title      = 0;
-    g_notice_detail[0]  = 0;
-    g_notice_detail[1]  = 0;
     g_friend_empty      = 0;
     g_friend_page       = 0;
     for (FriendRowWidgets& row : g_friend_row) {
@@ -1774,7 +1837,8 @@ Result BuildLobbyUI(const LobbyUIContext& context, const LobbyView& view,
     // Parenting into the menu's own widget tree built the whole screen correctly, reported
     // success, and drew nothing. AddToViewport is the path already proven to put a widget
     // on screen in this game, so the lobby is shown the way the engine shows any screen.
-    const std::uintptr_t root = CreateHostedCanvas(context);
+    const std::uintptr_t root =
+        CreateHostedCanvasAt(context, 1000, g_open_host_widget, g_open_lobby_widget);
     if (root == 0) {
         return Result::Fail(ErrorCode::InvalidState,
                             "could not host the lobby canvas in a viewport widget");
@@ -1788,32 +1852,13 @@ Result BuildLobbyUI(const LobbyUIContext& context, const LobbyView& view,
     (void)builder.Backer(root, 620.0F, 40.0F, 680.0F, 80.0F, kPanelLight);
     (void)builder.Label(root, 640.0F, 36.0F, 640.0F, 88.0F, "MULTIPLAYER LOBBY");
 
-    // Status, top right. Built here rather than per tab, because it describes the session
-    // rather than whichever tab happens to be showing.
-    (void)builder.Panel(root, 1544.0F, 20.0F, 336.0F, 116.0F, kStatusPanel);
-    // A rule down the left edge, because a translucent panel over a starfield has no edge
-    // of its own to read against and simply disappears.
-    (void)builder.Panel(root, 1544.0F, 20.0F, 3.0F, 116.0F, kAccent);
-    for (std::size_t line = 0; line < std::size(g_status_line); ++line) {
-        g_status_line[line] =
-            builder.Text(root, 1562.0F, 32.0F + static_cast<float>(line) * 34.0F, 310.0F,
-                         30.0F, "", kText, 19.0F);
-    }
+    // The status panel is not built here.
+    //
+    // It reports on the mod, not on this screen, so it lives in its own overlay that is
+    // added to the viewport above the lobby and is never hidden. That is what puts it on
+    // the main menu as well, and it is why hiding the lobby no longer takes it away.
 
-    // The notice panel, opposite the status panel. Built collapsed; SetLobbyStatus is
-    // what decides whether there is anything to say.
-    g_notice_panel = builder.Panel(root, 44.0F, 20.0F, 560.0F, 122.0F, kStatusPanel);
-    g_notice_rule  = builder.Panel(root, 44.0F, 20.0F, 3.0F, 122.0F, kWarn);
-    g_notice_title = builder.Text(root, 62.0F, 30.0F, 530.0F, 32.0F, "", kWarn, 21.0F);
-    for (std::size_t line = 0; line < std::size(g_notice_detail); ++line) {
-        g_notice_detail[line] =
-            builder.Text(root, 62.0F, 66.0F + static_cast<float>(line) * 26.0F, 530.0F, 26.0F,
-                         "", kText, 17.0F);
-    }
-    for (const std::uintptr_t widget : {g_notice_panel, g_notice_rule, g_notice_title,
-                                        g_notice_detail[0], g_notice_detail[1]}) {
-        builder.SetVisibilityOf(widget, kCollapsedValue);
-    }
+    // The notice panel is built with the status overlay, for the same reason.
 
     // Tabs, as real buttons so they can be pressed rather than only looked at.
     out_controls.push_back({builder.Button(root, 520.0F, 122.0F, 440.0F, 66.0F, "HOST"),
@@ -2035,7 +2080,7 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
 
         builder.SetVisibilityOf(row.button, used ? kVisibleValue : kCollapsedValue);
         for (const std::uintptr_t block : {row.name, row.mode, row.map, row.players,
-                                           row.ping}) {
+                                           row.ping, row.status}) {
             builder.SetVisibilityOf(block, used ? kHitTestInvisible : kCollapsedValue);
         }
         builder.SetVisibilityOf(
@@ -2052,7 +2097,14 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
         builder.SetTextLive(row.map, entry.map);
         builder.SetTextLive(row.players,
                             std::format("{}/{}", entry.players, entry.capacity));
+
+        // The same thresholds and the same colours as the status panel, so a number means
+        // one thing wherever a player reads it.
         builder.SetTextLive(row.ping, std::format("{}ms", entry.ping));
+        builder.SetColourLive(row.ping, PingColour(entry.ping));
+
+        builder.SetTextLive(row.status, entry.status);
+        builder.SetColourLive(row.status, entry.status == "IN GAME" ? kWarn : kGood);
     }
 
     builder.SetVisibilityOf(g_empty_notice,
@@ -2080,28 +2132,139 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
     }
 }
 
+bool StatusOverlayIsBuilt() {
+    return g_status_host != 0 && g_status_root != 0;
+}
+
+Result BuildStatusOverlay(const LobbyUIContext& context) {
+    if (StatusOverlayIsBuilt()) {
+        return Result::Success();
+    }
+    if (!context.Complete()) {
+        return Result::Fail(ErrorCode::InvalidState, "the lobby UI context is incomplete");
+    }
+
+    const Builder builder(context);
+
+    // Above the lobby, and never hidden.
+    //
+    // The lobby sits at z order 1000 and is collapsed whenever it is closed. The status
+    // panel describes the mod rather than that screen, so it gets its own host one step
+    // higher: it draws over the lobby when the lobby is open and stays on the main menu
+    // when it is not.
+    const std::uintptr_t root =
+        CreateHostedCanvasAt(context, 1001, g_status_host, g_status_scaler);
+    if (root == 0) {
+        return Result::Fail(ErrorCode::InvalidState, "could not host the status overlay");
+    }
+
+    // The canvas covers the design and must not eat clicks meant for what is underneath.
+    SetWidgetVisibility(context, g_status_host, kSelfHitTestInvisible);
+
+    // Wider and quieter than it was.
+    //
+    // The old box was 336 points wide with 19 point text, which a session line like
+    // "CONNECTING TO HOST  STALLED" overran, running off the right of the screen. It
+    // reaches further left now and the text is smaller, so a long line has somewhere to go
+    // and the panel reads as an instrument rather than a headline.
+    constexpr float kPanelX = 1396.0F;
+    constexpr float kPanelW = 484.0F;
+    constexpr float kPanelH = 186.0F;
+    constexpr float kTextX  = 1414.0F;
+    constexpr float kTextW  = 452.0F;
+
+    (void)builder.Panel(root, kPanelX, 20.0F, kPanelW, kPanelH, kStatusPanel);
+    // A rule down the left edge, because a translucent panel over a starfield has no edge
+    // of its own to read against and simply disappears.
+    (void)builder.Panel(root, kPanelX, 20.0F, 3.0F, kPanelH, kAccent);
+
+    // The mod's own name, so a player who has forgotten what put this here can tell.
+    (void)builder.Text(root, kTextX, 28.0F, kTextW, 26.0F, "MULTIPLAYER EVOLVED", kAccent,
+                       18.0F);
+    (void)builder.Panel(root, kTextX, 56.0F, kTextW - 8.0F, 2.0F, kAccentDim);
+
+    for (std::size_t line = 0; line < kStatusLines; ++line) {
+        g_status_line[line] =
+            builder.Text(root, kTextX, 68.0F + static_cast<float>(line) * 24.0F, kTextW,
+                         22.0F, "", kText, 15.0F);
+    }
+
+    // The notice panel, opposite the status panel and part of the same overlay, so a
+    // staged update or a failed session is readable from the main menu too. Built
+    // collapsed; SetLobbyStatus decides whether there is anything to say.
+    g_notice_panel = builder.Panel(root, 44.0F, 20.0F, 560.0F, 122.0F, kStatusPanel);
+    g_notice_rule  = builder.Panel(root, 44.0F, 20.0F, 3.0F, 122.0F, kWarn);
+    g_notice_title = builder.Text(root, 62.0F, 30.0F, 530.0F, 32.0F, "", kWarn, 19.0F);
+    for (std::size_t line = 0; line < std::size(g_notice_detail); ++line) {
+        g_notice_detail[line] =
+            builder.Text(root, 62.0F, 66.0F + static_cast<float>(line) * 26.0F, 530.0F, 26.0F,
+                         "", kText, 16.0F);
+    }
+    for (const std::uintptr_t widget : {g_notice_panel, g_notice_rule, g_notice_title,
+                                        g_notice_detail[0], g_notice_detail[1]}) {
+        builder.SetVisibilityOf(widget, kCollapsedValue);
+    }
+
+    g_status_root = root;
+    MPE_LOG_INFO("status overlay built at 0x{:X}; it stays on screen with the menu as well "
+                "as the lobby",
+                g_status_host);
+    return Result::Success();
+}
+
 void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status) {
     const Builder builder(context);
 
     static bool s_reported = false;
     if (!s_reported) {
         s_reported = true;
-        MPE_LOG_INFO("status panel first write: lines 0x{:X} 0x{:X} 0x{:X}, net={}, '{}'",
-                    g_status_line[0], g_status_line[1], g_status_line[2], status.online,
-                    status.version);
+        MPE_LOG_INFO("status panel first write: net={}, session '{}', '{}'", status.online,
+                    status.session, status.version);
     }
 
-    builder.SetTextLive(g_status_line[0], status.online ? "NET: ONLINE" : "NET: OFFLINE");
-    builder.SetColourLive(g_status_line[0], status.online ? kGood : kBad);
+    // One line per fact, in the order a player asks the questions: am I online, is there a
+    // session, who is running it, how far away are they, is this build current.
+    struct Line {
+        std::string  text;
+        LinearColour colour;
+    };
+    std::array<Line, kStatusLines> lines{};
 
-    builder.SetTextLive(g_status_line[1], std::format("SESSION: {}", status.session));
-    builder.SetColourLive(g_status_line[1], status.invitable ? kGood : kText);
+    lines[0] = {status.online ? "NET: ONLINE" : "NET: OFFLINE", status.online ? kGood : kBad};
+    lines[1] = {std::format("SESSION: {}", status.session),
+                status.invitable ? kGood : kText};
 
-    builder.SetTextLive(g_status_line[2], status.version);
-    builder.SetColourLive(g_status_line[2], status.update_available ? kWarn : kText);
+    // What is being played, when there is anything to play. Empty rather than a placeholder
+    // when the session has not settled on one, because a map name that is not the map is
+    // worse than no map name.
+    if (!status.mode.empty()) {
+        lines[2] = {status.map.empty() ? status.mode
+                                       : std::format("{}  {}", status.mode, status.map),
+                    kTextDim};
+    }
 
-    for (const std::uintptr_t line : g_status_line) {
-        builder.SetVisibilityOf(line, kHitTestInvisible);
+    // The host's name when this machine is not the host, and the ping to them. Neither is
+    // shown alone in an empty lobby: there is no round trip to a session of one, and a
+    // number invented for that case is one a player could act on wrongly.
+    if (status.ping_ms >= 0) {
+        lines[3] = {status.host_name.empty()
+                        ? std::format("PING: {} ms", status.ping_ms)
+                        : std::format("{}  {} ms", status.host_name, status.ping_ms),
+                    PingColour(status.ping_ms)};
+    } else if (!status.host_name.empty()) {
+        lines[3] = {status.host_name, kTextDim};
+    }
+
+    lines[4] = {status.version, status.update_available ? kWarn : kTextDim};
+
+    for (std::size_t index = 0; index < kStatusLines; ++index) {
+        builder.SetTextLive(g_status_line[index], lines[index].text);
+        builder.SetColourLive(g_status_line[index], lines[index].colour);
+        // An empty line is collapsed rather than left blank, so the panel is only as tall
+        // as it has something to say.
+        builder.SetVisibilityOf(g_status_line[index],
+                                lines[index].text.empty() ? kCollapsedValue
+                                                          : kHitTestInvisible);
     }
 
     // The notice panel. Shown only when there is something worth a whole sentence.
