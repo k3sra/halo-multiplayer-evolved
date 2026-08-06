@@ -9,6 +9,7 @@
 #include "Map/MapVariantParser.h"
 
 #include <algorithm>
+#include <random>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -1922,8 +1923,29 @@ std::uint8_t LobbyManager::AssignTeam() const {
             ++counts[player.team];
         }
     }
-    const auto smallest = std::min_element(counts.begin(), counts.end());
-    return static_cast<std::uint8_t>(std::distance(counts.begin(), smallest));
+
+    const std::size_t fewest = *std::min_element(counts.begin(), counts.end());
+
+    // Ties are broken at random rather than by team number.
+    //
+    // Taking the first smallest is correct arithmetic and a bad experience: every session
+    // starts level, so the first player to arrive always landed on blue, and with people
+    // joining and leaving in pairs the same side filled first every time. Choosing among
+    // the tied teams means an even lobby is genuinely even.
+    std::vector<std::uint8_t> candidates;
+    candidates.reserve(counts.size());
+    for (std::size_t team = 0; team < counts.size(); ++team) {
+        if (counts[team] == fewest) {
+            candidates.push_back(static_cast<std::uint8_t>(team));
+        }
+    }
+    if (candidates.size() == 1) {
+        return candidates.front();
+    }
+
+    static std::mt19937 generator{std::random_device{}()};
+    std::uniform_int_distribution<std::size_t> pick(0, candidates.size() - 1);
+    return candidates[pick(generator)];
 }
 
 void LobbyManager::RemovePlayerByPeer(PeerHandle peer) {

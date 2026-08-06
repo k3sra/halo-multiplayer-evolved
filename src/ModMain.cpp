@@ -193,7 +193,7 @@ void SwitchLobbyTab(bool browsing);
 void SelectLobbyMode(bool slayer);
 void SelectLobbyMap(int map_index);
 void EnsureSessionHosted();
-void InviteToSession(int team);
+void InviteToSession();
 void ApplyServerFilter();
 void PublishSessionDetails();
 void CaptureServerName();
@@ -875,10 +875,10 @@ void TickLoop() {
                     OnLeaveLobby();
                     break;
                 case unreal::LobbyAction::InviteRed:
-                    InviteToSession(0);
-                    break;
                 case unreal::LobbyAction::InviteBlue:
-                    InviteToSession(1);
+                    // Which slot was pressed is deliberately not passed on. See
+                    // InviteToSession.
+                    InviteToSession();
                     break;
 
                 case unreal::LobbyAction::FilterModeAny:
@@ -1609,9 +1609,20 @@ void InviteFriendAt(int row) {
     ShowInviteList(true);
 }
 
-void InviteToSession(int team) {
-    MPE_LOG_INFO("opening the invite list for the {} team of this multiplayer session",
-                team == 0 ? "blue" : "red");
+void InviteToSession() {
+    // The slot that was pressed decides nothing.
+    //
+    // It reads like it should: press a red slot, get a red team mate. It cannot work that
+    // way and stay balanced. Somebody invited into a chosen slot would have to keep it
+    // even after two other people join the other side, and the alternative, honouring it
+    // only sometimes, is worse than never honouring it.
+    //
+    // Teams are assigned on arrival by whichever side is smallest, so every slot is the
+    // same button. This used to take the team as an argument and use it for nothing but a
+    // log line, which was itself wrong: the red slot logged blue and the blue slot logged
+    // red. Taking the argument away is what makes it impossible to start honouring it by
+    // accident later.
+    MPE_LOG_INFO("opening the invite list for this multiplayer session");
     EnsureSessionHosted();
     g_invite_pending = true;
     OpenSessionInvite();
