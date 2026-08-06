@@ -55,6 +55,7 @@
 #include <random>
 #include <cstring>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -1759,6 +1760,43 @@ void RefreshLobbyRoster() {
     MPE_LOG_INFO("lobby roster: {} on blue, {} on red", blue.size(), red.size());
 }
 
+/// The mode as the lobby names it, rather than as the engine spells it on the wire.
+[[nodiscard]] std::string DisplayMode(engine::GameMode mode) {
+    switch (mode) {
+        case engine::GameMode::CaptureTheFlag: return "CAPTURE THE FLAG";
+        case engine::GameMode::TeamSlayer:     return "SLAYER";
+        default:                               break;
+    }
+    // Anything without a lobby name falls back to the engine's, upper cased and with the
+    // underscores opened out, which is still readable.
+    std::string text(engine::ToString(mode));
+    for (char& character : text) {
+        character = (character == '_') ? ' '
+                                       : static_cast<char>(std::toupper(
+                                             static_cast<unsigned char>(character)));
+    }
+    return text;
+}
+
+/// The map as the lobby names it, from the scenario code the engine uses.
+[[nodiscard]] std::string DisplayMap(std::string_view scenario) {
+    for (const unreal::LobbyMap& map : unreal::kLobbyMaps) {
+        if (scenario == map.scenario) {
+            // The label carries the code in brackets, which the panel has no room for and
+            // the player does not need twice.
+            const std::string_view label{map.label};
+            const std::size_t      bracket = label.find(" (");
+            return std::string(bracket == std::string_view::npos ? label
+                                                                 : label.substr(0, bracket));
+        }
+    }
+    std::string text(scenario);
+    for (char& character : text) {
+        character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+    }
+    return text;
+}
+
 void RefreshLobbyStatus() {
     static auto s_last = std::chrono::steady_clock::time_point{};
 
@@ -1869,8 +1907,13 @@ void RefreshLobbyStatus() {
                 status.ping_ms = -1;
             }
 
-            status.mode = engine::ToString(snapshot.settings.mode);
-            status.map  = snapshot.settings.scenario;
+            // Shown the way the lobby names them, not the way the engine does.
+            //
+            // The engine's own vocabulary is what goes on the wire and into lobby data:
+            // capture_the_flag, a30. Correct there and wrong on a panel a player reads,
+            // where it looks like a debug string that escaped.
+            status.mode = DisplayMode(snapshot.settings.mode);
+            status.map  = DisplayMap(snapshot.settings.scenario);
 
             // A phase that is going nowhere says so.
             //
