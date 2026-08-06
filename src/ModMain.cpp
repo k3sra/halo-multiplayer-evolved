@@ -368,6 +368,17 @@ constexpr const char* kDefaultCampaignAsset = "DA_FirstPlayableCampaign";
         // shown against that rather than as zero.
         entry.capacity = listing.capacity > 0 ? listing.capacity : 10;
         entry.ping     = listing.ping_milliseconds;
+
+        // What the host says it is doing, turned into the two answers a player is choosing
+        // between. Anything the host has not published yet reads as a lobby, because a
+        // session that has just been created is one.
+        if (listing.phase == "in_match" || listing.phase == "loading" ||
+            listing.phase == "countdown") {
+            entry.status = "IN GAME";
+        } else {
+            entry.status = "LOBBY";
+        }
+
         servers.push_back(std::move(entry));
     }
     return servers;
@@ -3804,12 +3815,6 @@ __declspec(dllexport) int MPE_LeaveSession() {
     }
     mpe::g_state->manager->LeaveSession();
     return 0;
-}
-
-__declspec(dllexport) int MPE_SetReady(int ready) {
-    return mpe::WithManager([&](mpe::lobby::LobbyManager& manager) {
-        return manager.SetLocalReady(ready != 0);
-    });
 }
 
 __declspec(dllexport) int MPE_StartMatch() {
