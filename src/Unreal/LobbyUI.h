@@ -475,6 +475,26 @@ void ShowInvitePanel(const LobbyUIContext& context, bool visible);
 /// True while the invite list is on screen.
 [[nodiscard]] bool InvitePanelIsOpen();
 
+/// Whether an invitation sent right now would reach anywhere.
+enum class InviteReadiness : std::uint8_t {
+    /// The lobby is still being created. Nothing can be invited to it yet.
+    Preparing,
+    /// There is a session, and pressing a name sends an invitation to it.
+    Ready,
+    /// There is no session and none is coming, so the panel is a dead end.
+    Unavailable,
+};
+
+/// Says what the session behind the panel is doing.
+///
+/// The panel opens the instant a slot is pressed, which is before the Steam lobby exists,
+/// so it has to be able to say that. Without it the first press of the session showed a
+/// list of names that silently did nothing when one was chosen.
+///
+/// Must run on the game thread.
+void SetInvitePanelState(const LobbyUIContext& context, std::string_view text,
+                         InviteReadiness readiness);
+
 /// Rewrites the invite list in place.
 ///
 /// page is which block of kFriendRows to show, so a friends list longer than the panel is

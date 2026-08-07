@@ -249,6 +249,8 @@ std::uintptr_t g_friend_empty  = 0; ///< Shown when there is nobody to list.
 std::uintptr_t g_friend_hint   = 0; ///< The second line of the empty state.
 std::uintptr_t g_friend_count  = 0; ///< "12 FRIENDS, 3 IN GAME", in the header.
 std::uintptr_t g_friend_page   = 0; ///< The page indicator between the paging buttons.
+/// Whether the session an invitation would point at exists yet, and whose it is.
+std::uintptr_t g_invite_state  = 0;
 bool           g_invite_open   = false;
 
 /// Builds widgets and places them on a canvas.
@@ -1112,9 +1114,17 @@ void DrawInvitePanel(const Builder& builder, std::uintptr_t canvas,
         builder.Text(canvas, cross_x + 13.0F, cross_y + 4.0F, 44.0F, 40.0F, "X", kTextDim,
                      26.0F);
     builder.SetVisibilityOf(cross, kHitTestInvisible);
-    (void)builder.Text(canvas, kInsetX, kCardY + 72.0F, kInsetW, 28.0F,
-                       "Whoever you pick joins this session, not a fireteam.", kTextDim,
-                       18.0F);
+
+    // What the session is doing, in the place a fixed sentence used to be.
+    //
+    // The line it replaced said the same thing every time it was drawn, which is a line
+    // worth nothing on a panel that opens before the session exists. A player who presses a
+    // slot and sees a list of names reasonably assumes pressing one will work; when the
+    // lobby is still being created it will not, and the only honest thing to do is say so
+    // here rather than let the press fail silently.
+    g_invite_state = builder.Text(canvas, kInsetX, kCardY + 72.0F, kInsetW, 28.0F,
+                                  "PREPARING YOUR SESSION", kWarn, 18.0F);
+    builder.SetVisibilityOf(g_invite_state, kHitTestInvisible);
 
     // The roster's own summary. A list of names says nothing about how many of them can
     // actually act on an invitation now, and that is the useful number.
@@ -2125,6 +2135,15 @@ void ShowInvitePanel(const LobbyUIContext& context, bool visible) {
 
 bool InvitePanelIsOpen() {
     return g_invite_open;
+}
+
+void SetInvitePanelState(const LobbyUIContext& context, std::string_view text,
+                         InviteReadiness readiness) {
+    const Builder builder(context);
+    builder.SetTextLive(g_invite_state, text);
+    builder.SetColourLive(g_invite_state, readiness == InviteReadiness::Ready      ? kGood
+                                          : readiness == InviteReadiness::Preparing ? kWarn
+                                                                                    : kBad);
 }
 
 void SetLobbyFriends(const LobbyUIContext& context, const std::vector<LobbyFriend>& friends,

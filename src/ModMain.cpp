@@ -218,6 +218,16 @@ void RefreshLobbyRoster();
 [[nodiscard]] std::string LoadServerName();
 void                      SaveServerName(const std::string& name);
 [[nodiscard]] lobby::LobbyId HostedLobbyLocked();
+[[nodiscard]] lobby::LobbyId CurrentSessionLobbyLocked();
+
+/// What the invite panel should say about the session behind it.
+struct InviteSessionState {
+    lobby::LobbyId          lobby{0};
+    std::string             text;
+    unreal::InviteReadiness readiness{unreal::InviteReadiness::Preparing};
+};
+[[nodiscard]] InviteSessionState DescribeInviteSession();
+void                             RefreshInvitePanelState();
 
 /// Which multiplayer screen is showing.
 ///
@@ -266,11 +276,12 @@ std::vector<unreal::LobbyControl> g_lobby_controls;
 unreal::ServerFilter g_server_filter;
 int                  g_selected_server = 0;
 
-/// True while a slot has been pressed but the session is not yet ready to be invited to.
+/// The session line the invite panel is currently showing.
 ///
-/// Creating a Steam lobby is asynchronous, so the first press always arrives too early.
-/// Remembering it means the player's click is honoured a moment later rather than lost.
-bool g_invite_pending = false;
+/// Compared against what the session says now, so the panel is rewritten when the answer
+/// changes and left alone the rest of the time. Cleared when the panel closes, so reopening
+/// it always writes the line rather than assuming the widget still holds it.
+std::string g_invite_state_shown;
 
 /// True when the pool and the object array were read from the static image rather than
 /// searched for. It decides whether the slow search, and the waiting that exists only to
@@ -819,11 +830,10 @@ void TickLoop() {
             }
         }
 
-        // A slot pressed before the lobby finished being created is honoured here, once it
-        // exists, rather than being dropped.
-        if (g_invite_pending) {
-            OpenSessionInvite();
-        }
+        // The invite panel's session line, while it is open. The lobby it points at finishes
+        // being created a beat after the panel opens, and this is what stops the line saying
+        // the session is being prepared once it is not.
+        RefreshInvitePanelState();
 
         RefreshLobbyStatus();
         CheckOwnSessionIsFindable();
@@ -1552,23 +1562,6 @@ void EnsureSessionHosted() {
 /// while the lobby is still being created, and asking to invite then did nothing at all,
 /// silently. The request is remembered instead and opened the moment hosting completes.
 void OpenSessionInvite() {
-    lobby::LobbyId lobby = 0;
-    {
-        std::lock_guard lock(g_state_mutex);
-        if (!g_state || !g_state->manager) {
-            MPE_LOG_WARN("cannot invite: networking is unavailable");
-            g_invite_pending = false;
-            return;
-        }
-        lobby = HostedLobbyLocked();
-    }
-    if (lobby == 0) {
-        return; // Not yet; the poll loop will try again.
-    }
-
-    g_invite_pending = false;
-    PublishSessionDetails();
-
     // Read now, not continuously, and never invited in bulk.
     //
     // An earlier version invited every friend it could see the moment a slot was pressed,
@@ -1592,10 +1585,39 @@ void OpenSessionInvite() {
     const std::size_t in_game = static_cast<std::size_t>(
         std::count_if(friends.begin(), friends.end(),
                       [](const steam::GameFriend& f) { return f.in_this_game; }));
-    MPE_LOG_INFO("invite list for session {}: {} friend(s), {} in this game", lobby,
-                friends.size(), in_game);
+    MPE_LOG_INFO("invite list: {} friend(s), {} in this game", friends.size(), in_game);
 
     ShowInviteList(true);
+}
+
+/// Keeps the panel's session line current while it is open.
+///
+/// Called from the poll rather than only when the panel opens, because the interesting
+/// moment is the one after: the lobby finishes being created a beat later, and the line has
+/// to stop saying it is being prepared without the player having to close and reopen
+/// anything to find out.
+void RefreshInvitePanelState() {
+    if (!g_lobby_ui_ready || !unreal::InvitePanelIsOpen()) {
+        return;
+    }
+    const InviteSessionState state = DescribeInviteSession();
+    if (state.text == g_invite_state_shown) {
+        return;
+    }
+    g_invite_state_shown = state.text;
+
+    // The first time a session actually exists, the lobby's own metadata is published, so a
+    // friend who accepts arrives at something with a name, a mode and a map on it.
+    if (state.lobby != 0) {
+        PublishSessionDetails();
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    (void)unreal::RunOnGameThread(
+        [&]() { unreal::SetInvitePanelState(ui, state.text, state.readiness); }, 5000);
 }
 
 /// The lobby this machine is hosting, or zero when it is not hosting one.
@@ -1625,6 +1647,76 @@ void OpenSessionInvite() {
     }
 }
 
+/// The lobby this machine is in, whether it owns it or joined it.
+///
+/// Inviting is not a host's privilege. Steam lets any member of a lobby invite to it, and a
+/// player who has joined a friend and wants to pull in a third has exactly the same thing to
+/// offer as the host does: this lobby, this session, come in.
+///
+/// Only the host's lobby was ever considered, so a guest pressing an empty slot found the
+/// panel refusing to open, every time, with nothing said. Leaving to the main menu and
+/// coming back appeared to fix it, which it did, by ending the session and hosting a new
+/// one: the guest was quietly thrown out of their friend's game to be shown a list.
+///
+/// The caller must hold g_state_mutex.
+[[nodiscard]] lobby::LobbyId CurrentSessionLobbyLocked() {
+    if (!g_state || !g_state->manager) {
+        return 0;
+    }
+    switch (g_state->manager->Phase()) {
+        case lobby::LobbyPhase::Hosting:
+        case lobby::LobbyPhase::Countdown:
+        case lobby::LobbyPhase::Loading:
+        case lobby::LobbyPhase::InMatch:
+        case lobby::LobbyPhase::PostMatch:
+        case lobby::LobbyPhase::InLobby:
+            return g_state->manager->Snapshot().lobby_id;
+        default:
+            // Idle and Faulted have nothing to point at. Creating, Joining, Connecting and
+            // Handshaking are all on their way to having one, and the panel says so rather
+            // than pretending otherwise.
+            return 0;
+    }
+}
+
+InviteSessionState DescribeInviteSession() {
+    InviteSessionState state;
+    std::lock_guard    lock(g_state_mutex);
+    if (!g_state || !g_state->manager) {
+        state.text      = "STEAM IS UNAVAILABLE, SO NOBODY CAN BE INVITED";
+        state.readiness = unreal::InviteReadiness::Unavailable;
+        return state;
+    }
+
+    state.lobby = CurrentSessionLobbyLocked();
+    if (state.lobby != 0) {
+        state.readiness = unreal::InviteReadiness::Ready;
+        state.text      = g_state->manager->IsHost()
+                              ? "YOUR SESSION IS OPEN. PRESS A NAME TO INVITE THEM."
+                              : "PRESS A NAME TO INVITE THEM INTO THIS SESSION.";
+        return state;
+    }
+
+    switch (g_state->manager->Phase()) {
+        case lobby::LobbyPhase::Creating:
+        case lobby::LobbyPhase::Idle:
+            state.text      = "PREPARING YOUR SESSION";
+            state.readiness = unreal::InviteReadiness::Preparing;
+            break;
+        case lobby::LobbyPhase::Joining:
+        case lobby::LobbyPhase::Connecting:
+        case lobby::LobbyPhase::Handshaking:
+            state.text      = "JOINING A SESSION. INVITES OPEN ONCE YOU ARE IN.";
+            state.readiness = unreal::InviteReadiness::Preparing;
+            break;
+        default:
+            state.text      = "THERE IS NO SESSION TO INVITE ANYONE TO";
+            state.readiness = unreal::InviteReadiness::Unavailable;
+            break;
+    }
+    return state;
+}
+
 /// Puts the invite list on screen, or takes it off.
 void ShowInviteList(bool visible) {
     if (!g_lobby_ui_ready) {
@@ -1645,7 +1737,7 @@ void ShowInviteList(bool visible) {
 }
 
 void CloseInviteList() {
-    g_invite_pending = false;
+    g_invite_state_shown.clear();
     ShowInviteList(false);
 }
 
@@ -1672,9 +1764,13 @@ void InviteFriendAt(int row) {
     lobby::LobbyId lobby = 0;
     {
         std::lock_guard lock(g_state_mutex);
-        lobby = HostedLobbyLocked();
+        lobby = CurrentSessionLobbyLocked();
     }
     if (lobby == 0) {
+        // Said on the panel, not only to the log. A press that produces no visible change is
+        // the failure the whole panel exists to avoid.
+        const InviteSessionState state = DescribeInviteSession();
+        ShowSessionNotice("CANNOT INVITE YET", state.text);
         MPE_LOG_WARN("cannot invite {}: there is no session on this machine to invite to",
                     g_friend_list[index].name);
         return;
@@ -1695,6 +1791,20 @@ void InviteFriendAt(int row) {
 }
 
 void InviteToSession() {
+    // The panel opens on the press. Not on the session.
+    //
+    // It used to open only once a Steam lobby id existed and only on a machine that was
+    // hosting, which made the first press of every session do nothing at all: creating a
+    // lobby is asynchronous, so the id arrives a moment after the button. A player pressing
+    // a slot and seeing nothing has no way to tell that from a broken button, and pressing
+    // it again is the obvious thing to do, which is why this looked like it needed two
+    // attempts and a trip back to the main menu.
+    //
+    // Opening first and describing the session on the panel is the honest order: the list is
+    // there instantly, and the line under the title says whether an invitation can go out
+    // yet. The poll keeps that line current, so it stops saying the session is being
+    // prepared the moment it is not.
+    //
     // The slot that was pressed decides nothing.
     //
     // It reads like it should: press a red slot, get a red team mate. It cannot work that
@@ -1708,9 +1818,13 @@ void InviteToSession() {
     // red. Taking the argument away is what makes it impossible to start honouring it by
     // accident later.
     MPE_LOG_INFO("opening the invite list for this multiplayer session");
+
+    // Hosting first, so the lobby is already being created while the list is drawn. It is a
+    // no-op for anyone who is already in a session, which is what lets a guest invite a
+    // third person into their host's game rather than being thrown out of it.
     EnsureSessionHosted();
-    g_invite_pending = true;
     OpenSessionInvite();
+    RefreshInvitePanelState();
 }
 
 /// Advertises what this session is, so the browser shows it as something recognisable.
