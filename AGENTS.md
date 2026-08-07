@@ -12,13 +12,15 @@ build.bat debug                 # symbols, no optimisation
 build.bat install               # build, then copy into the game folder
 build.bat package               # build, then make the release archive in build\
 tools\protocol_check\build.bat  # wire protocol checks, ~1 second
+tools\session_check\build.bat   # a host and a client against each other, ~1 second
+tools\steam_check\build.bat     # discovery against the real Steam client, ~15 seconds
 ```
 
 `build.bat install` refuses while the game is running, because Windows will not replace a
 mapped DLL. Close the game first. It prints the size and modified time of what it copied.
 
-There is no test framework. Both checkers are plain console programs that return non-zero
-on failure.
+There is no test framework. All three checkers are plain console programs that return
+non-zero on failure.
 
 - `protocol_check` covers the message acceptability matrix and the packet bodies. Add cases
   when you touch `src/Net/PacketProtocol.cpp`.
@@ -26,7 +28,6 @@ on failure.
   transport. Add cases when you touch `src/Lobby/LobbyManager.cpp`, and especially when the
   change only shows itself with two people in a session: that is the class of bug that
   otherwise costs two machines, two players and a log from each to find.
-
 - `steam_check` hosts a real lobby and searches for it. It needs the Steam client running
   and the game closed, because Steam rate limits lobby creation and refuses while the game
   holds a session. A refusal is reported as SKIPPED, not as a failure: it proves nothing
