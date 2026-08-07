@@ -452,9 +452,8 @@ void NothingWaitsOnReadiness() {
     for (const PlayerSlot& player : snapshot.players) {
         Check(player.is_ready, "every slot is ready");
     }
-    Check(pair.host.SetLocalReady(false).ok(),
-          "asking to be unready is accepted and changes nothing");
-    Check(pair.host.Snapshot().EveryoneReady(), "and everybody is still ready");
+    // There is deliberately nothing here to call. Readiness has no setter, no message and
+    // no state; a session's members are ready because they are in it.
 }
 
 void PublicStaysPublic() {

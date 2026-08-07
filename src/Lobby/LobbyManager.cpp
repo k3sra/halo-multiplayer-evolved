@@ -354,13 +354,6 @@ void LobbyManager::LeaveSession() {
     TransitionTo(LobbyPhase::Idle, "Idle");
 }
 
-Result LobbyManager::SetLocalReady(bool ready) {
-    // Kept only so the export that calls it still links. Readiness was removed: everybody
-    // in a session is ready, always, so there is nothing for this to change.
-    (void)ready;
-    return Result::Success();
-}
-
 Result LobbyManager::SendChat(std::string_view text) {
     if (phase_ == LobbyPhase::Idle || phase_ == LobbyPhase::Faulted) {
         return Result::Fail(ErrorCode::InvalidState, "not in a session");

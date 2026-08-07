@@ -187,9 +187,6 @@ public:
     /// Tears down cleanly from any phase, including Faulted. Idempotent.
     void LeaveSession();
 
-    /// Does nothing. Readiness was removed; everybody in a session is ready, always.
-    /// Kept so an older caller still links.
-    [[nodiscard]] Result SetLocalReady(bool ready);
     [[nodiscard]] Result SendChat(std::string_view text);
     [[nodiscard]] Result OpenInviteOverlay();
 
