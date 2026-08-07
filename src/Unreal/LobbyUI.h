@@ -355,6 +355,13 @@ void ShowLobbyUI(const LobbyUIContext& context, bool visible);
 /// Must run on the game thread.
 void SetLobbyTab(const LobbyUIContext& context, bool browsing);
 
+/// Shows or hides everything only a host may use: the mode and map choices, and START
+/// MATCH.
+///
+/// A client cannot change any of it, so it is taken off the screen rather than left inert.
+/// Must run on the game thread.
+void SetLobbyHostControls(const LobbyUIContext& context, bool is_host);
+
 /// Marks which game mode is selected, without rebuilding the screen.
 ///
 /// Must run on the game thread.

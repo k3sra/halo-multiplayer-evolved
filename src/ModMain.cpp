@@ -201,6 +201,7 @@ void PublishSessionDetails();
 void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
+void RefreshLobbyAuthority();
 void PrepareLobby();
 void PrepareStatusOverlay();
 void InviteFriendAt(int row);
@@ -771,6 +772,7 @@ void TickLoop() {
         }
 
         RefreshLobbyStatus();
+        RefreshLobbyAuthority();
 
         // Four times a second. Somebody joining should appear promptly, and a quarter of
         // a second is promptly; copying the roster and building a comparison string sixty
@@ -1796,6 +1798,80 @@ void RefreshLobbyRoster() {
         character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
     }
     return text;
+}
+
+/// Keeps a client's screen following the host, and hides what a client cannot change.
+///
+/// Two things a guest needs and did not have. The mode and map are the host's to pick, so
+/// the controls for picking them come off the screen entirely; and when the host does pick
+/// something, the choice has to arrive here rather than the guest staring at whatever was
+/// selected before they joined.
+///
+/// Driven from the session snapshot rather than from what this machine last clicked,
+/// because for a client those are different things and only one of them is true.
+void RefreshLobbyAuthority() {
+    if (!g_lobby_ui_ready || !unreal::LobbyIsBuilt()) {
+        return;
+    }
+
+    bool        is_host = true;
+    bool        in_session = false;
+    std::string mode;
+    std::string scenario;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            return;
+        }
+        const lobby::LobbySnapshot& snapshot = g_state->manager->Snapshot();
+        in_session = snapshot.phase != lobby::LobbyPhase::Idle;
+        is_host    = !in_session || g_state->manager->IsHost();
+        mode       = (snapshot.settings.mode == engine::GameMode::TeamSlayer)
+                         ? "SLAYER"
+                         : "CAPTURE THE FLAG";
+        scenario   = snapshot.settings.scenario;
+    }
+
+    // Only when something changed, so this costs one comparison a tick while nobody is
+    // touching anything.
+    static bool        s_host = true;
+    static std::string s_mode;
+    static std::string s_scenario;
+    if (is_host == s_host && mode == s_mode && scenario == s_scenario) {
+        return;
+    }
+    s_host     = is_host;
+    s_mode     = mode;
+    s_scenario = scenario;
+
+    int chosen = 0;
+    for (std::size_t index = 0; index < std::size(unreal::kLobbyMaps); ++index) {
+        if (scenario == unreal::kLobbyMaps[index].scenario) {
+            chosen = static_cast<int>(index);
+        }
+    }
+    const bool slayer = (mode == "SLAYER");
+
+    // A guest's own idea of the settings follows the host's, so leaving and hosting again
+    // does not resurrect a choice somebody else made.
+    if (!is_host) {
+        g_lobby.mode     = mode;
+        g_lobby.scenario = scenario;
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    (void)unreal::RunOnGameThread(
+        [&]() {
+            unreal::SetLobbyHostControls(ui, is_host);
+            unreal::SetLobbyMode(ui, slayer);
+            unreal::SetLobbyMap(ui, chosen);
+        },
+        5000);
+    MPE_LOG_INFO("lobby authority: {}, mode {}, map {}", is_host ? "host" : "guest", mode,
+                scenario);
 }
 
 void RefreshLobbyStatus() {

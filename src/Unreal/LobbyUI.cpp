@@ -70,6 +70,10 @@ constexpr LinearColour kWarn       = {0.960F, 0.760F, 0.300F, 1.0F};
 /// layout, so it should read over the scene instead of punching a hole in it.
 constexpr LinearColour kStatusPanel = {0.020F, 0.040F, 0.055F, 0.45F};
 
+/// Everything on the HOST tab that only the host may see: the mode and map headings, their
+/// buttons, and START MATCH. Collapsed wholesale when this machine has joined somebody.
+std::vector<std::uintptr_t> g_host_only;
+
 /// The bars drawn behind the two mode buttons. Selection is shown by making one visible
 /// and the other not, so choosing a mode costs a visibility change rather than a rebuild.
 std::uintptr_t g_mode_marker[2] = {0, 0};
@@ -782,7 +786,14 @@ void BuildPlayerCard(const Builder& builder, std::uintptr_t canvas, SlotWidgets&
 void DrawHostTab(const Builder& builder, std::uintptr_t canvas, const LobbyView& view,
                  std::vector<LobbyControl>& controls) {
     // Left: mode selection.
-    (void)builder.Label(canvas, 56.0F, 180.0F, 400.0F, 72.0F, "GAME MODE SELECTION");
+    //
+    // Everything on this side is the host's to decide, so every piece of it is recorded
+    // and taken off the screen for a client. A client looking at mode and map buttons that
+    // do nothing would reasonably conclude the mod is broken; the honest screen for
+    // somebody who has joined shows what was chosen, not controls for choosing.
+    g_host_only.clear();
+    g_host_only.push_back(
+        builder.Label(canvas, 56.0F, 180.0F, 400.0F, 72.0F, "GAME MODE SELECTION"));
     const std::array<const char*, 2> modes = {"CAPTURE THE FLAG", "SLAYER"};
     float                            mode_y = 252.0F;
     for (std::size_t index = 0; index < modes.size(); ++index) {
@@ -791,23 +802,28 @@ void DrawHostTab(const Builder& builder, std::uintptr_t canvas, const LobbyView&
         // bar only marks which one is chosen.
         g_mode_marker[index] = builder.Panel(canvas, 52.0F, mode_y - 3.0F, 376.0F, 72.0F,
                                              kAccentDim);
-        controls.push_back(
-            {builder.Button(canvas, 60.0F, mode_y, 360.0F, 66.0F, mode),
-             std::string_view(mode) == "SLAYER" ? LobbyAction::SelectSlayer
-                                                : LobbyAction::SelectCaptureTheFlag});
+        const std::uintptr_t mode_button = builder.Button(canvas, 60.0F, mode_y, 360.0F,
+                                                          66.0F, mode);
+        controls.push_back({mode_button,
+                            std::string_view(mode) == "SLAYER"
+                                ? LobbyAction::SelectSlayer
+                                : LobbyAction::SelectCaptureTheFlag});
+        g_host_only.push_back(mode_button);
         mode_y += 82.0F;
     }
 
 
     // Left, below the modes: the map.
-    (void)builder.Label(canvas, 56.0F, 424.0F, 400.0F, 72.0F, "MAP SELECTION");
+    g_host_only.push_back(builder.Label(canvas, 56.0F, 424.0F, 400.0F, 72.0F,
+                                        "MAP SELECTION"));
     for (std::size_t index = 0; index < std::size(kLobbyMaps); ++index) {
         const float y = 490.0F + static_cast<float>(index) * 62.0F;
         g_map_marker[index] =
             builder.Panel(canvas, 56.0F, y - 3.0F, 308.0F, 60.0F, kAccentDim);
-        controls.push_back({builder.Button(canvas, 60.0F, y, 300.0F, 54.0F,
-                                           kLobbyMaps[index].label),
-                            LobbyAction::SelectMap, static_cast<int>(index)});
+        const std::uintptr_t map_button =
+            builder.Button(canvas, 60.0F, y, 300.0F, 54.0F, kLobbyMaps[index].label);
+        controls.push_back({map_button, LobbyAction::SelectMap, static_cast<int>(index)});
+        g_host_only.push_back(map_button);
     }
 
     // Middle: the two team columns, five slots each in two rows.
@@ -855,8 +871,11 @@ void DrawHostTab(const Builder& builder, std::uintptr_t canvas, const LobbyView&
                                         view.server_name);
 
     // Bottom right action.
-    controls.push_back({builder.Button(canvas, 1380.0F, 916.0F, 500.0F, 104.0F, "START MATCH"),
-                        LobbyAction::StartMatch});
+    // The host starts the match; a client waits for them to.
+    const std::uintptr_t start = builder.Button(canvas, 1380.0F, 916.0F, 500.0F, 104.0F,
+                                                "START MATCH");
+    controls.push_back({start, LobbyAction::StartMatch});
+    g_host_only.push_back(start);
     controls.push_back({builder.Button(canvas, 60.0F, 946.0F, 500.0F, 104.0F, "BACK"),
                         LobbyAction::Back, 0});
 }
@@ -1483,6 +1502,7 @@ void RemoveLobbyUI(const LobbyUIContext& context) {
     g_invite_open       = false;
     g_friend_empty      = 0;
     g_friend_page       = 0;
+    g_host_only.clear();
     for (FriendRowWidgets& row : g_friend_row) {
         row = FriendRowWidgets{};
     }
@@ -2046,6 +2066,32 @@ void SetLobbyRoster(const LobbyUIContext& context, const std::vector<std::string
         }
         builder.SetTextLive(g_team_heading[side],
                             std::format("{}/{}", players.size(), kTeamSlots));
+    }
+}
+
+void SetLobbyHostControls(const LobbyUIContext& context, bool is_host) {
+    const Builder builder(context);
+
+    // Removed rather than greyed out.
+    //
+    // A client cannot choose the mode or the map, and cannot start the match; those belong
+    // to whoever is hosting. Leaving the controls on screen and inert is the worst of both:
+    // it looks like the mod ignoring a press. Taking them away says the truth, which is
+    // that there is nothing here for a guest to decide.
+    const std::uint8_t visibility = is_host ? kVisibleValue : kCollapsedValue;
+    for (const std::uintptr_t widget : g_host_only) {
+        builder.SetVisibilityOf(widget, visibility);
+    }
+
+    // The markers go with them, or a collapsed button leaves its highlight bar floating
+    // over the backdrop with nothing behind it.
+    if (!is_host) {
+        for (const std::uintptr_t marker : g_mode_marker) {
+            builder.SetVisibilityOf(marker, kCollapsedValue);
+        }
+        for (const std::uintptr_t marker : g_map_marker) {
+            builder.SetVisibilityOf(marker, kCollapsedValue);
+        }
     }
 }
 
