@@ -167,6 +167,15 @@ rules whose failures otherwise only show up with two machines and two people.
 tools\protocol_check\build.bat
 ```
 
+```bash
+tools\session_check\build.bat
+```
+
+The second runs a real host and a real client against each other in one process,
+over a loopback transport, through the real protocol. It covers the things that
+otherwise need two machines and two people: a join completing, a guest being told
+the host's mode and map, teams balancing, and leaving a session cleanly.
+
 ---
 
 ## Credits

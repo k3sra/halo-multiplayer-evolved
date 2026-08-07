@@ -17,8 +17,19 @@ tools\protocol_check\build.bat  # wire protocol checks, ~1 second
 `build.bat install` refuses while the game is running, because Windows will not replace a
 mapped DLL. Close the game first. It prints the size and modified time of what it copied.
 
-There is no test framework. `protocol_check` is a plain console program; add cases to
-`tools/protocol_check/protocol_check.cpp` when you touch `src/Net/PacketProtocol.cpp`.
+There is no test framework. Both checkers are plain console programs that return non-zero
+on failure.
+
+- `protocol_check` covers the message acceptability matrix and the packet bodies. Add cases
+  when you touch `src/Net/PacketProtocol.cpp`.
+- `session_check` runs a real host and a real client against each other over a loopback
+  transport. Add cases when you touch `src/Lobby/LobbyManager.cpp`, and especially when the
+  change only shows itself with two people in a session: that is the class of bug that
+  otherwise costs two machines, two players and a log from each to find.
+
+Its loopback transport keeps a separate queue per channel and lets a case choose the drain
+order. Use it. Separate channels are separate lanes with no ordering between them, and
+assuming otherwise is what made the first client that ever reached a host disconnect it.
 
 ## Verifying a change
 
