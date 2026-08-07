@@ -194,6 +194,48 @@ int main(int argc, char** argv) {
           "will appear the same way");
 
     // ------------------------------------------------------------------
+    // Every Steam call this mod makes, made once.
+    // ------------------------------------------------------------------
+    //
+    // This is the bug class that actually took somebody's game down. The mod binds the
+    // flat API by hand, and the game ships two Steamworks SDKs at different interface
+    // versions; handing a v018 pointer to a v017 module's wrapper calls a different vtable
+    // slot, which read the friend flags as a pointer and wrote through them. It crashed on
+    // GetFriendCount, and nothing short of calling it would have found that.
+    //
+    // So every one of them is called here, for real, once. A wrong signature or a
+    // mismatched interface faults on the call rather than in somebody's match.
+    std::printf("calling every bound Steam function once\n");
+
+    const auto persona = steam::GetPersonaName();
+    Check(persona != nullptr && *persona != '\0', "GetPersonaName returned a name");
+    Check(steam::GetLocalSteamId() != 0, "GetSteamID returned an id");
+    Check(steam::IsOverlayEnabled() || true, "IsOverlayEnabled answered without faulting");
+
+    // The one that crashed. Reads the whole friends list, each name, and what each person
+    // is playing.
+    const auto friends = steam::FriendsInGame();
+    std::printf("  ok    FriendsInGame read %zu friend(s) without faulting\n", friends.size());
+
+    Check(steam::GetNumLobbyMembers(watcher.created) >= 1,
+          "GetNumLobbyMembers counted us in our own lobby");
+    Check(steam::GetLobbyOwner(watcher.created) == steam::GetLocalSteamId(),
+          "GetLobbyOwner named us as the owner");
+    Check(steam::SetRichPresence("connect", "mpe-check"),
+          "SetRichPresence was accepted");
+
+    // Invited to nobody on purpose.
+    //
+    // A zero id is not a person, so Steam refuses and no real player is bothered by a test
+    // run. What is being checked is the call itself: that the binding is resolved, the
+    // signature matches the module's, and a refusal comes back as false rather than as a
+    // fault. Whether an invitation reaches somebody is Steam's to answer, and needs a
+    // second account to ask.
+    const bool invited_nobody = steam::InviteUserToLobby(watcher.created, 0);
+    Check(!invited_nobody,
+          "InviteUserToLobby is callable and refuses an invalid target cleanly");
+
+    // ------------------------------------------------------------------
     // The relay, to ourselves.
     // ------------------------------------------------------------------
     //
