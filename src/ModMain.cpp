@@ -284,7 +284,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.1.7";
+constexpr const char* kModVersion = "0.1.8";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -772,7 +772,18 @@ void TickLoop() {
         }
 
         RefreshLobbyStatus();
-        RefreshLobbyAuthority();
+
+        // Four times a second. It reads the session under the state lock and formats two
+        // strings to compare against the last pair; sixty passes a second to notice a
+        // button press is contention bought for nothing.
+        {
+            static auto s_last_authority = std::chrono::steady_clock::time_point{};
+            const auto  now              = std::chrono::steady_clock::now();
+            if (now - s_last_authority >= std::chrono::milliseconds(250)) {
+                s_last_authority = now;
+                RefreshLobbyAuthority();
+            }
+        }
 
         // Four times a second. Somebody joining should appear promptly, and a quarter of
         // a second is promptly; copying the roster and building a comparison string sixty
