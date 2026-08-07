@@ -137,6 +137,7 @@ Result SteamMatchmakingHooks::Join(LobbyId lobby) {
         return Result::Fail(ErrorCode::SteamCallFailed, "JoinLobby was not accepted by Steam");
     }
     operation_in_flight_ = true;
+    requested_lobby_     = lobby;
 
     MPE_LOG_INFO("joining lobby {}", lobby);
     return Result::Success();
@@ -151,8 +152,19 @@ void SteamMatchmakingHooks::Leave() {
     steam::SetCurrentLobby(0);
     is_owner_            = false;
     operation_in_flight_ = false;
+    requested_lobby_     = 0;
     name_cache_.clear();
     ClearJoinablePresence();
+
+    // The queue goes too.
+    //
+    // Anything still in it describes the lobby being left, and the next thing this backend
+    // does is almost always join a different one. A leftover entry event would then be
+    // delivered as though it were the answer to that join, which is how a player who backed
+    // out to the menu and then picked a server ended up waiting on a lobby they had already
+    // left.
+    std::lock_guard lock(queue_mutex_);
+    pending_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +377,8 @@ void SteamMatchmakingHooks::Enqueue(Event event) {
 }
 
 void SteamMatchmakingHooks::Poll(ILobbyBackendObserver& observer) {
+    NoticeEntryWithoutCallback();
+
     std::deque<Event> batch;
     {
         std::lock_guard lock(queue_mutex_);
@@ -372,6 +386,44 @@ void SteamMatchmakingHooks::Poll(ILobbyBackendObserver& observer) {
     }
     for (const Event& event : batch) {
         Dispatch(event, observer);
+    }
+}
+
+void SteamMatchmakingHooks::NoticeEntryWithoutCallback() {
+    // Entering a lobby is detected by asking, not only by being told.
+    //
+    // LobbyEnter_t is a broadcast callback, and inside the game this mod does not own the
+    // Steam callback pump: the host application does. Every entry therefore waited on
+    // whenever the game next chose to dispatch callbacks, which is not something this mod
+    // controls or can measure, and it is the largest part of why joining somebody took long
+    // enough for a player to conclude it had hung.
+    //
+    // Membership is readable synchronously, so it is read. A player appears in a lobby's own
+    // member list only once they are actually in it, which makes finding our own id there
+    // proof of entry that owes the callback nothing. The callback still arrives later and is
+    // ignored, because requested_lobby_ has been cleared by then.
+    if (requested_lobby_ == 0) {
+        return;
+    }
+
+    const steam::SteamId local = steam::GetLocalSteamId();
+    if (local == 0) {
+        return;
+    }
+
+    const int members = steam::GetNumLobbyMembers(requested_lobby_);
+    for (int index = 0; index < members; ++index) {
+        if (steam::GetLobbyMemberByIndex(requested_lobby_, index) != local) {
+            continue;
+        }
+        MPE_LOG_INFO("entry into lobby {} observed directly; not waiting for the callback",
+                    requested_lobby_);
+        Enqueue(Event{EventKind::LobbyEntered, requested_lobby_, 0, false, ErrorCode::None,
+                      ""});
+        // Cleared here rather than in the dispatch, so a second pass before the queue drains
+        // cannot enqueue the same entry twice.
+        requested_lobby_ = 0;
+        return;
     }
 }
 
@@ -403,32 +455,50 @@ void SteamMatchmakingHooks::Dispatch(const Event& event, ILobbyBackendObserver& 
             return;
 
         case EventKind::LobbyEntered:
-            // Only lobbies this mod asked for.
+            // Only lobbies this mod asked for, and only the one it asked for.
             //
             // Steam raises LobbyEnter for every lobby the process joins, and the game uses
             // Steam lobbies for its own fireteam. Recording those made the backend believe
             // it was already in a lobby it had never created, so hosting was refused with
-            // "already in lobby" and no multiplayer session could exist at all. Nothing was
-            // wrong with the session code; it was never reached.
+            // "already in lobby" and no multiplayer session could exist at all.
             //
-            // A lobby is ours if we have a request outstanding, or if it is the one we are
-            // already tracking, which is the enter event that follows our own create.
-            if (!operation_in_flight_ && event.lobby != current_lobby_) {
+            // Which lobby matters as much as whether one was asked for. Testing only
+            // "is a request outstanding" cannot tell one lobby from another, and leaving a
+            // lobby to join a different one is precisely where that fails: the enter event
+            // for the lobby just left can still be in the queue, and it would consume the
+            // outstanding request, be reported as the lobby that was joined, and leave the
+            // real one to arrive with nothing expecting it and be discarded. The join then
+            // neither completed nor failed. That is a session stuck on Joining forever,
+            // which is what a player saw after picking a server out of the browser.
+            if (requested_lobby_ != 0 && event.lobby != requested_lobby_) {
+                MPE_LOG_INFO("ignoring entry into lobby {} while waiting for {}", event.lobby,
+                            requested_lobby_);
+                return;
+            }
+            if (requested_lobby_ == 0 && !operation_in_flight_ &&
+                event.lobby != current_lobby_) {
                 MPE_LOG_INFO("ignoring lobby {}, which this mod did not open", event.lobby);
                 return;
             }
             current_lobby_       = event.lobby;
             operation_in_flight_ = false;
+            requested_lobby_     = 0;
             steam::SetCurrentLobby(event.lobby);
             RefreshOwnership();
             observer.OnLobbyEntered(event.lobby, is_owner_);
             return;
 
         case EventKind::LobbyEnterFailed:
+            if (requested_lobby_ != 0 && event.lobby != requested_lobby_) {
+                MPE_LOG_INFO("ignoring a failure to enter lobby {} while waiting for {}",
+                            event.lobby, requested_lobby_);
+                return;
+            }
             current_lobby_       = 0;
-    steam::SetCurrentLobby(0);
+            steam::SetCurrentLobby(0);
             is_owner_            = false;
             operation_in_flight_ = false;
+            requested_lobby_     = 0;
             observer.OnLobbyEnterFailed(Error{event.error_code, event.detail});
             return;
 

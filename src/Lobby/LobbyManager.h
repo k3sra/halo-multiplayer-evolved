@@ -154,7 +154,14 @@ struct HostOptions {
 /// Tunables with defaults chosen to be forgiving on a poor connection while
 /// never leaving a player staring at a frozen screen.
 struct LobbyTimings {
+    /// Entering the platform lobby. One Steam round trip, normally instant.
+    ///
+    /// Bounded because it used not to be, and an unbounded wait on a step that can silently
+    /// never complete is a session stuck forever with no error to show for it.
+    double join_timeout_seconds{15.0};
     double handshake_timeout_seconds{20.0};
+    /// How often a client re-greets a host that has not answered.
+    double handshake_resend_seconds{2.0};
     double connect_timeout_seconds{30.0};
     double load_timeout_seconds{180.0};
     double keepalive_interval_seconds{2.0};
@@ -245,6 +252,9 @@ private:
     [[nodiscard]] Result HandleHandshakeRequest(net::PeerHandle peer, ByteReader& reader);
     [[nodiscard]] Result HandleHandshakeAccept(ByteReader& reader);
     [[nodiscard]] Result HandleHandshakeReject(ByteReader& reader);
+    /// Greets the host, or greets it again when it has not answered.
+    [[nodiscard]] Result SendHandshakeRequest();
+
     [[nodiscard]] Result HandleRosterUpdate(ByteReader& reader);
     [[nodiscard]] Result HandleMatchSettings(ByteReader& reader);
     [[nodiscard]] Result HandleReadyStateChange(net::PeerHandle peer, ByteReader& reader);
@@ -338,8 +348,20 @@ private:
     // Timers, all in seconds.
     double phase_elapsed_{0.0};
     double keepalive_elapsed_{0.0};
+
+    /// Since the last time this client greeted the host.
+    ///
+    /// The greeting used to be sent once, so anything that lost it or its reply cost the
+    /// whole handshake timeout and then a failure. Repeating it turns that into a pause.
+    double handshake_resend_elapsed_{0.0};
     double roster_broadcast_elapsed_{0.0};
     double countdown_remaining_{0.0};
+    /// Wall clock instant the countdown ends, in epoch milliseconds.
+    ///
+    /// A deadline rather than a running total, because a total is only as accurate as the
+    /// tick that decrements it and a stalled tick stretched a five second countdown into a
+    /// minute while still announcing five.
+    std::int64_t countdown_deadline_ms_{0};
     std::uint8_t countdown_last_announced_{0};
 
     /// Host: the serialized map every client must hold.

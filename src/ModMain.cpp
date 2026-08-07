@@ -38,6 +38,7 @@
 #include "Debug/AccessTrap.h"
 #include "Unreal/FNameTrampoline.h"
 #include "Unreal/GameThread.h"
+#include "Unreal/LoadingLines.h"
 #include "Unreal/LobbyUI.h"
 #include "Update/UpdateCheck.h"
 #include "Engine/CampaignEngineControl.h"
@@ -317,7 +318,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.0";
+constexpr const char* kModVersion = "0.2.1";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -1401,9 +1402,17 @@ void OnMultiplayerClicked() {
     }
 
     // Whatever this player called their game last time, so it is typed once rather than
-    // once per launch.
+    // once per launch. Failing that, their own name, because a server nobody has named is
+    // still somebody's, and "Nessie's Server" tells a browser far more than a blank row or
+    // a placeholder that is the same on every machine.
     if (g_lobby.server_name.empty()) {
         g_lobby.server_name = LoadServerName();
+    }
+    if (g_lobby.server_name.empty()) {
+        const std::string owner = SteamPlayerName();
+        if (!owner.empty()) {
+            g_lobby.server_name = std::format("{}'s Server", owner);
+        }
     }
 
     // The screen is ordinary UMG: tabs, two team columns of player cards, a settings panel
@@ -1928,7 +1937,7 @@ void PublishSessionDetails() {
     }
 
     const std::string name =
-        g_lobby.server_name.empty() ? std::format("{}'s game", SteamPlayerName())
+        g_lobby.server_name.empty() ? std::format("{}'s Server", SteamPlayerName())
                                     : g_lobby.server_name;
     const std::string summary =
         std::format("{}|{}|{}|{}", name, g_lobby.mode, g_lobby.scenario,
@@ -3421,6 +3430,14 @@ std::chrono::steady_clock::time_point g_loading_since{};
 unreal::LoadingStage                  g_loading_stage = unreal::LoadingStage::None;
 std::uint32_t                         g_loading_frame = 0;
 
+/// Where in the list of lines this session starts.
+///
+/// Seeded once from the clock rather than reset per wait, so two players joining the same
+/// lobby do not read the same line at the same moment, and so the first thing anybody sees
+/// is not the same line every launch.
+std::uint32_t g_loading_line_seed = static_cast<std::uint32_t>(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+
 /// Builds the loading screen once, and again if its menu was collected under it.
 void PrepareLoadingOverlay() {
     if (!g_lobby_ui_ready || g_live_menu == 0) {
@@ -3616,10 +3633,34 @@ void RefreshLoadingScreen() {
         view.cancellable = true;
     }
 
+    // The line under the title is flavour, not narration.
+    //
+    // It used to describe the step, which the title already names, the bar already
+    // measures and the clock already times. Four lines saying the same thing is three too
+    // many. Something to read while waiting is worth more, and a line that changes every
+    // few seconds is also the clearest possible signal that the mod has not stopped.
+    //
+    // Except when something is actually wrong. A wait that has gone on long enough to be
+    // worth explaining gets the line back, because at that point it is the most useful
+    // thing on the screen.
+    if (view.elapsed_seconds < kCancelUnlocksAfterSeconds) {
+        view.detail = unreal::LoadingLine(g_loading_line_seed + view.frame / 40U);
+    }
+
     unreal::LobbyUIContext ui = g_lobby_ui;
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
     }
+    // A quarter of a second, not five.
+    //
+    // This runs twelve and a half times a second on the same thread that counts the
+    // countdown down and reads button presses. A five second deadline on a screen update
+    // means one unlucky frame costs five seconds of everything else, and the countdown
+    // advances by however much real time each tick observed, clamped to a second: enough
+    // stalled ticks in a row and a five second countdown takes a minute.
+    //
+    // Nothing here is worth waiting for. A dropped animation frame is invisible; a tick
+    // that does not happen is not.
     (void)unreal::RunOnGameThread(
         [&]() {
             unreal::SetLoadingView(ui, view);
@@ -3627,7 +3668,7 @@ void RefreshLoadingScreen() {
                 unreal::ShowLoadingOverlay(ui, true);
             }
         },
-        5000);
+        250);
     if (opening) {
         MPE_LOG_INFO("loading screen open: stage {}, {}%", static_cast<int>(view.stage),
                     view.percent);

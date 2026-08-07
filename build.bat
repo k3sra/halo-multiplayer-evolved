@@ -85,6 +85,7 @@ set SOURCES=^
  "%ROOT%src\Unreal\FNameTrampoline.cpp"^
  "%ROOT%src\Unreal\GameThread.cpp"^
  "%ROOT%src\Unreal\LobbyUI.cpp"^
+ "%ROOT%src\Unreal\LoadingLines.cpp"^
  "%ROOT%src\Unreal\ObjectArray.cpp"^
  "%ROOT%src\Unreal\Reflection.cpp"^
  "%ROOT%src\Engine\IEngineControl.cpp"^

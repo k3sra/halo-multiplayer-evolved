@@ -516,6 +516,9 @@ Result LobbyManager::StartCountdown() {
     }
 
     countdown_remaining_      = static_cast<double>(timings_.countdown_seconds);
+    countdown_deadline_ms_ =
+        static_cast<std::int64_t>(EpochMilliseconds()) +
+        static_cast<std::int64_t>(timings_.countdown_seconds) * 1000;
     countdown_last_announced_ = timings_.countdown_seconds + 1; // force a first announce
     TransitionTo(LobbyPhase::Countdown, "Starting match");
     return Result::Success();
@@ -673,6 +676,25 @@ void LobbyManager::TickClient(double delta_seconds) {
     (void)delta_seconds;
 
     switch (phase_) {
+        case LobbyPhase::Joining:
+            // The step that had no limit at all.
+            //
+            // Every other client phase was bounded and this one was not, so a Steam entry
+            // that never completed left the session on Joining for as long as the game was
+            // running: no progress, no error, no recovery, and nothing in the state machine
+            // that would ever look at it again. A player who picked a server out of the
+            // browser watched that screen until they killed the game.
+            //
+            // Entering a lobby is one Steam round trip and is normally instant. Fifteen
+            // seconds is generous for it and still short enough that the answer arrives
+            // while the player is still willing to wait for one.
+            if (phase_elapsed_ > timings_.join_timeout_seconds) {
+                Fault(Error{ErrorCode::Timeout,
+                            "Steam did not confirm entry to that lobby; it may have closed, "
+                            "filled up, or become invitation only"});
+            }
+            return;
+
         case LobbyPhase::Connecting:
             if (phase_elapsed_ > timings_.connect_timeout_seconds) {
                 Fault(Error{ErrorCode::Timeout,
@@ -684,6 +706,29 @@ void LobbyManager::TickClient(double delta_seconds) {
         case LobbyPhase::Handshaking:
             if (phase_elapsed_ > timings_.handshake_timeout_seconds) {
                 Fault(Error{ErrorCode::Timeout, "the host did not complete the handshake"});
+                return;
+            }
+
+            // Asked again rather than waited out.
+            //
+            // The greeting was sent exactly once, so anything that lost it or its reply
+            // cost the full handshake timeout and then a failure, with the host meanwhile
+            // showing the player on its roster as though they had arrived. A player watched
+            // that for twenty five seconds while their own screen said the host had not
+            // answered, and the host's screen said they had.
+            //
+            // Repeating it is cheap and the host is built to answer a repeat: it accepts a
+            // handshake from a peer it already knows and replies again. Two seconds is long
+            // enough not to be chatter and short enough that a lost message costs a pause
+            // rather than the join.
+            handshake_resend_elapsed_ += delta_seconds;
+            if (handshake_resend_elapsed_ >= timings_.handshake_resend_seconds) {
+                handshake_resend_elapsed_ = 0.0;
+                if (const Result sent = SendHandshakeRequest(); !sent.ok()) {
+                    MPE_LOG_DEBUG("re-sending the handshake failed: {}", sent.message());
+                } else {
+                    MPE_LOG_INFO("no answer yet; greeting the host again");
+                }
             }
             return;
 
@@ -721,7 +766,29 @@ void LobbyManager::TickCountdown(double delta_seconds) {
         return;
     }
 
+    // Whichever clock says there is less time left.
+    //
+    // Subtracting each tick's observed delta makes the countdown only as accurate as the
+    // tick, and the tick is clamped so that a long stall cannot cancel a launch in flight.
+    // Both are reasonable alone and together they stretch time: a mod thread losing seconds
+    // to a blocked screen update advanced the countdown by at most a second per tick, so
+    // five seconds of countdown took a minute of wall clock while announcing five.
+    //
+    // A wall clock deadline cannot be stretched, but it cannot be driven either, and the
+    // check harness runs this whole sequence on simulated time with no wall clock passing
+    // at all. Taking the smaller of the two satisfies both: real time bounds it from above
+    // so nothing can drag it out, and ticks still drive it for anything running faster than
+    // real time.
     countdown_remaining_ -= delta_seconds;
+    const auto now_ms = static_cast<std::int64_t>(EpochMilliseconds());
+    if (countdown_deadline_ms_ != 0) {
+        const double by_clock = countdown_deadline_ms_ > now_ms
+                                    ? static_cast<double>(countdown_deadline_ms_ - now_ms) /
+                                          1000.0
+                                    : 0.0;
+        countdown_remaining_ = std::min(countdown_remaining_, by_clock);
+    }
+
     const auto whole_seconds = static_cast<std::uint8_t>(
         std::max(0.0, std::ceil(countdown_remaining_)));
 
@@ -1006,6 +1073,20 @@ void LobbyManager::OnPeerConnected(PeerHandle peer, const PeerIdentity& identity
 
     // Client: the host is up. Introduce ourselves.
     host_peer_ = peer;
+    (void)identity;
+
+    if (const Result sent = SendHandshakeRequest(); !sent.ok()) {
+        Fault(sent.error());
+        return;
+    }
+    handshake_resend_elapsed_ = 0.0;
+    TransitionTo(LobbyPhase::Handshaking, "Joining match");
+}
+
+Result LobbyManager::SendHandshakeRequest() {
+    if (host_peer_ == PeerHandle::Invalid) {
+        return Result::Fail(ErrorCode::InvalidState, "there is no host connection to greet");
+    }
 
     const Expected<std::string> name = backend_.LocalDisplayName();
     std::vector<std::byte> packet;
@@ -1017,14 +1098,7 @@ void LobbyManager::OnPeerConnected(PeerHandle peer, const PeerIdentity& identity
     body.platform_id  = local_id_;
     body.Write(builder.Body());
 
-    if (const Result sent = SendTo(peer, MessageType::HandshakeRequest, packet,
-                                   SendMode::Reliable);
-        !sent.ok()) {
-        Fault(sent.error());
-        return;
-    }
-    (void)identity;
-    TransitionTo(LobbyPhase::Handshaking, "Joining match");
+    return SendTo(host_peer_, MessageType::HandshakeRequest, packet, SendMode::Reliable);
 }
 
 void LobbyManager::OnPeerDisconnected(PeerHandle peer, DisconnectReason reason,
@@ -1351,6 +1425,29 @@ Result LobbyManager::HandleRosterUpdate(ByteReader& reader) {
         player.ping_milliseconds = entry.ping_milliseconds;
         player.load_progress     = player.is_local ? local_progress : 0.0f;
         players_.push_back(std::move(player));
+    }
+
+    // A roster with us on it is the host saying yes.
+    //
+    // The accept and the roster are sent on different channels, which are independently
+    // ordered lanes, so either can arrive first and either can be the one that goes
+    // missing. Waiting only for the accept meant a client could hold a complete, current
+    // roster with its own name on it, drawn on its own screen, while still reporting that
+    // the host had not answered. That is the state a player sat in for twenty five
+    // seconds, looking at both players in the lobby behind a screen that said otherwise.
+    //
+    // The host does not put anybody on the roster until it has accepted their handshake,
+    // so being on one is proof of the same thing the accept carries. Treating it as such
+    // costs nothing when the accept arrives normally, because by then the phase has
+    // already moved.
+    if (!is_host_ && phase_ == LobbyPhase::Handshaking) {
+        const bool listed = std::any_of(players_.begin(), players_.end(),
+                                        [](const PlayerSlot& p) { return p.is_local; });
+        if (listed) {
+            MPE_LOG_INFO("the host's roster already lists this machine; treating the "
+                        "handshake as complete");
+            TransitionTo(LobbyPhase::InLobby, "In lobby");
+        }
     }
 
     MarkDirty();
