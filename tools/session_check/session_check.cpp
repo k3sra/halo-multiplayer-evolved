@@ -26,6 +26,7 @@
 #include "Engine/IEngineControl.h"
 #include "Lobby/LobbyManager.h"
 #include "Net/IPeerTransport.h"
+#include "Lobby/Discovery.h"
 #include "Net/PacketProtocol.h"
 
 namespace {
@@ -504,6 +505,77 @@ void HostLeavingFaultsTheGuest() {
     Check(pair.client.Snapshot().players.empty(), "and the roster is emptied with it");
 }
 
+
+void BrowserDecisions() {
+    std::printf("what the server browser lists\n");
+
+    const std::uint64_t mine = 4242;
+
+    RawListing ours;
+    ours.id      = 99;
+    ours.host_id = "76561198000000001";
+    ours.marker  = "2";
+    Check(JudgeListing(ours, mine, "2") == ListingVerdict::Listed,
+          "another player's session of the same version is listed");
+
+    RawListing own = ours;
+    own.id = mine;
+    Check(JudgeListing(own, mine, "2") == ListingVerdict::OwnSession,
+          "this machine's own session is not");
+
+    // The bug that made the browser incapable of returning a row: a fireteam lobby the
+    // game opened carries no host id, and used to be indistinguishable from ours because
+    // the key being tested was one nothing ever wrote.
+    RawListing fireteam;
+    fireteam.id = 1234;
+    Check(JudgeListing(fireteam, mine, "2") == ListingVerdict::NotOurs,
+          "a lobby with no host id is not one of ours");
+
+    RawListing older = ours;
+    older.marker = "1";
+    Check(JudgeListing(older, mine, "2") == ListingVerdict::WrongProtocol,
+          "a session speaking an older protocol is not listed");
+
+    // A build that has not been told what to look for lists what it can rather than going
+    // silently empty, which is the failure mode this whole area already had once.
+    Check(JudgeListing(ours, mine, "") == ListingVerdict::Listed,
+          "with no expected marker, anything of ours is still listed");
+
+    Check(SessionStatusFromPhase("hosting") == "LOBBY", "a hosting session reads as a lobby");
+    Check(SessionStatusFromPhase("") == "LOBBY", "so does one that has published nothing");
+    Check(SessionStatusFromPhase("in_match") == "IN GAME", "a running match reads as in game");
+    Check(SessionStatusFromPhase("loading") == "IN GAME", "so does one that is loading");
+    Check(SessionStatusFromPhase("countdown") == "IN GAME", "so does one counting down");
+}
+
+void InviteListPaging() {
+    std::printf("which friend a row on a page means\n");
+
+    constexpr int rows = 10;
+
+    Check(FriendPageCount(0, rows) == 1, "an empty list still has one page");
+    Check(FriendPageCount(10, rows) == 1, "ten friends fit on one page");
+    Check(FriendPageCount(11, rows) == 2, "eleven need two");
+
+    Check(FriendIndexFor(0, 0, 25, rows) == 0, "the first row of the first page is the first");
+    Check(FriendIndexFor(1, 0, 25, rows) == 10, "the first row of the second page follows it");
+    Check(FriendIndexFor(2, 4, 25, rows) == 24, "the last row of the last page is the last");
+
+    // The rows past the end of an uneven final page must not resolve to anybody, or
+    // pressing an empty row invites whoever happens to be at that index.
+    Check(FriendIndexFor(2, 5, 25, rows) == static_cast<std::size_t>(-1),
+          "a row past the end of the list means nobody");
+    Check(FriendIndexFor(9, 0, 25, rows) == static_cast<std::size_t>(-1),
+          "and so does a page past the end");
+
+    // Paging back from the first page: a plain modulo of a negative is negative in C++,
+    // which would land on a page where every row reads as empty.
+    Check(StepFriendPage(0, -1, 25, rows) == 2, "paging back from the first page wraps to the last");
+    Check(StepFriendPage(2, 1, 25, rows) == 0, "and forward from the last wraps to the first");
+    Check(StepFriendPage(0, 1, 5, rows) == 0, "a single page does not move");
+    Check(StepFriendPage(0, -1, 0, rows) == 0, "an empty list does not move either");
+}
+
 } // namespace
 
 int main() {
@@ -513,6 +585,8 @@ int main() {
     NothingWaitsOnReadiness();
     PublicStaysPublic();
     HostLeavingFaultsTheGuest();
+    BrowserDecisions();
+    InviteListPaging();
 
     std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;
