@@ -238,6 +238,7 @@ void PrepareLobby();
 void PrepareStatusOverlay();
 void PrepareLoadingOverlay();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
+void DumpClassSurface(const unreal::ObjectArray& objects, const unreal::Reflection& reflection);
 void RegisterLoadingCancel();
 void RefreshLoadingScreen();
 void OnCancelLoading();
@@ -934,6 +935,7 @@ void TickLoop() {
                 if (TakeEngineView(objects, reflection) && objects->Count() > 20000) {
                     s_surveyed = true;
                     SurveyNetworkSurface(*objects);
+                    DumpClassSurface(*objects, *reflection);
                 }
             }
         }
@@ -1842,6 +1844,70 @@ void SurveyNetworkSurface(const unreal::ObjectArray& objects) {
         MPE_LOG_INFO("      {}", joined);
     }
     MPE_LOG_INFO("=== end networking surface ===");
+}
+
+/// Dumps everything a named class actually exposes: its functions and its properties.
+///
+/// The survey by name found the session subsystems and almost nothing on them, which is the
+/// answer rather than a disappointment: their functions are not called things like
+/// "JoinNetworkSession", they are called Host, Start, Travel and Leave. A keyword sweep
+/// cannot find those without also returning half the engine.
+///
+/// So this asks the classes themselves. These are the handful of types that stand between
+/// two people being in the same world and not, and what is wanted from each of them is the
+/// complete list, not the part that matched a word.
+void DumpClassSurface(const unreal::ObjectArray& objects,
+                      const unreal::Reflection&  reflection) {
+    static constexpr std::string_view kClasses[] = {
+        "BlamNetworkSessionGameInstanceSubsystem",
+        "BlamOnlineSessionSubsystem",
+        "BlamNetworkGameStateComponent",
+        "BlamNetworkPlayerControllerComponent",
+        "BlamNetworkPlayerStateComponent",
+        "BlamCampaignFlowGameSubsystem",
+        "BlamMultiplayerGlobalsTagDataAsset",
+        "BlamCoopSpawningGlobalsDefinitionTagDataAsset",
+    };
+
+    for (const std::string_view wanted : kClasses) {
+        std::uintptr_t class_object = 0;
+        objects.ForEach([&](const unreal::ObjectInfo& object) {
+            if (object.name != wanted || object.class_name.find("Class") == std::string::npos) {
+                return true;
+            }
+            class_object = object.address;
+            return false;
+        });
+        if (class_object == 0) {
+            MPE_LOG_INFO("  {}: not present in this build", wanted);
+            continue;
+        }
+
+        MPE_LOG_INFO("--- {} (0x{:X}) ---", wanted, class_object);
+
+        // Functions are objects whose outer is the class, so they are found by walking the
+        // array rather than by asking the class, which has no reflected list of them.
+        std::vector<std::string> functions;
+        objects.ForEach([&](const unreal::ObjectInfo& object) {
+            if (object.class_name != "Function" || object.outer_address != class_object) {
+                return true;
+            }
+            functions.push_back(object.name);
+            return true;
+        });
+        std::sort(functions.begin(), functions.end());
+        for (const std::string& name : functions) {
+            MPE_LOG_INFO("    fn  {}", name);
+        }
+        if (functions.empty()) {
+            MPE_LOG_INFO("    fn  (none reflected; native only)");
+        }
+
+        for (const unreal::PropertyInfo& property : reflection.ReadAllProperties(class_object)) {
+            MPE_LOG_INFO("    var {} : {} at +0x{:X}", property.name, property.type_name,
+                        property.offset);
+        }
+    }
 }
 
 /// Writes a full picture of the session into the log, on demand.

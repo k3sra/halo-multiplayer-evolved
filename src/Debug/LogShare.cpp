@@ -53,8 +53,48 @@ std::string             g_endpoint;
 /// at send time means the first report after sign in carries the real identity.
 std::function<std::string()> g_describe;
 
+std::atomic<bool>       g_running{false};
+
+/// The last label that named a real machine, kept so it never has to be asked for twice.
+std::mutex  g_label_mutex;
+std::string g_known_label;
+
+/// Who this machine is, asked for at most until the answer is worth keeping.
+///
+/// Asking every time is what made the label useful, because sharing starts before Steam is
+/// signed in and a label taken then is the same placeholder everywhere. Asking every time is
+/// also what made the game crash on the way out: the supplier reads the Steam persona name
+/// and id, the final report is sent during teardown, and by then the game has released
+/// Steam. Reading through a released interface faulted inside steam_api64, on every exit,
+/// whether the player quit from the menu or killed the window.
+///
+/// Caching the first real answer satisfies both. Steam is asked until it says something
+/// worth keeping, and never again, so the report sent while the process is coming down
+/// touches nothing that might already be gone.
 [[nodiscard]] std::string Label() {
-    return g_describe ? g_describe() : std::string("unidentified");
+    {
+        std::lock_guard lock(g_label_mutex);
+        if (!g_known_label.empty()) {
+            return g_known_label;
+        }
+    }
+    if (!g_describe) {
+        return "unidentified";
+    }
+    if (!g_running.load(std::memory_order_acquire)) {
+        // Shutting down. Whatever the supplier reads may already have been released, and
+        // an unnamed report is worth immeasurably more than a crash on exit.
+        return "unidentified";
+    }
+
+    std::string described = g_describe();
+    // "PLAYER (0)" is the shape of an answer given before Steam signed in. Anything with a
+    // real id in it is worth keeping; anything else is worth asking about again.
+    if (described.find("(0)") == std::string::npos && !described.empty()) {
+        std::lock_guard lock(g_label_mutex);
+        g_known_label = described;
+    }
+    return described;
 }
 std::filesystem::path   g_log_path;
 std::thread             g_worker;
@@ -62,7 +102,7 @@ std::mutex              g_mutex;
 std::condition_variable g_wake;
 std::string             g_pending_reason;
 bool                    g_has_pending = false;
-std::atomic<bool>       g_running{false};
+
 
 /// How far into the log has already been sent.
 std::uintmax_t g_sent_offset = 0;
