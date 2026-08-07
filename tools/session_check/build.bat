@@ -32,6 +32,7 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor /u
    /I "%ROOT%\src" /Fo"%OUT%\session_check\\" /Fe"%OUT%\session_check.exe" ^
    "%~dp0session_check.cpp" ^
    "%ROOT%\src\Net\PacketProtocol.cpp" ^
+   "%ROOT%\src\Lobby\Discovery.cpp" ^
    "%ROOT%\src\Lobby\LobbyManager.cpp" ^
    "%ROOT%\src\Engine\IEngineControl.cpp" ^
    "%ROOT%\src\Map\MapVariant.cpp" ^
