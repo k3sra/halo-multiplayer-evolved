@@ -5,13 +5,10 @@
 #include "Unreal/LobbyUI.h"
 
 #include "Core/Log.h"
+#include "Core/Text.h"
 #include "Unreal/GameThread.h"
 #include "Lobby/Discovery.h"
 #include "Unreal/ProcessMemory.h"
-
-// For MultiByteToWideChar: Steam hands back UTF-8 and the engine's text wants UTF-16.
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
 
 #include <algorithm>
 #include <array>
@@ -85,6 +82,12 @@ std::uintptr_t g_map_marker[4] = {0, 0, 0, 0};
 /// The server name field, so its contents can be read back when hosting.
 std::uintptr_t g_server_name_field = 0;
 
+/// The three values in the settings panel: game time, friendly fire, respawn time.
+///
+/// Values rather than whole lines, so writing the host's settings into them costs three
+/// short strings and leaves the names they belong to alone.
+std::uintptr_t g_setting_value[3] = {0, 0, 0};
+
 /// ESlateVisibility values used throughout.
 constexpr std::uint8_t kVisibleValue          = 0;
 constexpr std::uint8_t kCollapsedValue        = 1;
@@ -92,6 +95,12 @@ constexpr std::uint8_t kHitTestInvisible      = 3;
 /// EStretch::Fill. Stretches a widget to its whole box rather than fitting it centred.
 constexpr std::uint8_t kStretchFill           = 1;
 constexpr std::uint8_t kSelfHitTestInvisibleValue = 4;
+
+/// How faded a control is when it belongs to somebody else.
+///
+/// Low enough to read as unavailable at a glance and high enough that the value on it is
+/// still legible, which is the entire point of showing it rather than removing it.
+constexpr float kDisabledOpacity = 0.42F;
 
 /// The server table, built once and then only rewritten.
 ///
@@ -113,6 +122,51 @@ struct ServerRowWidgets {
 constexpr std::size_t kServerRows = 8;
 ServerRowWidgets g_server_row[kServerRows];
 
+/// One column of the server table: where it is, how large its text is, and how much of it
+/// fits.
+///
+/// The limit is not decoration. A text block given more than it can draw does not wrap or
+/// clip, it keeps going over whatever is beside it, so a column's width only holds if the
+/// value written into it was cut to match. Keeping the two in one place is what stops a
+/// column being widened without its limit following, which is how CAPTURE THE FLAG came to
+/// be printed across the map.
+struct TableColumn {
+    const char* heading;
+    float       x;
+    float       width;
+    float       size;
+    /// In code points. At these sizes the frontend's face runs about half the point size
+    /// per character, so a column holds roughly twice its width divided by its size.
+    std::size_t limit;
+};
+constexpr float kTableX = 390.0F;
+constexpr float kTableW = 1000.0F;
+constexpr TableColumn kColumns[] = {
+    {"SERVER",  400.0F,  330.0F, 22.0F, 28},
+    {"MODE",    746.0F,  150.0F, 17.0F, 16},
+    {"MAP",     906.0F,  150.0F, 17.0F, 16},
+    {"PLAYERS", 1066.0F, 150.0F, 17.0F, 16},
+    {"PING",    1226.0F, 140.0F, 17.0F, 14},
+};
+
+/// How many characters a player's name may take on a team card.
+///
+/// The card is a hundred and thirty two wide and the name box is a hundred and sixteen of
+/// that, which at eighteen point is about thirteen characters. A Steam persona name is
+/// routinely longer, and the overflow printed across the card beside it.
+constexpr std::size_t kSlotNameLimit = 13;
+
+/// The mode, short enough for the table's column.
+///
+/// The browser's filter buttons already say CTF, so this is the name the screen uses for it
+/// rather than an abbreviation invented for one column.
+[[nodiscard]] std::string ShortMode(std::string_view mode) {
+    if (mode == "CAPTURE THE FLAG") {
+        return "CTF";
+    }
+    return mpe::text::Ellipsise(mode, kColumns[1].limit);
+}
+
 /// The details panel's five value lines, and the filter markers.
 std::uintptr_t g_detail_line[5]   = {0, 0, 0, 0, 0};
 std::uintptr_t g_filter_mode[3]   = {0, 0, 0};
@@ -131,34 +185,11 @@ std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0, 0};
 
 /// Turns UTF-8 into the wide string the engine's text conversion expects.
 ///
-/// Every one of these used to widen by casting each byte to a wchar_t. That is correct for
-/// ASCII and wrong for everything else: a Steam persona name is UTF-8, so a name with any
-/// character outside ASCII arrived as one garbage glyph per byte. A player called Nessie
-/// with decorated brackets around the name rendered as "£T? Nessie £T?" on the team card,
-/// which looks like the mod corrupting somebody's name, because it was.
-///
-/// Falls back to the old byte for byte widening only if the conversion fails outright,
-/// which keeps a name on screen rather than blanking the card.
-[[nodiscard]] std::wstring WidenUtf8(std::string_view text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int needed = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
-                                             static_cast<int>(text.size()), nullptr, 0);
-    if (needed > 0) {
-        std::wstring wide(static_cast<std::size_t>(needed), wchar_t{});
-        if (::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                                  wide.data(), needed) == needed) {
-            return wide;
-        }
-    }
-    std::wstring fallback;
-    fallback.reserve(text.size());
-    for (const char character : text) {
-        fallback.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
-    }
-    return fallback;
-}
+/// In Core/Text rather than here, because GameThread widens strings too and the two copies
+/// disagreed: this one decoded UTF-8 and that one still cast byte by byte, so the same name
+/// drew correctly on a team card and as garbage on a menu entry. One implementation, with
+/// tests, is the only way that stays fixed.
+using mpe::text::WidenUtf8;
 
 /// Green under a hundred, amber to a hundred and fifty, red past it.
 ///
@@ -243,12 +274,47 @@ struct FriendRowWidgets {
 };
 FriendRowWidgets g_friend_row[kFriendRows];
 
+// --- The loading screen ------------------------------------------------------
+//
+// Its own viewport widget above everything else, because the waits it covers do not all
+// happen on the same screen: accepting an invitation starts from the main menu, starting a
+// match starts from the lobby, and loading a map takes both of them away.
+std::uintptr_t g_loading_host   = 0;
+std::uintptr_t g_loading_scaler = 0;
+std::uintptr_t g_loading_root   = 0;
+bool           g_loading_open   = false;
+
+std::uintptr_t g_loading_title   = 0;
+std::uintptr_t g_loading_percent = 0;
+std::uintptr_t g_loading_detail  = 0;
+std::uintptr_t g_loading_elapsed = 0;
+/// The bar. The fill's slot is what carries the value, and the sweep's slot is what carries
+/// the fact that there is no value to carry.
+std::uintptr_t g_loading_fill      = 0;
+std::uintptr_t g_loading_fill_slot = 0;
+std::uintptr_t g_loading_sweep      = 0;
+std::uintptr_t g_loading_sweep_slot = 0;
+/// One marker and one label per stage, so the four waits read as a route rather than as
+/// four unrelated screens that happen to look alike.
+constexpr std::size_t kLoadingStages = 4;
+std::uintptr_t g_loading_step_bar[kLoadingStages]   = {0, 0, 0, 0};
+std::uintptr_t g_loading_step_label[kLoadingStages] = {0, 0, 0, 0};
+std::uintptr_t g_loading_cancel = 0;
+
+/// The bar's geometry, shared by the track, the fill and the sweep.
+constexpr float kBarX = 474.0F;
+constexpr float kBarY = 512.0F;
+constexpr float kBarW = 972.0F;
+constexpr float kBarH = 14.0F;
+
 /// The invite list's own widgets. Built with the lobby and kept collapsed.
 std::uintptr_t g_invite_panel  = 0; ///< The canvas holding all of it.
 std::uintptr_t g_friend_empty  = 0; ///< Shown when there is nobody to list.
 std::uintptr_t g_friend_hint   = 0; ///< The second line of the empty state.
 std::uintptr_t g_friend_count  = 0; ///< "12 FRIENDS, 3 IN GAME", in the header.
 std::uintptr_t g_friend_page   = 0; ///< The page indicator between the paging buttons.
+/// Whether the session an invitation would point at exists yet, and whose it is.
+std::uintptr_t g_invite_state  = 0;
 bool           g_invite_open   = false;
 
 /// Builds widgets and places them on a canvas.
@@ -277,12 +343,17 @@ public:
         return parameters.return_value;
     }
 
-    /// Parents a widget to a canvas and places it.
+    /// Parents a widget to a canvas, places it, and hands back its slot.
     ///
     /// Anchors are left at the default top left, and the position and size are given in
     /// design space; the canvas scales the whole thing to the real viewport.
-    [[nodiscard]] bool Place(std::uintptr_t canvas, std::uintptr_t widget, float x, float y,
-                             float width, float height) const {
+    ///
+    /// The slot is returned because a progress bar is a panel whose width is the value it
+    /// reports, and the slot is where a canvas keeps that width. Everything else discards
+    /// it, since a widget that never moves has no use for it.
+    [[nodiscard]] std::uintptr_t PlaceReturningSlot(std::uintptr_t canvas,
+                                                    std::uintptr_t widget, float x, float y,
+                                                    float width, float height) const {
         struct AddParameters {
             std::uintptr_t content;
             std::uintptr_t return_value;
@@ -291,21 +362,54 @@ public:
         add.content = widget;
         if (!CallFunction(canvas, context_.add_to_canvas, &add).ok() ||
             add.return_value == 0) {
-            return false;
+            return 0;
         }
         const std::uintptr_t slot = add.return_value;
+        SetSlotPosition(slot, x, y);
+        SetSlotSize(slot, width, height);
+        return slot;
+    }
 
+    [[nodiscard]] bool Place(std::uintptr_t canvas, std::uintptr_t widget, float x, float y,
+                             float width, float height) const {
+        return PlaceReturningSlot(canvas, widget, x, y, width, height) != 0;
+    }
+
+    void SetSlotPosition(std::uintptr_t slot, float x, float y) const {
+        if (slot == 0 || context_.set_position == 0) {
+            return;
+        }
         struct VectorParameters {
             Vector2 value;
         };
         VectorParameters position{};
         position.value = {x, y};
         (void)CallFunction(slot, context_.set_position, &position);
+    }
 
+    void SetSlotSize(std::uintptr_t slot, float width, float height) const {
+        if (slot == 0 || context_.set_size == 0) {
+            return;
+        }
+        struct VectorParameters {
+            Vector2 value;
+        };
         VectorParameters size{};
         size.value = {width, height};
         (void)CallFunction(slot, context_.set_size, &size);
-        return true;
+    }
+
+    /// A filled rectangle whose slot is kept, so it can be moved or resized later.
+    [[nodiscard]] std::uintptr_t PanelSlotted(std::uintptr_t canvas, float x, float y,
+                                              float width, float height, LinearColour colour,
+                                              std::uintptr_t& out_slot) const {
+        const std::uintptr_t border = Spawn(context_.border_class);
+        if (border == 0) {
+            return 0;
+        }
+        SetBorderColour(border, colour);
+        out_slot = PlaceReturningSlot(canvas, border, x, y, width, height);
+        return out_slot == 0 ? 0 : border;
     }
 
     /// A filled rectangle, used for panels, bars and slots.
@@ -559,6 +663,33 @@ public:
         (void)CallFunction(widget, context_.set_visibility, &parameters);
     }
 
+    /// Fades a widget and everything under it.
+    void SetOpacityOf(std::uintptr_t widget, float opacity) const {
+        if (context_.set_render_opacity == 0 || widget == 0) {
+            return;
+        }
+        struct Parameters {
+            float opacity;
+        };
+        Parameters parameters{opacity};
+        (void)CallFunction(widget, context_.set_render_opacity, &parameters);
+    }
+
+    /// Shows a control as somebody else's to change.
+    ///
+    /// Dimmed and unpressable, rather than collapsed. A guest has to be able to see the mode,
+    /// the map and the settings the host picked, because those decide the match they are
+    /// about to play; taking the controls away left three empty panels that said nothing at
+    /// all. Hit testing is what stops it being pressed, and the fade is what stops it looking
+    /// like it should be.
+    void SetControlEnabled(std::uintptr_t widget, bool enabled) const {
+        if (widget == 0) {
+            return;
+        }
+        SetVisibilityOf(widget, enabled ? kVisibleValue : kHitTestInvisible);
+        SetOpacityOf(widget, enabled ? 1.0F : kDisabledOpacity);
+    }
+
     /// A field the player can type into.
     ///
     ///   EditableTextBox +0x2E8 Text (FText, written directly)
@@ -790,10 +921,17 @@ void BuildPlayerCard(const Builder& builder, std::uintptr_t canvas, SlotWidgets&
     // The filled state: a team coloured strip so the side is readable at a glance rather
     // than only from the column heading, then the name and the role.
     out.strip = builder.Panel(canvas, x, y, kCardWidth, 4.0F, team);
-    out.name  = builder.Text(canvas, x + 8.0F, y + kCardHeight - 46.0F, kCardWidth - 16.0F,
-                             22.0F, "", kText);
+    // Eighteen point rather than twenty two, and the name given the card's full inner width.
+    //
+    // At twenty two a name of any ordinary length was wider than the hundred and sixteen
+    // points it had, and a text block that runs out of room keeps drawing rather than
+    // clipping, so the overflow printed across the card beside it. The size and the
+    // character limit in SetLobbyRoster are one decision: changing either alone brings the
+    // overlap back.
+    out.name  = builder.Text(canvas, x + 8.0F, y + kCardHeight - 48.0F, kCardWidth - 16.0F,
+                             24.0F, "", kText, 18.0F);
     out.role  = builder.Text(canvas, x + 8.0F, y + kCardHeight - 24.0F, kCardWidth - 16.0F,
-                             18.0F, "Player", kTextDim);
+                             18.0F, "Player", kTextDim, 15.0F);
     builder.SetVisibilityOf(out.strip, kCollapsedValue);
     builder.SetVisibilityOf(out.name, kCollapsedValue);
     builder.SetVisibilityOf(out.role, kCollapsedValue);
@@ -872,20 +1010,35 @@ void DrawHostTab(const Builder& builder, std::uintptr_t canvas, const LobbyView&
     SetLobbyRoster(builder.Context(), view.blue, view.red, view.host_name);
 
     // Right: settings and server name.
+    //
+    // Drawn as name and value rather than as one sentence per line.
+    //
+    // Every one of these was a fixed label built from whatever this machine happened to
+    // think when the screen was made, and never touched again. On a guest that is simply
+    // wrong: it showed this machine's defaults while describing somebody else's match. They
+    // are text now, so the host's real values can be written into them, and the value sits
+    // in its own column so a change of one does not reflow the line it is on.
     (void)builder.Backer(canvas, 1440.0F, 250.0F, 440.0F, 190.0F, kPanelLight);
     (void)builder.Label(canvas, 1444.0F, 172.0F, 440.0F, 74.0F, "LOBBY SETTINGS");
-    (void)builder.Label(canvas, 1456.0F, 262.0F, 408.0F, 54.0F,
-                        std::format("GAME TIME: {}min", view.game_time_minutes));
-    (void)builder.Label(canvas, 1456.0F, 320.0F, 408.0F, 54.0F,
-                        std::format("FRIENDLY FIRE: {}", view.friendly_fire ? "ON" : "OFF"));
-    (void)builder.Label(canvas, 1456.0F, 378.0F, 408.0F, 54.0F,
-                        std::format("RESPAWN TIME: {}s", view.respawn_seconds));
+    const std::array<const char*, 3> setting_names = {"GAME TIME", "FRIENDLY FIRE",
+                                                      "RESPAWN TIME"};
+    for (std::size_t line = 0; line < setting_names.size(); ++line) {
+        const float y = 274.0F + static_cast<float>(line) * 50.0F;
+        (void)builder.Text(canvas, 1462.0F, y, 240.0F, 30.0F, setting_names[line], kTextDim,
+                           20.0F);
+        g_setting_value[line] =
+            builder.Text(canvas, 1706.0F, y, 156.0F, 30.0F, "", kText, 20.0F);
+        builder.SetVisibilityOf(g_setting_value[line], kHitTestInvisible);
+    }
 
     (void)builder.Panel(canvas, 1452.0F, 498.0F, 416.0F, 68.0F, kPanelLight);
     (void)builder.Text(canvas, 1456.0F, 462.0F, 400.0F, 28.0F, "SERVER NAME", kAccent,
                        18.0F);
     g_server_name_field = builder.Field(canvas, 1468.0F, 512.0F, 384.0F, 40.0F,
                                         view.server_name);
+    // A guest sees the host's name here and cannot type over it, so the field is one of the
+    // things the authority pass governs.
+    g_host_only.push_back(g_server_name_field);
 
     // Bottom right action.
     // The host starts the match; a client waits for them to.
@@ -956,54 +1109,65 @@ void DrawBrowseTab(const Builder& builder, std::uintptr_t canvas, const LobbyVie
     }
 
     // Middle: the table. Headings in the frontend's own art, then eight permanent rows.
-    const std::array<const char*, 5> headings = {"SERVER", "MODE", "MAP", "PLAYERS", "PING"};
-    // Spaced so the widest heading fits its own column. PLAYERS is the long one, so the
-    // gap after it is the one that matters; at thirty point it ran straight into PING.
-    const std::array<float, 5> columns = {400.0F, 800.0F, 980.0F, 1120.0F, 1290.0F};
-    const std::array<float, 5> widths  = {390.0F, 170.0F, 130.0F, 160.0F, 110.0F};
-
+    //
+    // HOW THE COLUMNS ARE SIZED, AND WHY THEY OVERFLOWED
+    //
+    // A text block given more than it can draw does not wrap or clip; it keeps going, over
+    // whatever is next to it. So a column's width is not a suggestion here, it is the only
+    // thing keeping one field out of another, and it has to be paired with a character
+    // limit rather than trusted on its own.
+    //
+    // Two collisions came out of not doing that. "CAPTURE THE FLAG" at twenty two point is
+    // about two hundred and twenty points wide and its column was a hundred and seventy, so
+    // it ran through the gap and printed over the map. And the LOBBY tag sat twenty four
+    // points below a twenty four point name in a twenty six point box, which is not below
+    // it at all.
+    //
+    // Every column now states its own font and its own limit, in one table the headings and
+    // the cells both read from, and kColumnLimit is derived from the width rather than
+    // guessed: at these sizes the frontend's face runs about half the point size per
+    // character, so a column fits roughly twice its width in points divided by the size.
     // Text, not the button art.
     //
     // A label is a button scaled to fit its box, and a column is under two hundred wide, so
     // whatever size is asked for it comes out at about a third of it. A heading is not a
     // button, so it is drawn as text in the game's own font, where the size is the size.
-    for (std::size_t index = 0; index < headings.size(); ++index) {
-        (void)builder.Text(canvas, columns[index], 206.0F, widths[index], 26.0F,
-                           headings[index], kAccent, 17.0F);
+    for (const TableColumn& column : kColumns) {
+        (void)builder.Text(canvas, column.x, 206.0F, column.width, 26.0F, column.heading,
+                           kAccent, 16.0F);
     }
-    (void)builder.Panel(canvas, 390.0F, 244.0F, 1000.0F, 2.0F, kAccentDim);
+    (void)builder.Panel(canvas, kTableX, 244.0F, kTableW, 2.0F, kAccentDim);
 
     float row_y = 258.0F;
     for (std::size_t index = 0; index < kServerRows; ++index) {
         ServerRowWidgets& row = g_server_row[index];
-        row.highlight = builder.Panel(canvas, 390.0F, row_y, 1000.0F, 62.0F, kAccentDim);
+        row.highlight = builder.Panel(canvas, kTableX, row_y, kTableW, 62.0F, kAccentDim);
 
         // The pressable area goes down before the text, so the text draws over it rather
         // than being hidden behind it, and the text is made non interactive so the click
         // still reaches the row underneath. The whole row is the target: a server is
         // chosen by clicking it, not by a separate control that would need explaining.
-        row.button = builder.Button(canvas, 390.0F, row_y, 1000.0F, 62.0F, " ",
+        row.button = builder.Button(canvas, kTableX, row_y, kTableW, 62.0F, " ",
                                     kStretchFill);
         controls.push_back({row.button, LobbyAction::SelectServer, static_cast<int>(index)});
 
-        row.name    = builder.Text(canvas, columns[0] + 10.0F, row_y + 18.0F, widths[0],
-                                   26.0F, "", kText, 24.0F);
-        row.mode    = builder.Text(canvas, columns[1], row_y + 18.0F, widths[1], 26.0F, "",
-                                   kTextDim, 22.0F);
-        row.map     = builder.Text(canvas, columns[2], row_y + 18.0F, widths[2], 26.0F, "",
-                                   kTextDim, 22.0F);
-        row.players = builder.Text(canvas, columns[3], row_y + 18.0F, widths[3], 26.0F, "",
-                                   kTextDim, 22.0F);
-        row.ping    = builder.Text(canvas, columns[4], row_y + 18.0F, widths[4], 26.0F, "",
-                                   kTextDim, 22.0F);
+        // The name sits high in the row and the tag sits under it, with the row's height
+        // split between them rather than both laying claim to the middle of it.
+        row.name    = builder.Text(canvas, kColumns[0].x, row_y + 8.0F, kColumns[0].width,
+                                   28.0F, "", kText, kColumns[0].size);
+        row.status  = builder.Text(canvas, kColumns[0].x, row_y + 38.0F, kColumns[0].width,
+                                   20.0F, "", kTextDim, 14.0F);
 
-        // Under the name rather than in a column of its own. The table is already as wide
-        // as the design allows, and this qualifies the server rather than being another
-        // field of it: a row that says IN GAME is the same server, differently joinable.
-        row.status  = builder.Text(canvas, columns[0] + 10.0F, row_y + 42.0F, widths[0],
-                                   20.0F, "", kTextDim, 15.0F);
+        // The other four are centred on the row, since none of them has a second line.
+        std::uintptr_t* const cells[4] = {&row.mode, &row.map, &row.players, &row.ping};
+        for (std::size_t cell = 0; cell < std::size(cells); ++cell) {
+            const TableColumn& column = kColumns[cell + 1];
+            *cells[cell] = builder.Text(canvas, column.x, row_y + 20.0F, column.width, 26.0F,
+                                        "", kTextDim, column.size);
+        }
+
         for (const std::uintptr_t block : {row.name, row.mode, row.map, row.players,
-                                           row.ping}) {
+                                           row.ping, row.status}) {
             builder.SetVisibilityOf(block, kHitTestInvisible);
         }
         row_y += 70.0F;
@@ -1112,9 +1276,17 @@ void DrawInvitePanel(const Builder& builder, std::uintptr_t canvas,
         builder.Text(canvas, cross_x + 13.0F, cross_y + 4.0F, 44.0F, 40.0F, "X", kTextDim,
                      26.0F);
     builder.SetVisibilityOf(cross, kHitTestInvisible);
-    (void)builder.Text(canvas, kInsetX, kCardY + 72.0F, kInsetW, 28.0F,
-                       "Whoever you pick joins this session, not a fireteam.", kTextDim,
-                       18.0F);
+
+    // What the session is doing, in the place a fixed sentence used to be.
+    //
+    // The line it replaced said the same thing every time it was drawn, which is a line
+    // worth nothing on a panel that opens before the session exists. A player who presses a
+    // slot and sees a list of names reasonably assumes pressing one will work; when the
+    // lobby is still being created it will not, and the only honest thing to do is say so
+    // here rather than let the press fail silently.
+    g_invite_state = builder.Text(canvas, kInsetX, kCardY + 72.0F, kInsetW, 28.0F,
+                                  "PREPARING YOUR SESSION", kWarn, 18.0F);
+    builder.SetVisibilityOf(g_invite_state, kHitTestInvisible);
 
     // The roster's own summary. A list of names says nothing about how many of them can
     // actually act on an invitation now, and that is the useful number.
@@ -1828,6 +2000,11 @@ Result ResolveLobbyStatics(const ObjectArray& objects, LobbyUIContext& out_conte
     context.get_child_at          = find("GetChildAt", "PanelWidget");
     context.get_desired_size      = find("GetDesiredSize", "Widget");
     context.set_stretch           = find("SetStretch", "ScaleBox");
+    // Greying a control out rather than taking it off the screen. Render opacity applies to
+    // a widget and everything under it, which is the only way to dim the frontend's button:
+    // its label, its brackets and its art are its own children, and none of them are text
+    // blocks whose colour this code could write.
+    context.set_render_opacity    = find("SetRenderOpacity", "Widget");
     context.set_keyboard_focus    = find("SetKeyboardFocus", "Widget");
     context.get_player_controller = find("GetPlayerController", "GameplayStatics");
     context.set_input_mode_ui  = find("SetInputMode_UIOnlyEx", "WidgetBlueprintLibrary");
@@ -2127,6 +2304,15 @@ bool InvitePanelIsOpen() {
     return g_invite_open;
 }
 
+void SetInvitePanelState(const LobbyUIContext& context, std::string_view text,
+                         InviteReadiness readiness) {
+    const Builder builder(context);
+    builder.SetTextLive(g_invite_state, text);
+    builder.SetColourLive(g_invite_state, readiness == InviteReadiness::Ready      ? kGood
+                                          : readiness == InviteReadiness::Preparing ? kWarn
+                                                                                    : kBad);
+}
+
 void SetLobbyFriends(const LobbyUIContext& context, const std::vector<LobbyFriend>& friends,
                      int page) {
     const Builder builder(context);
@@ -2177,7 +2363,9 @@ void SetLobbyFriends(const LobbyUIContext& context, const std::vector<LobbyFrien
                                 entry.invited ? kHitTestInvisible : kCollapsedValue);
         builder.SetBorderColour(row.stripe, tone);
 
-        builder.SetTextLive(row.name, entry.name);
+        // The row is 728 wide with 186 of it given to the status, so the name has about 520
+        // points at 23 point, which is around forty five characters.
+        builder.SetTextLive(row.name, text::CleanDisplayName(entry.name, 45));
         builder.SetTextLive(row.status, label);
         builder.SetColourLive(row.status, tone);
 
@@ -2232,8 +2420,12 @@ void SetLobbyRoster(const LobbyUIContext& context, const std::vector<std::string
             if (!occupied) {
                 continue;
             }
+            // Cleaned and cut to the card, which is a hundred and sixteen points of name
+            // box. The comparison against the host is made on the raw name, because two
+            // long names that differ past the cut would otherwise both come back as the
+            // owner.
             const std::string& name = players[static_cast<std::size_t>(slot)];
-            builder.SetTextLive(card.name, name);
+            builder.SetTextLive(card.name, text::CleanDisplayName(name, kSlotNameLimit));
             builder.SetTextLive(card.role, name == host_name ? "Owner" : "Player");
         }
         builder.SetTextLive(g_team_heading[side],
@@ -2244,26 +2436,51 @@ void SetLobbyRoster(const LobbyUIContext& context, const std::vector<std::string
 void SetLobbyHostControls(const LobbyUIContext& context, bool is_host) {
     const Builder builder(context);
 
-    // Removed rather than greyed out.
+    // Greyed out rather than removed.
     //
-    // A client cannot choose the mode or the map, and cannot start the match; those belong
-    // to whoever is hosting. Leaving the controls on screen and inert is the worst of both:
-    // it looks like the mod ignoring a press. Taking them away says the truth, which is
-    // that there is nothing here for a guest to decide.
-    const std::uint8_t visibility = is_host ? kVisibleValue : kCollapsedValue;
+    // Taking them away was the previous answer and it was the wrong one. A guest cannot
+    // choose the mode, the map, the settings or the server name, and cannot start the
+    // match, but they very much need to see what was chosen: those are the terms of the
+    // game they are about to play. Collapsing the lot left three empty panels and a screen
+    // that told a guest less than the browser row they joined from.
+    //
+    // Dimmed and unpressable says both things at once. The value is legible, and the fade
+    // and the dead mouse together say it is not theirs to change, which is the same
+    // vocabulary every other program uses for the same idea.
     for (const std::uintptr_t widget : g_host_only) {
-        builder.SetVisibilityOf(widget, visibility);
+        builder.SetControlEnabled(widget, is_host);
     }
 
-    // The markers go with them, or a collapsed button leaves its highlight bar floating
-    // over the backdrop with nothing behind it.
-    if (!is_host) {
-        for (const std::uintptr_t marker : g_mode_marker) {
-            builder.SetVisibilityOf(marker, kCollapsedValue);
-        }
-        for (const std::uintptr_t marker : g_map_marker) {
-            builder.SetVisibilityOf(marker, kCollapsedValue);
-        }
+    // The selection markers stay, dimmed with what they mark. They are how a guest can see
+    // which mode and which map the host settled on, so removing them would take away the
+    // one thing the mode and map lists are for on a screen nobody can press.
+    for (const std::uintptr_t marker : g_mode_marker) {
+        builder.SetOpacityOf(marker, is_host ? 1.0F : kDisabledOpacity);
+    }
+    for (const std::uintptr_t marker : g_map_marker) {
+        builder.SetOpacityOf(marker, is_host ? 1.0F : kDisabledOpacity);
+    }
+}
+
+void SetLobbySettings(const LobbyUIContext& context, const LobbySettingsView& settings) {
+    const Builder builder(context);
+
+    const std::array<std::string, 3> values = {
+        settings.game_time_minutes > 0 ? std::format("{} MIN", settings.game_time_minutes)
+                                       : std::string("NO LIMIT"),
+        settings.friendly_fire ? "ON" : "OFF",
+        std::format("{} SEC", settings.respawn_seconds),
+    };
+    for (std::size_t line = 0; line < values.size(); ++line) {
+        builder.SetTextLive(g_setting_value[line], values[line]);
+    }
+
+    // Written into the field rather than beside it, because the field is where a player
+    // looks for the name. On a guest it is the host's name, and the field is dimmed and
+    // unpressable by the authority pass, so it reads as a value rather than a prompt.
+    if (!settings.server_name.empty() && g_server_name_field != 0) {
+        builder.SetTextLiveOn(g_server_name_field, context.set_editable_text,
+                              settings.server_name);
     }
 }
 
@@ -2310,9 +2527,14 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
         }
 
         const ServerEntry& entry = servers[index];
-        builder.SetTextLive(row.name, entry.name);
-        builder.SetTextLive(row.mode, entry.mode);
-        builder.SetTextLive(row.map, entry.map);
+
+        // Every value is cut to its column before it is written. The name is cleaned as well
+        // as cut, because a server name is typed by somebody else and arrives with whatever
+        // they felt like putting in it.
+        builder.SetTextLive(row.name,
+                            text::CleanDisplayName(entry.name, kColumns[0].limit));
+        builder.SetTextLive(row.mode, ShortMode(entry.mode));
+        builder.SetTextLive(row.map, text::Ellipsise(entry.map, kColumns[2].limit));
         builder.SetTextLive(row.players,
                             std::format("{}/{}", entry.players, entry.capacity));
 
@@ -2377,6 +2599,231 @@ void ForgetStatusOverlay() {
 
 std::uint32_t LobbyBuildId() {
     return g_lobby_build_id;
+}
+
+// --- The loading screen ------------------------------------------------------
+
+bool LoadingOverlayIsBuilt() {
+    return g_loading_host != 0 && g_loading_root != 0;
+}
+
+std::uintptr_t LoadingOverlayWidget() {
+    return g_loading_host;
+}
+
+std::uintptr_t LoadingCancelButton() {
+    return g_loading_cancel;
+}
+
+bool LoadingOverlayIsOpen() {
+    return g_loading_open;
+}
+
+void ForgetLoadingOverlay() {
+    g_loading_host   = 0;
+    g_loading_scaler = 0;
+    g_loading_root   = 0;
+    g_loading_open   = false;
+
+    g_loading_title      = 0;
+    g_loading_percent    = 0;
+    g_loading_detail     = 0;
+    g_loading_elapsed    = 0;
+    g_loading_fill       = 0;
+    g_loading_fill_slot  = 0;
+    g_loading_sweep      = 0;
+    g_loading_sweep_slot = 0;
+    for (std::size_t step = 0; step < kLoadingStages; ++step) {
+        g_loading_step_bar[step]   = 0;
+        g_loading_step_label[step] = 0;
+    }
+}
+
+Result BuildLoadingOverlay(const LobbyUIContext& context) {
+    if (LoadingOverlayIsBuilt()) {
+        return Result::Success();
+    }
+    if (!context.Complete()) {
+        return Result::Fail(ErrorCode::InvalidState, "the lobby UI context is incomplete");
+    }
+
+    const Builder builder(context);
+
+    // Above both the lobby at 1000 and the status overlay at 1001.
+    //
+    // A loading screen that something can be drawn over is not a loading screen. The two
+    // things it has to cover are exactly the two that would otherwise be on top of it: the
+    // lobby it was started from, and the status panel that reports on a session which is in
+    // the middle of changing.
+    const std::uintptr_t root =
+        CreateHostedCanvasAt(context, 1002, g_loading_host, g_loading_scaler);
+    if (root == 0) {
+        return Result::Fail(ErrorCode::InvalidState, "could not host the loading overlay");
+    }
+
+    // Full bleed and nearly opaque. It also swallows every click, which is the point: while
+    // a session is being joined or a match is being started, the lobby underneath is
+    // describing a state that is already gone, and a press landing on it would act on it.
+    (void)builder.Panel(root, 0.0F, 0.0F, kDesignWidth, kDesignHeight, {0, 0, 0, 0.93F});
+
+    // The card. Wide and short, sitting on the horizon rather than filling the screen,
+    // because there is very little to say and a large box with a little in it reads as
+    // something having gone wrong.
+    constexpr float kCardX = 430.0F;
+    constexpr float kCardY = 356.0F;
+    constexpr float kCardW = 1060.0F;
+    constexpr float kCardH = 368.0F;
+    (void)builder.Backer(root, kCardX, kCardY, kCardW, kCardH, kPanel);
+    (void)builder.Panel(root, kCardX, kCardY, 4.0F, kCardH, kAccent);
+
+    // What is happening, and how far through it is. The number is the size it is because it
+    // is the thing a player looks at, and it sits on the same line as the title so the eye
+    // does not have to travel between the two.
+    g_loading_title = builder.Text(root, kBarX, kCardY + 36.0F, 700.0F, 52.0F, "", kAccent,
+                                   38.0F);
+    g_loading_percent =
+        builder.Text(root, 1256.0F, kCardY + 28.0F, 200.0F, 68.0F, "", kText, 54.0F);
+
+    // The running commentary. This is the line that makes the difference between a screen
+    // that is working and a screen that has hung, and it is why every wait below reports
+    // what it is actually doing rather than a stage name repeated.
+    g_loading_detail =
+        builder.Text(root, kBarX, kCardY + 104.0F, 900.0F, 30.0F, "", kTextDim, 20.0F);
+
+    // The bar: a track, a fill whose width is the value, and a sweep that only appears when
+    // there is no value. Three separate widgets rather than one that changes meaning,
+    // because a bar that sometimes reports a fraction and sometimes reports motion has to be
+    // able to be both without either looking like the other.
+    (void)builder.Panel(root, kBarX, kBarY, kBarW, kBarH, {1.0F, 1.0F, 1.0F, 0.08F});
+    g_loading_fill =
+        builder.PanelSlotted(root, kBarX, kBarY, 0.0F, kBarH, kAccent, g_loading_fill_slot);
+    g_loading_sweep = builder.PanelSlotted(root, kBarX, kBarY, 180.0F, kBarH,
+                                           {0.294F, 0.780F, 0.886F, 0.55F},
+                                           g_loading_sweep_slot);
+    builder.SetVisibilityOf(g_loading_sweep, kCollapsedValue);
+
+    // The four waits, as a route. Somebody watching this wants to know not only what is
+    // happening but how much of it there is left, and four labelled steps answer that
+    // without a sentence.
+    static constexpr const char* kStepNames[kLoadingStages] = {
+        "JOINING LOBBY", "STARTING SESSION", "LOADING MAP", "WAITING FOR PLAYERS"};
+    for (std::size_t step = 0; step < kLoadingStages; ++step) {
+        const float x = kBarX + static_cast<float>(step) * 246.0F;
+        g_loading_step_bar[step] = builder.Panel(root, x, kBarY + 38.0F, 226.0F, 3.0F,
+                                                 {1.0F, 1.0F, 1.0F, 0.10F});
+        g_loading_step_label[step] =
+            builder.Text(root, x, kBarY + 48.0F, 226.0F, 22.0F, kStepNames[step], kTextDim,
+                         14.0F);
+        builder.SetVisibilityOf(g_loading_step_label[step], kHitTestInvisible);
+    }
+
+    // The one number that is always true, whatever else the screen can or cannot measure.
+    g_loading_elapsed =
+        builder.Text(root, 1256.0F, kCardY + 268.0F, 200.0F, 30.0F, "", kTextDim, 22.0F);
+
+    for (const std::uintptr_t block :
+         {g_loading_title, g_loading_percent, g_loading_detail, g_loading_elapsed}) {
+        builder.SetVisibilityOf(block, kHitTestInvisible);
+    }
+
+    // A way out. Waiting on a machine that is never going to answer is the failure this
+    // whole screen exists to make visible, and a visible failure with no exit is worse than
+    // no screen at all.
+    g_loading_cancel = builder.Button(root, kBarX, kCardY + 258.0F, 300.0F, 64.0F, "CANCEL");
+
+    g_loading_root = root;
+    SetWidgetVisibility(context, g_loading_host, kCollapsedValue);
+    g_loading_open = false;
+    MPE_LOG_INFO("loading overlay built at 0x{:X}", root);
+    return Result::Success();
+}
+
+void ShowLoadingOverlay(const LobbyUIContext& context, bool visible) {
+    if (g_loading_host == 0) {
+        return;
+    }
+    // Visible rather than SelfHitTestInvisible, unlike every other overlay here: this one
+    // is meant to swallow clicks. The screen behind it describes a session that is in the
+    // middle of becoming something else, and a press landing on it would act on the old one.
+    SetWidgetVisibility(context, g_loading_host, visible ? kVisible : kCollapsedValue);
+    g_loading_open = visible;
+}
+
+void SetLoadingView(const LobbyUIContext& context, const LoadingView& view) {
+    if (!LoadingOverlayIsBuilt()) {
+        return;
+    }
+    const Builder builder(context);
+
+    static constexpr const char* kTitles[] = {"", "JOINING LOBBY", "STARTING SESSION",
+                                              "LOADING MAP", "WAITING FOR PLAYERS"};
+    const auto stage_index = static_cast<std::size_t>(view.stage);
+
+    // Three dots that cycle, on the title.
+    //
+    // The cheapest possible proof that the mod is still running. Everything else on this
+    // screen can legitimately stand still for a long time, and a screen where nothing at all
+    // moves is one a player is right to think has hung.
+    const int    dots = static_cast<int>((view.frame / 4) % 4);
+    std::string  title(kTitles[stage_index < std::size(kTitles) ? stage_index : 0]);
+    title.append(static_cast<std::size_t>(dots), '.');
+    builder.SetTextLive(g_loading_title, title);
+
+    const int clamped = view.percent < 0 ? 0 : (view.percent > 100 ? 100 : view.percent);
+    const std::string clock = std::format("{:02}:{:02}", view.elapsed_seconds / 60,
+                                          view.elapsed_seconds % 60);
+
+    // The large readout is whichever number is actually true right now.
+    //
+    // While there is a fraction to report it is the percentage, because that is what
+    // somebody waiting wants. While there is not, it is the elapsed time, because a
+    // percentage that has not moved for two minutes is the exact thing this screen exists to
+    // avoid, and a made up one is worse: a player reads it as a promise. The clock always
+    // moves and is never wrong.
+    builder.SetTextLive(g_loading_percent,
+                        view.indeterminate ? clock : std::format("{}%", clamped));
+    builder.SetTextLive(g_loading_detail, view.detail);
+    builder.SetTextLive(g_loading_elapsed, view.indeterminate ? std::string{} : clock);
+
+    builder.SetSlotSize(g_loading_fill_slot,
+                        kBarW * static_cast<float>(clamped) / 100.0F, kBarH);
+
+    // The sweep runs only while there is nothing to measure, and it starts off the left
+    // edge and ends off the right so it enters and leaves rather than appearing and
+    // vanishing at the ends of the track.
+    if (view.indeterminate) {
+        constexpr float kSweepW = 180.0F;
+        const float     span    = kBarW + kSweepW;
+        const float     offset  = static_cast<float>((view.frame * 14U) % static_cast<unsigned>(span));
+        const float     left    = kBarX - kSweepW + offset;
+        const float     visible_left  = left < kBarX ? kBarX : left;
+        const float     visible_right = (left + kSweepW) > (kBarX + kBarW) ? kBarX + kBarW
+                                                                           : left + kSweepW;
+        builder.SetVisibilityOf(g_loading_sweep, kHitTestInvisible);
+        builder.SetSlotPosition(g_loading_sweep_slot, visible_left, kBarY);
+        builder.SetSlotSize(g_loading_sweep_slot,
+                            visible_right > visible_left ? visible_right - visible_left : 0.0F,
+                            kBarH);
+    } else {
+        builder.SetVisibilityOf(g_loading_sweep, kCollapsedValue);
+    }
+
+    // Done, doing, and still to come. Three states rather than two, because "which one am I
+    // on" and "how many are left" are different questions and a player waiting asks both.
+    for (std::size_t step = 0; step < kLoadingStages; ++step) {
+        const std::size_t number = step + 1; // Stage None is zero.
+        const bool        done   = stage_index > number;
+        const bool        active = stage_index == number;
+        builder.SetBorderColour(g_loading_step_bar[step],
+                                active ? kAccent
+                                : done ? kAccentDim
+                                       : LinearColour{1.0F, 1.0F, 1.0F, 0.10F});
+        builder.SetColourLive(g_loading_step_label[step],
+                              active ? kText : (done ? kTextDim : LinearColour{0.35F, 0.39F,
+                                                                                0.41F, 1.0F}));
+    }
+
+    builder.SetControlEnabled(g_loading_cancel, view.cancellable);
 }
 
 Result BuildStatusOverlay(const LobbyUIContext& context) {

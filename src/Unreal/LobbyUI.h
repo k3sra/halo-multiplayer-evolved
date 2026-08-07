@@ -118,6 +118,54 @@ enum class LobbyAction {
     /// Pages the invite list, for a friends list longer than one screen.
     FriendsPrevious,
     FriendsNext,
+    /// Abandons whatever the loading screen is waiting for.
+    CancelLoading,
+};
+
+/// Which of the four waits the player is in.
+///
+/// Named after what is actually happening rather than after a phase, because the phase is
+/// the mod's word for it and these are the player's: joining somebody, starting a match,
+/// loading the map, waiting for the others to finish loading theirs.
+enum class LoadingStage : std::uint8_t {
+    None = 0,
+    JoiningLobby,
+    StartingSession,
+    LoadingMap,
+    WaitingForPlayers,
+};
+
+/// Everything the loading screen shows.
+struct LoadingView {
+    LoadingStage stage{LoadingStage::None};
+
+    /// Zero to a hundred, across the whole wait rather than within one step.
+    ///
+    /// Each stage owns a band of the bar and fills its own band from a real measurement:
+    /// how many of the three connection steps are done, how much of the countdown is left,
+    /// how many peers have finished loading. The bands are what keep it moving forward
+    /// instead of restarting at every stage.
+    int percent{0};
+
+    /// True while the length of the current step genuinely cannot be known.
+    ///
+    /// Loading the map is the case. The engine's campaign entry point commits to the load
+    /// and returns; it reports no fraction, and inventing a curve for it would be a number
+    /// the player could read as a promise. An indeterminate bar is the honest signal for
+    /// working with no end in sight, and it is what every other program uses for it.
+    bool indeterminate{false};
+
+    /// The live line under the bar, saying what is happening at this moment.
+    std::string detail;
+
+    /// How long this wait has been going, which is the one number that is always true.
+    int elapsed_seconds{0};
+
+    /// Advances once per animation tick, so the screen animates without keeping a clock.
+    std::uint32_t frame{0};
+
+    /// False once cancelling would leave the session in a worse state than waiting.
+    bool cancellable{true};
 };
 
 /// One row in the invite list.
@@ -188,6 +236,14 @@ struct LobbyUIContext {
     /// Reads a widget's visibility so folding the menu away can put it back exactly as it
     /// was. Restoring it to Visible instead is what left the main menu drawn and dead.
     std::uintptr_t get_visibility{0};
+    /// Dims a control instead of removing it.
+    ///
+    /// A guest cannot change the mode, the map or the settings, and the screen used to say
+    /// so by collapsing all of it, which left three empty panels and no way to see what the
+    /// host had actually chosen. Render opacity applies to a widget and everything beneath
+    /// it, which is what makes it work on the frontend's button: its label and its bracket
+    /// art are children this code did not create and cannot recolour one by one.
+    std::uintptr_t set_render_opacity{0};
     /// Walking the menu root's children, so the widgets to fold away are the ones actually
     /// parented there rather than a list of offsets guessed from a header.
     std::uintptr_t get_children_count{0};
@@ -355,12 +411,32 @@ void ShowLobbyUI(const LobbyUIContext& context, bool visible);
 /// Must run on the game thread.
 void SetLobbyTab(const LobbyUIContext& context, bool browsing);
 
-/// Shows or hides everything only a host may use: the mode and map choices, and START
-/// MATCH.
+/// Enables or greys out everything only a host may use.
 ///
-/// A client cannot change any of it, so it is taken off the screen rather than left inert.
+/// That is the mode and map choices, the three lobby settings, the server name field and
+/// START MATCH. A client cannot change any of it, but has to be able to read all of it,
+/// because those are the terms of the match it is about to play. Greyed out and unpressable
+/// says both things; collapsing them, which is what this used to do, left empty panels and
+/// told a guest nothing.
+///
 /// Must run on the game thread.
 void SetLobbyHostControls(const LobbyUIContext& context, bool is_host);
+
+/// The three lobby settings and the server name, as they should read right now.
+struct LobbySettingsView {
+    int         game_time_minutes{15};
+    bool        friendly_fire{false};
+    int         respawn_seconds{5};
+    /// Empty leaves whatever the field holds, which is what a host typing into it wants.
+    std::string server_name;
+};
+
+/// Writes the settings panel.
+///
+/// Driven from the session rather than from what this machine last chose, because on a
+/// guest those are different things and only one of them describes the match. Must run on
+/// the game thread.
+void SetLobbySettings(const LobbyUIContext& context, const LobbySettingsView& settings);
 
 /// Marks which game mode is selected, without rebuilding the screen.
 ///
@@ -420,6 +496,37 @@ struct LobbyStatus {
 /// Rewrites the status panel in place. Must run on the game thread.
 void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status);
 
+/// Builds the loading screen. Safe to call repeatedly; it builds once.
+///
+/// Its own viewport widget above the lobby's and the status overlay's, because it has to
+/// cover whatever is behind it: joining somebody happens from the main menu as often as
+/// from the lobby. Must run on the game thread.
+[[nodiscard]] Result BuildLoadingOverlay(const LobbyUIContext& context);
+
+/// True once the loading screen exists and can simply be shown.
+[[nodiscard]] bool LoadingOverlayIsBuilt();
+
+/// The widget the viewport holds it in, so a caller can check it still exists.
+[[nodiscard]] std::uintptr_t LoadingOverlayWidget();
+
+/// Drops every handle without touching them, for when the objects have been collected.
+void ForgetLoadingOverlay();
+
+/// Puts the loading screen up or takes it down. Must run on the game thread.
+void ShowLoadingOverlay(const LobbyUIContext& context, bool visible);
+
+/// True while it is up.
+[[nodiscard]] bool LoadingOverlayIsOpen();
+
+/// Rewrites it in place. Must run on the game thread.
+void SetLoadingView(const LobbyUIContext& context, const LoadingView& view);
+
+/// The CANCEL button, so the caller can make it live and map a press to an action.
+///
+/// It is not part of the lobby's control list because the loading screen outlives the lobby
+/// and is rebuilt on its own schedule, so the caller registers it separately.
+[[nodiscard]] std::uintptr_t LoadingCancelButton();
+
 /// Builds the status overlay, which is separate from the lobby and outlives it.
 ///
 /// It reports on the mod rather than on whichever screen is showing, so it belongs to
@@ -474,6 +581,26 @@ void ShowInvitePanel(const LobbyUIContext& context, bool visible);
 
 /// True while the invite list is on screen.
 [[nodiscard]] bool InvitePanelIsOpen();
+
+/// Whether an invitation sent right now would reach anywhere.
+enum class InviteReadiness : std::uint8_t {
+    /// The lobby is still being created. Nothing can be invited to it yet.
+    Preparing,
+    /// There is a session, and pressing a name sends an invitation to it.
+    Ready,
+    /// There is no session and none is coming, so the panel is a dead end.
+    Unavailable,
+};
+
+/// Says what the session behind the panel is doing.
+///
+/// The panel opens the instant a slot is pressed, which is before the Steam lobby exists,
+/// so it has to be able to say that. Without it the first press of the session showed a
+/// list of names that silently did nothing when one was chosen.
+///
+/// Must run on the game thread.
+void SetInvitePanelState(const LobbyUIContext& context, std::string_view text,
+                         InviteReadiness readiness);
 
 /// Rewrites the invite list in place.
 ///

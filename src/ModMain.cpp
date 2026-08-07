@@ -34,6 +34,7 @@
 #include "Core/GameBuild.h"
 #include "Core/Log.h"
 #include "Core/Pacing.h"
+#include "Core/Text.h"
 #include "Debug/AccessTrap.h"
 #include "Unreal/FNameTrampoline.h"
 #include "Unreal/GameThread.h"
@@ -204,10 +205,16 @@ void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
 void ShowSessionNotice(std::string title, std::string detail);
+void ReportLaunchFailure(std::string_view reason);
+void HandleLaunchFailureLocked();
 void CheckOwnSessionIsFindable();
 void RefreshLobbyAuthority();
 void PrepareLobby();
 void PrepareStatusOverlay();
+void PrepareLoadingOverlay();
+void RegisterLoadingCancel();
+void RefreshLoadingScreen();
+void OnCancelLoading();
 void InviteFriendAt(int row);
 void CloseInviteList();
 void PageFriendList(int direction);
@@ -216,6 +223,27 @@ void RefreshLobbyRoster();
 [[nodiscard]] std::string LoadServerName();
 void                      SaveServerName(const std::string& name);
 [[nodiscard]] lobby::LobbyId HostedLobbyLocked();
+[[nodiscard]] lobby::LobbyId CurrentSessionLobbyLocked();
+
+/// True when this machine may change what the lobby is playing.
+///
+/// The mode, the map, the settings, the server name and the start of the match all belong
+/// to whoever is hosting. Not being in a session at all counts as being the host, because
+/// pressing MULTIPLAYER and choosing a mode before anybody has joined is how a session gets
+/// its settings in the first place.
+[[nodiscard]] bool LocalPlayerHasAuthority();
+
+/// The same, said on screen. Returns false when the press should be ignored.
+[[nodiscard]] bool RefuseWithoutAuthority(std::string_view what);
+
+/// What the invite panel should say about the session behind it.
+struct InviteSessionState {
+    lobby::LobbyId          lobby{0};
+    std::string             text;
+    unreal::InviteReadiness readiness{unreal::InviteReadiness::Preparing};
+};
+[[nodiscard]] InviteSessionState DescribeInviteSession();
+void                             RefreshInvitePanelState();
 
 /// Which multiplayer screen is showing.
 ///
@@ -264,11 +292,12 @@ std::vector<unreal::LobbyControl> g_lobby_controls;
 unreal::ServerFilter g_server_filter;
 int                  g_selected_server = 0;
 
-/// True while a slot has been pressed but the session is not yet ready to be invited to.
+/// The session line the invite panel is currently showing.
 ///
-/// Creating a Steam lobby is asynchronous, so the first press always arrives too early.
-/// Remembering it means the player's click is honoured a moment later rather than lost.
-bool g_invite_pending = false;
+/// Compared against what the session says now, so the panel is rewritten when the answer
+/// changes and left alone the rest of the time. Cleared when the panel closes, so reopening
+/// it always writes the line rather than assuming the widget still holds it.
+std::string g_invite_state_shown;
 
 /// True when the pool and the object array were read from the static image rather than
 /// searched for. It decides whether the slow search, and the waiting that exists only to
@@ -288,7 +317,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.1.9";
+constexpr const char* kModVersion = "0.2.0";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -468,6 +497,56 @@ std::mutex               g_state_mutex;
 std::unique_ptr<ModState> g_state;               ///< Guarded by g_state_mutex.
 std::atomic<bool>        g_running{false};
 std::atomic<bool>        g_ready{false};         ///< True once the lobby manager exists.
+
+// --- The engine view, reachable without the state lock -----------------------
+//
+// A second copy of the object array and the reflection, behind a lock of their own.
+//
+// This exists because of exactly one deadlock, and it is worth naming precisely so it is
+// not reintroduced. The tick loop holds g_state_mutex while it calls LobbyManager::Tick.
+// Beginning a match happens inside that tick, and it needs the object array, which lived
+// only inside g_state. Reaching for it therefore meant taking g_state_mutex again: from the
+// same thread if done directly, and from the game thread if done through a dispatched job.
+// The second is what shipped. The game thread blocked on a lock the tick was holding, the
+// tick blocked waiting for the game thread, and the pair sat there for the whole sixty
+// second timeout before the wait gave up and left a job running against a stack frame that
+// had already returned.
+//
+// Both are cheap value types: an address, a couple of counts and a pointer to the name pool,
+// which outlives everything. Copying them is a handful of bytes, and having them behind a
+// lock that is never held across a tick means anything, on any thread, can read them without
+// ordering itself against the lobby.
+std::mutex                         g_engine_view_mutex;
+std::optional<unreal::ObjectArray> g_engine_objects;
+std::optional<unreal::Reflection>  g_engine_reflection;
+
+/// Publishes the object array for anything that needs it without the state lock.
+void PublishEngineObjects(const unreal::ObjectArray& objects) {
+    std::lock_guard lock(g_engine_view_mutex);
+    g_engine_objects = objects;
+}
+
+/// The same for reflection.
+void PublishEngineReflection(const unreal::Reflection& reflection) {
+    std::lock_guard lock(g_engine_view_mutex);
+    g_engine_reflection = reflection;
+}
+
+/// Takes a copy of both, or reports that they are not ready.
+///
+/// Optionals rather than references, because neither type is default constructible: a
+/// Reflection is only meaningful against a name pool, and there is no such thing as one
+/// without.
+[[nodiscard]] bool TakeEngineView(std::optional<unreal::ObjectArray>& out_objects,
+                                  std::optional<unreal::Reflection>&  out_reflection) {
+    std::lock_guard lock(g_engine_view_mutex);
+    if (!g_engine_objects.has_value() || !g_engine_reflection.has_value()) {
+        return false;
+    }
+    out_objects    = g_engine_objects;
+    out_reflection = g_engine_reflection;
+    return true;
+}
 
 /// True from load until teardown begins.
 ///
@@ -718,6 +797,10 @@ void TickLoop() {
                 // the loading screen blocked. Clamped so timers do not jump and
                 // cancel a countdown that was fine.
                 g_state->manager->Tick(delta > 1.0 ? 1.0 : delta);
+
+                // A launch that failed on the game thread is unwound here, on the thread
+                // that owns the lobby.
+                HandleLaunchFailureLocked();
             } else {
                 last_tick = std::chrono::steady_clock::now();
             }
@@ -745,6 +828,21 @@ void TickLoop() {
         // they share a virtual table with exists, and that is established last.
         PrepareStatusOverlay();
         PrepareLobby();
+        PrepareLoadingOverlay();
+        RegisterLoadingCancel();
+
+        // Twelve and a half times a second, which is enough for the dots to read as a cycle
+        // and the sweep as motion. Sixty would be smoother and would cost sixty game thread
+        // round trips a second to animate three widgets, which is not a trade worth making
+        // while the machine is loading a level.
+        {
+            static auto s_last_frame = std::chrono::steady_clock::time_point{};
+            const auto  now          = std::chrono::steady_clock::now();
+            if (now - s_last_frame >= std::chrono::milliseconds(80)) {
+                s_last_frame = now;
+                RefreshLoadingScreen();
+            }
+        }
 
         // Kept current while a session is up: the name, mode and map a player picks have to
         // reach the lobby's metadata or nobody browsing can tell one game from another.
@@ -763,11 +861,10 @@ void TickLoop() {
             }
         }
 
-        // A slot pressed before the lobby finished being created is honoured here, once it
-        // exists, rather than being dropped.
-        if (g_invite_pending) {
-            OpenSessionInvite();
-        }
+        // The invite panel's session line, while it is open. The lobby it points at finishes
+        // being created a beat after the panel opens, and this is what stops the line saying
+        // the session is being prepared once it is not.
+        RefreshInvitePanelState();
 
         RefreshLobbyStatus();
         CheckOwnSessionIsFindable();
@@ -885,14 +982,23 @@ void TickLoop() {
                     ApplyServerFilter();
                     break;
                 case unreal::LobbyAction::SelectCaptureTheFlag:
+                    if (RefuseWithoutAuthority("the game mode")) {
+                        break;
+                    }
                     g_lobby.mode = "CAPTURE THE FLAG";
                     SelectLobbyMode(false);
                     break;
                 case unreal::LobbyAction::SelectSlayer:
+                    if (RefuseWithoutAuthority("the game mode")) {
+                        break;
+                    }
                     g_lobby.mode = "SLAYER";
                     SelectLobbyMode(true);
                     break;
                 case unreal::LobbyAction::StartMatch:
+                    if (RefuseWithoutAuthority("when the match starts")) {
+                        break;
+                    }
                     OnStartMatch();
                     break;
                 case unreal::LobbyAction::JoinMatch:
@@ -949,6 +1055,9 @@ void TickLoop() {
                     ApplyServerFilter();
                     break;
                 case unreal::LobbyAction::SelectMap:
+                    if (RefuseWithoutAuthority("the map")) {
+                        break;
+                    }
                     SelectLobbyMap(pressed_index);
                     break;
 
@@ -969,6 +1078,9 @@ void TickLoop() {
                     break;
                 case unreal::LobbyAction::FriendsNext:
                     PageFriendList(1);
+                    break;
+                case unreal::LobbyAction::CancelLoading:
+                    OnCancelLoading();
                     break;
             }
         }
@@ -1218,6 +1330,9 @@ int LogObjectsMatching(std::string_view fragment, std::size_t limit) {
     // wrong for the rest of the session. Anything this early therefore uses fixed offsets
     // rather than reflected ones.
     g_state->reflection.emplace(*g_state->names);
+
+    PublishEngineObjects(*g_state->objects);
+    PublishEngineReflection(*g_state->reflection);
     return true;
 }
 
@@ -1416,6 +1531,12 @@ void CaptureServerName() {
     if (!g_lobby_ui_ready) {
         return;
     }
+    // A guest's field holds the host's name, put there by the authority pass. Reading it
+    // back would take somebody else's name, save it as this machine's own, and advertise it
+    // the next time this player hosted anything.
+    if (!LocalPlayerHasAuthority()) {
+        return;
+    }
     unreal::LobbyUIContext ui = g_lobby_ui;
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
@@ -1493,23 +1614,6 @@ void EnsureSessionHosted() {
 /// while the lobby is still being created, and asking to invite then did nothing at all,
 /// silently. The request is remembered instead and opened the moment hosting completes.
 void OpenSessionInvite() {
-    lobby::LobbyId lobby = 0;
-    {
-        std::lock_guard lock(g_state_mutex);
-        if (!g_state || !g_state->manager) {
-            MPE_LOG_WARN("cannot invite: networking is unavailable");
-            g_invite_pending = false;
-            return;
-        }
-        lobby = HostedLobbyLocked();
-    }
-    if (lobby == 0) {
-        return; // Not yet; the poll loop will try again.
-    }
-
-    g_invite_pending = false;
-    PublishSessionDetails();
-
     // Read now, not continuously, and never invited in bulk.
     //
     // An earlier version invited every friend it could see the moment a slot was pressed,
@@ -1533,10 +1637,39 @@ void OpenSessionInvite() {
     const std::size_t in_game = static_cast<std::size_t>(
         std::count_if(friends.begin(), friends.end(),
                       [](const steam::GameFriend& f) { return f.in_this_game; }));
-    MPE_LOG_INFO("invite list for session {}: {} friend(s), {} in this game", lobby,
-                friends.size(), in_game);
+    MPE_LOG_INFO("invite list: {} friend(s), {} in this game", friends.size(), in_game);
 
     ShowInviteList(true);
+}
+
+/// Keeps the panel's session line current while it is open.
+///
+/// Called from the poll rather than only when the panel opens, because the interesting
+/// moment is the one after: the lobby finishes being created a beat later, and the line has
+/// to stop saying it is being prepared without the player having to close and reopen
+/// anything to find out.
+void RefreshInvitePanelState() {
+    if (!g_lobby_ui_ready || !unreal::InvitePanelIsOpen()) {
+        return;
+    }
+    const InviteSessionState state = DescribeInviteSession();
+    if (state.text == g_invite_state_shown) {
+        return;
+    }
+    g_invite_state_shown = state.text;
+
+    // The first time a session actually exists, the lobby's own metadata is published, so a
+    // friend who accepts arrives at something with a name, a mode and a map on it.
+    if (state.lobby != 0) {
+        PublishSessionDetails();
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    (void)unreal::RunOnGameThread(
+        [&]() { unreal::SetInvitePanelState(ui, state.text, state.readiness); }, 5000);
 }
 
 /// The lobby this machine is hosting, or zero when it is not hosting one.
@@ -1566,6 +1699,103 @@ void OpenSessionInvite() {
     }
 }
 
+/// The lobby this machine is in, whether it owns it or joined it.
+///
+/// Inviting is not a host's privilege. Steam lets any member of a lobby invite to it, and a
+/// player who has joined a friend and wants to pull in a third has exactly the same thing to
+/// offer as the host does: this lobby, this session, come in.
+///
+/// Only the host's lobby was ever considered, so a guest pressing an empty slot found the
+/// panel refusing to open, every time, with nothing said. Leaving to the main menu and
+/// coming back appeared to fix it, which it did, by ending the session and hosting a new
+/// one: the guest was quietly thrown out of their friend's game to be shown a list.
+///
+/// The caller must hold g_state_mutex.
+[[nodiscard]] lobby::LobbyId CurrentSessionLobbyLocked() {
+    if (!g_state || !g_state->manager) {
+        return 0;
+    }
+    switch (g_state->manager->Phase()) {
+        case lobby::LobbyPhase::Hosting:
+        case lobby::LobbyPhase::Countdown:
+        case lobby::LobbyPhase::Loading:
+        case lobby::LobbyPhase::InMatch:
+        case lobby::LobbyPhase::PostMatch:
+        case lobby::LobbyPhase::InLobby:
+            return g_state->manager->Snapshot().lobby_id;
+        default:
+            // Idle and Faulted have nothing to point at. Creating, Joining, Connecting and
+            // Handshaking are all on their way to having one, and the panel says so rather
+            // than pretending otherwise.
+            return 0;
+    }
+}
+
+InviteSessionState DescribeInviteSession() {
+    InviteSessionState state;
+    std::lock_guard    lock(g_state_mutex);
+    if (!g_state || !g_state->manager) {
+        state.text      = "STEAM IS UNAVAILABLE, SO NOBODY CAN BE INVITED";
+        state.readiness = unreal::InviteReadiness::Unavailable;
+        return state;
+    }
+
+    state.lobby = CurrentSessionLobbyLocked();
+    if (state.lobby != 0) {
+        state.readiness = unreal::InviteReadiness::Ready;
+        state.text      = g_state->manager->IsHost()
+                              ? "YOUR SESSION IS OPEN. PRESS A NAME TO INVITE THEM."
+                              : "PRESS A NAME TO INVITE THEM INTO THIS SESSION.";
+        return state;
+    }
+
+    switch (g_state->manager->Phase()) {
+        case lobby::LobbyPhase::Creating:
+        case lobby::LobbyPhase::Idle:
+            state.text      = "PREPARING YOUR SESSION";
+            state.readiness = unreal::InviteReadiness::Preparing;
+            break;
+        case lobby::LobbyPhase::Joining:
+        case lobby::LobbyPhase::Connecting:
+        case lobby::LobbyPhase::Handshaking:
+            state.text      = "JOINING A SESSION. INVITES OPEN ONCE YOU ARE IN.";
+            state.readiness = unreal::InviteReadiness::Preparing;
+            break;
+        default:
+            state.text      = "THERE IS NO SESSION TO INVITE ANYONE TO";
+            state.readiness = unreal::InviteReadiness::Unavailable;
+            break;
+    }
+    return state;
+}
+
+bool LocalPlayerHasAuthority() {
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->manager) {
+        return true; // Nothing to be a guest of.
+    }
+    if (g_state->manager->Phase() == lobby::LobbyPhase::Idle) {
+        return true;
+    }
+    return g_state->manager->IsHost();
+}
+
+bool RefuseWithoutAuthority(std::string_view what) {
+    if (LocalPlayerHasAuthority()) {
+        return false;
+    }
+    // Two gates, not one, and the second is the one that matters.
+    //
+    // The screen already greys these out, and that is the right thing to show. It is not a
+    // rule: a widget's hit testing is a drawing decision, one rebuild away from being wrong,
+    // and a bug that lets a guest change the map is a bug that desynchronises the match. The
+    // rule lives here, where every path to changing something has to pass.
+    MPE_LOG_INFO("ignoring a guest's attempt to change {}", what);
+    ShowSessionNotice("THE HOST DECIDES",
+                      std::format("Only the host can change {} in this session.", what));
+    return true;
+}
+
 /// Puts the invite list on screen, or takes it off.
 void ShowInviteList(bool visible) {
     if (!g_lobby_ui_ready) {
@@ -1586,7 +1816,7 @@ void ShowInviteList(bool visible) {
 }
 
 void CloseInviteList() {
-    g_invite_pending = false;
+    g_invite_state_shown.clear();
     ShowInviteList(false);
 }
 
@@ -1613,9 +1843,13 @@ void InviteFriendAt(int row) {
     lobby::LobbyId lobby = 0;
     {
         std::lock_guard lock(g_state_mutex);
-        lobby = HostedLobbyLocked();
+        lobby = CurrentSessionLobbyLocked();
     }
     if (lobby == 0) {
+        // Said on the panel, not only to the log. A press that produces no visible change is
+        // the failure the whole panel exists to avoid.
+        const InviteSessionState state = DescribeInviteSession();
+        ShowSessionNotice("CANNOT INVITE YET", state.text);
         MPE_LOG_WARN("cannot invite {}: there is no session on this machine to invite to",
                     g_friend_list[index].name);
         return;
@@ -1636,6 +1870,20 @@ void InviteFriendAt(int row) {
 }
 
 void InviteToSession() {
+    // The panel opens on the press. Not on the session.
+    //
+    // It used to open only once a Steam lobby id existed and only on a machine that was
+    // hosting, which made the first press of every session do nothing at all: creating a
+    // lobby is asynchronous, so the id arrives a moment after the button. A player pressing
+    // a slot and seeing nothing has no way to tell that from a broken button, and pressing
+    // it again is the obvious thing to do, which is why this looked like it needed two
+    // attempts and a trip back to the main menu.
+    //
+    // Opening first and describing the session on the panel is the honest order: the list is
+    // there instantly, and the line under the title says whether an invitation can go out
+    // yet. The poll keeps that line current, so it stops saying the session is being
+    // prepared the moment it is not.
+    //
     // The slot that was pressed decides nothing.
     //
     // It reads like it should: press a red slot, get a red team mate. It cannot work that
@@ -1649,9 +1897,13 @@ void InviteToSession() {
     // red. Taking the argument away is what makes it impossible to start honouring it by
     // accident later.
     MPE_LOG_INFO("opening the invite list for this multiplayer session");
+
+    // Hosting first, so the lobby is already being created while the list is drawn. It is a
+    // no-op for anyone who is already in a session, which is what lets a guest invite a
+    // third person into their host's game rather than being thrown out of it.
     EnsureSessionHosted();
-    g_invite_pending = true;
     OpenSessionInvite();
+    RefreshInvitePanelState();
 }
 
 /// Advertises what this session is, so the browser shows it as something recognisable.
@@ -1823,10 +2075,12 @@ void RefreshLobbyAuthority() {
         return;
     }
 
-    bool        is_host = true;
-    bool        in_session = false;
-    std::string mode;
-    std::string scenario;
+    bool                      is_host    = true;
+    bool                      in_session = false;
+    std::string               mode;
+    std::string               scenario;
+    lobby::LobbyId            lobby = 0;
+    unreal::LobbySettingsView settings;
     {
         std::lock_guard lock(g_state_mutex);
         if (!g_state || !g_state->manager) {
@@ -1839,6 +2093,21 @@ void RefreshLobbyAuthority() {
                          ? "SLAYER"
                          : "CAPTURE THE FLAG";
         scenario   = snapshot.settings.scenario;
+        lobby      = snapshot.lobby_id;
+
+        settings.game_time_minutes = snapshot.settings.time_limit_seconds / 60;
+        settings.friendly_fire     = snapshot.settings.friendly_fire;
+        settings.respawn_seconds   = snapshot.settings.respawn_delay_seconds;
+    }
+
+    // The server name is lobby metadata rather than a match setting, because it names the
+    // session rather than the rules. A guest reads the host's out of the lobby it joined;
+    // a host is left alone, since the field is the one they are typing into.
+    if (!is_host && lobby != 0) {
+        if (const char* const advertised = steam::GetLobbyData(lobby, "name");
+            advertised != nullptr) {
+            settings.server_name = advertised;
+        }
     }
 
     // Only when something changed, so this costs one comparison a tick while nobody is
@@ -1852,14 +2121,21 @@ void RefreshLobbyAuthority() {
     static bool          s_host = true;
     static std::string   s_mode;
     static std::string   s_scenario;
+    static std::string   s_settings;
     static std::uint32_t s_build = 0;
     const std::uint32_t  build   = unreal::LobbyBuildId();
-    if (is_host == s_host && mode == s_mode && scenario == s_scenario && build == s_build) {
+    const std::string    summary =
+        std::format("{}|{}|{}|{}", settings.game_time_minutes,
+                    settings.friendly_fire ? 1 : 0, settings.respawn_seconds,
+                    settings.server_name);
+    if (is_host == s_host && mode == s_mode && scenario == s_scenario && build == s_build &&
+        summary == s_settings) {
         return;
     }
     s_host     = is_host;
     s_mode     = mode;
     s_scenario = scenario;
+    s_settings = summary;
     s_build    = build;
 
     int chosen = 0;
@@ -1883,13 +2159,15 @@ void RefreshLobbyAuthority() {
     }
     (void)unreal::RunOnGameThread(
         [&]() {
+            unreal::SetLobbySettings(ui, settings);
             unreal::SetLobbyHostControls(ui, is_host);
             unreal::SetLobbyMode(ui, slayer);
             unreal::SetLobbyMap(ui, chosen);
         },
         5000);
-    MPE_LOG_INFO("lobby authority: {}, mode {}, map {}", is_host ? "host" : "guest", mode,
-                scenario);
+    MPE_LOG_INFO("lobby authority: {}, mode {}, map {}, {}min, friendly fire {}, respawn {}s",
+                is_host ? "host" : "guest", mode, scenario, settings.game_time_minutes,
+                settings.friendly_fire ? "on" : "off", settings.respawn_seconds);
 }
 
 /// Proves, against real Steam, that a hosted session can be found by a search.
@@ -1973,6 +2251,49 @@ void ShowSessionNotice(std::string title, std::string detail) {
     g_notice.title  = std::move(title);
     g_notice.detail = std::move(detail);
     g_notice.until  = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+}
+
+/// Says that a launch this machine had already committed to did not happen.
+///
+/// The campaign call is posted rather than waited on, so its failure arrives after the
+/// lobby has moved on and there is no Result left to return it through. Left unreported it
+/// would be the worst possible outcome: a screen that says the match is loading and a game
+/// that is doing nothing.
+///
+/// Recorded rather than acted on, and this is not fastidiousness. It runs on the game
+/// thread, and LobbyManager is single threaded by construction: the tick thread is very
+/// likely inside Tick on the same object at this moment. Touching the session from here
+/// would be a data race on the state machine that owns the whole session, to report that a
+/// match did not start. The tick picks it up on its next pass, which is within sixteen
+/// milliseconds, on the thread that owns the lobby.
+std::atomic<bool> g_launch_failed{false};
+std::mutex        g_launch_failure_mutex;
+std::string       g_launch_failure_reason;
+
+void ReportLaunchFailure(std::string_view reason) {
+    {
+        std::lock_guard lock(g_launch_failure_mutex);
+        g_launch_failure_reason = std::string(reason);
+    }
+    g_launch_failed.store(true, std::memory_order_release);
+}
+
+/// Acts on a failed launch, on the tick thread. Caller must hold g_state_mutex.
+void HandleLaunchFailureLocked() {
+    if (!g_launch_failed.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::string reason;
+    {
+        std::lock_guard lock(g_launch_failure_mutex);
+        reason = g_launch_failure_reason;
+    }
+    ShowSessionNotice("MATCH DID NOT START", reason);
+    if (g_state && g_state->manager) {
+        // A clean departure, so the next attempt starts from a lobby rather than from
+        // whatever half-launched state this left behind.
+        g_state->manager->LeaveSession();
+    }
 }
 
 void RefreshLobbyStatus() {
@@ -3069,6 +3390,263 @@ void MaintainMainMenuButton() {
     }
 }
 
+// --- The loading screen ------------------------------------------------------
+//
+// WHAT THE PERCENTAGE MEANS
+//
+// Every number this reports is measured. Nothing on this screen is a curve chosen to look
+// like progress, because a player reads a percentage as a promise and a made up one is
+// worse than none at all.
+//
+// The wait is divided into bands, and each band is filled from something real:
+//
+//   JOINING LOBBY       0..30   which of three connection steps has completed
+//   STARTING SESSION   30..55   how much of the countdown has elapsed
+//   LOADING MAP        55..75   nothing; the engine reports no fraction, so this one is
+//                               honestly indeterminate and says so
+//   WAITING FOR PLAYERS 75..100 how many peers have reported their load finished
+//
+// The bands are what keep the bar moving forward rather than restarting at every stage, and
+// they are why the screen can be truthful about the one step it cannot measure without the
+// whole thing looking broken.
+//
+// The step nobody can measure is the engine's own load. Its campaign entry point commits to
+// the load and returns, reporting nothing further; there is no fraction to read. That is
+// exactly the case an indeterminate bar exists for, so the bar sweeps, the large readout
+// becomes the elapsed time, and the line underneath says what the game is doing. The screen
+// is never silent and never claims to know something it does not.
+
+/// When the current wait started, for the elapsed clock.
+std::chrono::steady_clock::time_point g_loading_since{};
+unreal::LoadingStage                  g_loading_stage = unreal::LoadingStage::None;
+std::uint32_t                         g_loading_frame = 0;
+
+/// Builds the loading screen once, and again if its menu was collected under it.
+void PrepareLoadingOverlay() {
+    if (!g_lobby_ui_ready || g_live_menu == 0) {
+        return;
+    }
+    if (unreal::LoadingOverlayIsBuilt()) {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->objects.has_value()) {
+            return;
+        }
+        if (g_state->objects->ClassOf(unreal::LoadingOverlayWidget()) != 0) {
+            return; // Still there.
+        }
+        MPE_LOG_INFO("the loading overlay was collected with its menu; building it again");
+        unreal::ForgetLoadingOverlay();
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    Result outcome = Result::Success();
+    (void)unreal::RunOnGameThread([&]() { outcome = unreal::BuildLoadingOverlay(ui); }, 10000);
+    if (!outcome.ok()) {
+        static bool s_complained = false;
+        if (!s_complained) {
+            s_complained = true;
+            MPE_LOG_WARN("the loading overlay could not be built: {}", outcome.message());
+        }
+    }
+}
+
+/// Makes the loading screen's CANCEL answer the mouse.
+///
+/// Separate from the lobby's own controls because the two are rebuilt on different
+/// schedules: forgetting the watched widgets before a lobby rebuild drops this one too, so
+/// it is put back rather than registered once and assumed.
+void RegisterLoadingCancel() {
+    const std::uintptr_t cancel = unreal::LoadingCancelButton();
+    if (cancel == 0) {
+        return;
+    }
+    for (const unreal::LobbyControl& control : g_lobby_controls) {
+        if (control.widget == cancel) {
+            return;
+        }
+    }
+    if (!unreal::AlsoWatchWidget(cancel).ok()) {
+        return;
+    }
+    g_lobby_controls.push_back({cancel, unreal::LobbyAction::CancelLoading, 0});
+}
+
+/// Works out what the loading screen should say, from the session and nothing else.
+[[nodiscard]] bool DescribeLoading(unreal::LoadingView& out_view) {
+    lobby::LobbyPhase phase = lobby::LobbyPhase::Idle;
+    std::uint8_t      countdown = 0;
+    std::size_t       loaded = 0;
+    std::size_t       total = 0;
+    std::string       still_loading;
+    std::uint8_t      countdown_total = 5;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            return false;
+        }
+        const lobby::LobbySnapshot& snapshot = g_state->manager->Snapshot();
+        phase     = snapshot.phase;
+        countdown = snapshot.countdown_seconds;
+        total     = snapshot.players.size();
+        for (const lobby::PlayerSlot& player : snapshot.players) {
+            if (player.load_progress >= 1.0F) {
+                ++loaded;
+            } else if (still_loading.empty()) {
+                still_loading = player.display_name;
+            }
+        }
+    }
+
+    // Joining is three connection steps, in order, and each one is a thing that either has
+    // happened or has not. That is a real fraction over three, not a guess.
+    const auto joining = [&out_view](int step, std::string_view detail) {
+        out_view.stage   = unreal::LoadingStage::JoiningLobby;
+        out_view.percent = lobby::LoadingPercent(lobby::LoadingStep::JoiningLobby, step, 3);
+        out_view.detail  = detail;
+    };
+
+    switch (phase) {
+        case lobby::LobbyPhase::Joining:
+            joining(1, "Entering the Steam lobby.");
+            break;
+        case lobby::LobbyPhase::Connecting:
+            joining(2, "Opening a relay connection to the host. No ports are involved; "
+                       "Steam routes this.");
+            break;
+        case lobby::LobbyPhase::Handshaking:
+            joining(3, "Waiting for the host to accept and send the roster.");
+            break;
+
+        case lobby::LobbyPhase::Countdown: {
+            // A real fraction: the countdown is a timer this machine can see running.
+            const int remaining = countdown;
+            const int elapsed   = countdown_total > remaining ? countdown_total - remaining : 0;
+            out_view.stage      = unreal::LoadingStage::StartingSession;
+            out_view.percent    = lobby::LoadingPercent(lobby::LoadingStep::StartingSession,
+                                                        elapsed, countdown_total);
+            out_view.detail     = remaining > 0
+                                      ? std::format("Everyone starts together in {}.", remaining)
+                                      : std::string("Telling every player to load.");
+            break;
+        }
+
+        case lobby::LobbyPhase::Loading:
+            if (total > 0 && loaded < total) {
+                // Also a real fraction, and the one that actually decides when the match
+                // begins: nobody is released until every machine has reported.
+                out_view.stage   = unreal::LoadingStage::WaitingForPlayers;
+                out_view.percent = lobby::LoadingPercent(lobby::LoadingStep::WaitingForPlayers,
+                                                         static_cast<int>(loaded),
+                                                         static_cast<int>(total));
+                out_view.detail =
+                    still_loading.empty()
+                        ? std::format("{} of {} players have finished loading.", loaded, total)
+                        : std::format("{} of {} players have finished loading. Waiting on {}.",
+                                      loaded, total,
+                                      text::CleanDisplayName(still_loading, 24));
+            } else {
+                // The one step with no fraction to report. Said plainly rather than
+                // decorated with a number nobody can stand behind.
+                out_view.stage         = unreal::LoadingStage::LoadingMap;
+                out_view.percent = lobby::LoadingPercent(lobby::LoadingStep::LoadingMap, 0, 0);
+                out_view.indeterminate = true;
+                out_view.detail        = "Building shaders and streaming the level. The first "
+                                         "run on a map is the slowest one.";
+            }
+            // Cancelling is withheld here rather than offered, for a while. The engine has
+            // already been told to load, so leaving now ends the session while the map
+            // carries on arriving, which is a worse place to be than waiting a few more
+            // seconds. RefreshLoadingScreen gives it back once waiting has stopped being
+            // the likely explanation.
+            out_view.cancellable = false;
+            break;
+
+        default:
+            return false; // Nothing worth covering the screen for.
+    }
+    return true;
+}
+
+/// Drives the loading screen. Called from the tick at the animation rate.
+void RefreshLoadingScreen() {
+    if (!g_lobby_ui_ready || !unreal::LoadingOverlayIsBuilt()) {
+        return;
+    }
+
+    unreal::LoadingView view;
+    const bool          wanted = DescribeLoading(view);
+    const auto          now    = std::chrono::steady_clock::now();
+
+    if (!wanted) {
+        if (unreal::LoadingOverlayIsOpen()) {
+            unreal::LobbyUIContext ui = g_lobby_ui;
+            if (unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+                (void)unreal::RunOnGameThread(
+                    [&]() { unreal::ShowLoadingOverlay(ui, false); }, 5000);
+            }
+            MPE_LOG_INFO("loading screen closed after {}s",
+                        std::chrono::duration_cast<std::chrono::seconds>(now - g_loading_since)
+                            .count());
+        }
+        g_loading_stage = unreal::LoadingStage::None;
+        return;
+    }
+
+    // The clock restarts when the stage does, because a player watching WAITING FOR PLAYERS
+    // wants to know how long that has been going, not how long ago they pressed a button.
+    const bool opening = !unreal::LoadingOverlayIsOpen();
+    if (opening || view.stage != g_loading_stage) {
+        g_loading_since = now;
+        g_loading_stage = view.stage;
+    }
+    view.elapsed_seconds = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - g_loading_since).count());
+    view.frame = ++g_loading_frame;
+
+    // A modal with no exit is a trap, and this one covers the whole screen and takes every
+    // click. Loading withholds cancelling because leaving mid load is genuinely worse than
+    // waiting, but only while waiting is still the likely explanation. Past half a minute it
+    // is not, and being stuck behind a screen that cannot be dismissed is the worse of the
+    // two outcomes by a wide margin.
+    constexpr int kCancelUnlocksAfterSeconds = 30;
+    if (!view.cancellable && view.elapsed_seconds >= kCancelUnlocksAfterSeconds) {
+        view.cancellable = true;
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    (void)unreal::RunOnGameThread(
+        [&]() {
+            unreal::SetLoadingView(ui, view);
+            if (opening) {
+                unreal::ShowLoadingOverlay(ui, true);
+            }
+        },
+        5000);
+    if (opening) {
+        MPE_LOG_INFO("loading screen open: stage {}, {}%", static_cast<int>(view.stage),
+                    view.percent);
+    }
+}
+
+/// Abandons whatever the loading screen is waiting for.
+void OnCancelLoading() {
+    MPE_LOG_INFO("the player cancelled the wait");
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (g_state && g_state->manager) {
+            g_state->manager->LeaveSession();
+        }
+    }
+    ShowSessionNotice("CANCELLED", "You left before it finished. Nothing was started.");
+    EnsureSessionHosted();
+}
+
 /// Polls every watched field and logs transitions.
 ///
 /// Runs at 1 Hz from the tick loop. Every entry is revalidated before it is read, because
@@ -3362,10 +3940,13 @@ void DetectPropertyLayout() {
         return;
     }
 
-    std::lock_guard lock(g_state_mutex);
-    if (g_state) {
-        g_state->reflection = reflection;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (g_state) {
+            g_state->reflection = reflection;
+        }
     }
+    PublishEngineReflection(reflection);
 }
 
 void ResolveUnrealObjects() {
@@ -3452,6 +4033,7 @@ void ResolveUnrealObjects() {
         }
         g_state->objects = objects;
     }
+    PublishEngineObjects(objects);
 
     // Proof, in the log: the first objects in a UE process are always engine
     // intrinsics, so their names and classes are recognizable at a glance.
@@ -3919,28 +4501,44 @@ void Initialize() {
     // The reflection stays on the Unreal side. This hands the engine control a callable
     // and nothing else, so Engine/ still knows nothing about object arrays or the game
     // thread.
+    // Posted, and taking nothing that the tick holds.
+    //
+    // This runs from inside LobbyManager::Tick, which the tick loop calls while holding
+    // g_state_mutex, so the two things this must not do are take that lock and wait.
+    //
+    // It did both. The job reached back for g_state_mutex on the game thread while the tick
+    // loop held it, so the game thread blocked on the lobby and the lobby blocked on the
+    // game thread: sixty seconds of frozen game, and then a wait that gave up and returned
+    // while the job was still holding references into the frame it had just left. The job
+    // wrote its result into those bytes once the lock finally came free, which is the
+    // unhandled exception both machines died with.
+    //
+    // The object array and the reflection now come from the engine view, which has its own
+    // lock and is never held across a tick, and the campaign call is posted rather than
+    // waited on. Beginning a match is a load: nothing useful can be reported back from it
+    // synchronously, and blocking the lobby for the duration stops the keepalives and every
+    // screen update at precisely the moment the other machines are watching for them.
     state->engine = std::make_unique<engine::CampaignEngineControl>(
         [](std::string_view scenario, bool friendly_fire) -> Result {
+            std::optional<unreal::ObjectArray> objects_copy;
+            std::optional<unreal::Reflection>  reflection_copy;
+            if (!TakeEngineView(objects_copy, reflection_copy)) {
+                return Result::Fail(ErrorCode::InvalidState, "UE reflection is not ready yet");
+            }
+
+            // Everything the job needs is copied into it. Nothing is captured by reference,
+            // because nobody is waiting and there is no frame left to refer to.
             const std::string wanted(scenario);
-            Result            outcome = Result::Success();
-            const Result      ran     = unreal::RunOnGameThread(
-                [&]() {
-                    // The lock is taken inside the job rather than around it: the caller
-                    // is the lobby manager, which is already holding nothing, and the game
-                    // thread is where the reflection may be read.
-                    std::lock_guard lock(g_state_mutex);
-                    if (!g_state || !g_state->objects.has_value() ||
-                        !g_state->reflection.has_value()) {
-                        outcome = Result::Fail(ErrorCode::InvalidState,
-                                               "UE reflection is not ready yet");
-                        return;
+            return unreal::PostToGameThread(
+                [objects_copy, reflection_copy, wanted, friendly_fire]() {
+                    const Result began =
+                        unreal::BeginCampaign(*objects_copy, *reflection_copy, wanted,
+                                              kDefaultCampaignAsset, friendly_fire);
+                    if (!began.ok()) {
+                        MPE_LOG_ERROR("beginning the campaign failed: {}", began.message());
+                        ReportLaunchFailure(began.message());
                     }
-                    outcome = unreal::BeginCampaign(*g_state->objects, *g_state->reflection,
-                                                    wanted, kDefaultCampaignAsset,
-                                                    friendly_fire);
-                },
-                60000);
-            return ran.ok() ? outcome : ran;
+                });
         });
 
     // The lobby manager needs both a backend and a transport. Without them the mod
@@ -4076,6 +4674,15 @@ void Initialize() {
 void Shutdown() {
     g_running_or_starting.store(false, std::memory_order_release);
     g_running.store(false, std::memory_order_release);
+
+    // Before the join, not after.
+    //
+    // The tick thread can be sitting in a game thread dispatch, and a job whose deadline has
+    // passed while it is already running is waited on rather than abandoned, because
+    // abandoning it hands a running job a stack frame that has gone. During teardown the
+    // game may never run another frame, so that wait would never end and the join would
+    // never return. Cancelling the queue first releases the waiter.
+    unreal::ShutdownGameThreadDispatch();
     if (g_tick_thread.joinable()) {
         g_tick_thread.join();
     }
@@ -5234,11 +5841,7 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         // pool walk.
         std::wstring wanted = L"None";
         if (const std::size_t space = command.find(' '); space != std::string::npos) {
-            const std::string argument = command.substr(space + 1);
-            wanted.clear();
-            for (const char character : argument) {
-                wanted.push_back(static_cast<wchar_t>(character));
-            }
+            wanted = mpe::text::WidenUtf8(command.substr(space + 1));
         }
 
         std::uint32_t    index = 0;

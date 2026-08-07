@@ -7,7 +7,7 @@
 
 **The multiplayer Halo: Campaign Evolved should have shipped with.**
 
-[![Version](https://img.shields.io/badge/version-0.1.9-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.2.0-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Download](https://img.shields.io/badge/download-latest%20release-2ea44f?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Licence](https://img.shields.io/badge/licence-MIT-blue?style=for-the-badge)](LICENSE)
 
@@ -121,6 +121,14 @@ What works today, honestly. Anything not yet tested says so.
 - Teams that balance themselves, with ties broken at random
 - A status panel on the main menu and the lobby: connection, session, who is
   hosting, ping, and whether the build is current
+- A loading screen for every wait: joining a lobby, starting a session, loading
+  the map, waiting for the other players. It shows how far through the wait it
+  is, what is happening at that moment, how long it has been going, and a way
+  out. Where a real fraction exists it is shown; where none does, it says so
+  rather than inventing one
+- A guest sees the host's mode, map, settings and server name, greyed out. Only
+  the host can change any of it, and that is enforced behind the screen as well
+  as on it
 - Checking for, downloading and installing updates
 
 **Built, not yet proven with two people**

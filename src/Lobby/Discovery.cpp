@@ -105,4 +105,32 @@ FaultRecovery JudgeFault(std::int64_t elapsed_milliseconds,
     return recovery;
 }
 
+LoadingBand BandForLoadingStep(LoadingStep step) noexcept {
+    // Contiguous and ascending, which is the whole point. A bar that restarts at every step
+    // tells a player the wait got longer; one that carries on tells them how much of the
+    // whole thing is left, which is what they are asking.
+    //
+    // Loading the map is the one step marked unmeasurable. The engine's campaign entry
+    // point commits to the load and returns without reporting a fraction, so there is
+    // nothing to divide. Saying so here is what lets the screen show motion instead of a
+    // number, rather than each caller inventing its own answer to the same question.
+    switch (step) {
+        case LoadingStep::JoiningLobby:      return {0, 30, true};
+        case LoadingStep::StartingSession:   return {30, 55, true};
+        case LoadingStep::LoadingMap:        return {55, 75, false};
+        case LoadingStep::WaitingForPlayers: return {75, 100, true};
+        case LoadingStep::None:
+        default:                             return {0, 0, true};
+    }
+}
+
+int LoadingPercent(LoadingStep step, int done, int total) noexcept {
+    const LoadingBand band = BandForLoadingStep(step);
+    if (!band.measurable || total <= 0) {
+        return band.begin;
+    }
+    const int clamped = done < 0 ? 0 : (done > total ? total : done);
+    return band.begin + ((band.end - band.begin) * clamped) / total;
+}
+
 } // namespace mpe::lobby

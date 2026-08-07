@@ -68,6 +68,7 @@ rem --- Sources --------------------------------------------------------------
 set SOURCES=^
  "%ROOT%src\ModMain.cpp"^
  "%ROOT%src\Core\Result.cpp"^
+ "%ROOT%src\Core\Text.cpp"^
  "%ROOT%src\Core\Log.cpp"^
  "%ROOT%src\Core\Hash.cpp"^
  "%ROOT%src\Core\Json.cpp"^

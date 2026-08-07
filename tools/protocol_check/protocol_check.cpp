@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "Core/ByteStream.h"
+#include "Core/Text.h"
 #include "Net/PacketProtocol.h"
 
 namespace {
@@ -106,6 +107,63 @@ int main() {
         Check(read.ok() &&
                   read.value().host_phase == static_cast<std::uint8_t>(ProtocolPhase::InLobby),
               "a HandshakeAccept without a phase reads as a lobby");
+    }
+
+    std::printf("text that came from somebody else\n");
+    {
+        using namespace mpe::text;
+
+        // The mangling itself. A Steam persona name is UTF-8, and widening it one byte at a
+        // time turned every multi byte character into a run of garbage glyphs. These are the
+        // decorative brackets that surrounded a real player's name when it drew wrongly.
+        const std::string decorated = "\xEA\xA7\x81 Nessie \xEA\xA7\x82";
+        Check(CountCodePoints(decorated) == 10,
+              "a decorated name is ten code points, not fourteen bytes");
+        Check(WidenUtf8(decorated).size() == 10,
+              "widening yields one wide character per code point");
+        Check(WidenUtf8("plain").size() == 5, "ASCII widens unchanged");
+
+        // Past the basic plane, which is where every emoji lives. One code point, two wide
+        // characters, because UTF-16 needs a surrogate pair for it.
+        const std::string emoji = "\xF0\x9F\x8E\xAE";
+        Check(CountCodePoints(emoji) == 1, "an emoji is one code point");
+        Check(WidenUtf8(emoji).size() == 2, "an emoji widens to a surrogate pair");
+
+        // Round tripping, which is what proves the decoder and the encoder agree.
+        Check(EncodeUtf8(DecodeUtf8(decorated)) == decorated,
+              "decoding and re-encoding a name gives it back unchanged");
+
+        // Cutting by code points rather than bytes. A byte wise cut at four would land
+        // inside the first character and leave half of it behind.
+        Check(Truncate(decorated, 2) == "\xEA\xA7\x81 ",
+              "truncation lands on a code point boundary");
+        Check(CountCodePoints(Ellipsise("abcdefghij", 6)) == 6,
+              "an ellipsis fits inside the limit rather than being added past it");
+        Check(Ellipsise("abcdefghij", 6) == "abc...", "the ellipsis replaces what was cut");
+        Check(Ellipsise("short", 12) == "short", "nothing under the limit is touched");
+
+        // What the frontend's font can draw. Latin, Greek and Cyrillic; not emoji, and not
+        // the decorative brackets that started this.
+        Check(IsDrawable(U'A') && IsDrawable(U'\u00E9') && IsDrawable(U'\u0416'),
+              "Latin, accented Latin and Cyrillic are drawable");
+        Check(!IsDrawable(U'\U0001F3AE') && !IsDrawable(U'\u0007'),
+              "an emoji and a control character are not");
+
+        // The whole point: the name a player recognises, out of what Steam handed over.
+        Check(CleanDisplayName(decorated, 13) == "Nessie",
+              "a decorated name cleans to the name inside it");
+        Check(CleanDisplayName("  spaced   out  ", 20) == "spaced out",
+              "runs of space left by dropping are collapsed");
+        Check(CleanDisplayName("\xF0\x9F\x8E\xAE", 13) == "PLAYER",
+              "a name with nothing drawable in it falls back rather than drawing boxes");
+        Check(CountCodePoints(CleanDisplayName("Averyveryverylongpersonaname", 13)) == 13,
+              "a long name is cut to the width of the card it goes on");
+        Check(CleanDisplayName("", 13) == "PLAYER", "an empty name falls back too");
+
+        // A truncated multi byte sequence is what a byte wise cut leaves behind. It has to
+        // decode to something rather than derailing the rest of the string.
+        Check(CountCodePoints("\xEA\xA7") == 2,
+              "a half written character decodes without eating what follows");
     }
 
     std::printf("versioning\n");

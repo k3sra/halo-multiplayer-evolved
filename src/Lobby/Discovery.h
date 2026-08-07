@@ -120,4 +120,36 @@ struct FaultRecovery {
 [[nodiscard]] FaultRecovery JudgeFault(std::int64_t elapsed_milliseconds,
                                        std::int64_t linger_milliseconds) noexcept;
 
+/// The four waits the loading screen covers, in the order they happen.
+enum class LoadingStep : std::uint8_t {
+    None = 0,
+    JoiningLobby,
+    StartingSession,
+    LoadingMap,
+    WaitingForPlayers,
+};
+
+/// Where one step sits on the shared bar, and whether it can report a fraction at all.
+struct LoadingBand {
+    int  begin{0};
+    int  end{0};
+    bool measurable{true};
+};
+
+/// The band a step owns.
+///
+/// Named here rather than in the drawing, because the property that matters is one the
+/// drawing cannot enforce: the bar must never go backwards. Bands make that a statement
+/// about a table, which a test can check, instead of a statement about four separate
+/// branches nobody compares.
+[[nodiscard]] LoadingBand BandForLoadingStep(LoadingStep step) noexcept;
+
+/// Where a step's own fraction lands on the shared bar.
+///
+/// done and total describe whatever that step can actually measure: connection steps
+/// completed, seconds of countdown elapsed, peers that have finished loading. A step that
+/// can measure nothing reports the start of its band, and the screen shows motion rather
+/// than a number.
+[[nodiscard]] int LoadingPercent(LoadingStep step, int done, int total) noexcept;
+
 } // namespace mpe::lobby

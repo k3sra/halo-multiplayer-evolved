@@ -39,6 +39,7 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor /u
    "%ROOT%\src\Core\GameBuild.cpp" ^
    "%ROOT%\src\Net\IPeerTransport.cpp" ^
    "%ROOT%\src\Core\Result.cpp" ^
+   "%ROOT%\src\Core\Text.cpp" ^
    "%ROOT%\src\Core\Log.cpp" ^
    "%ROOT%\src\Core\Hash.cpp"
 if errorlevel 1 (
