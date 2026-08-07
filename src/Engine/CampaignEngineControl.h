@@ -36,9 +36,22 @@ namespace mpe::engine {
 /// says why.
 using BeginScenarioFn = std::function<Result(std::string_view scenario, bool friendly_fire)>;
 
+/// How far the scenario the mod asked for has actually got.
+///
+/// Zero to one, and it must be measured rather than assumed. This exists because the
+/// version without it reported one the instant loading began, which made the launch
+/// sequence's central promise a lie: the host broadcasts that everybody has loaded only when
+/// every peer reports one, so reporting one immediately meant the host broadcast it before
+/// any machine had loaded anything. Both peers were then released, the lobby declared the
+/// match live within a second, and the actual map load started whenever each machine
+/// happened to get round to it. Measured across two machines that was 4.7 seconds on one and
+/// 44.6 on the other, which is not a synchronised launch, it is two separate ones.
+using QueryScenarioProgressFn = std::function<float()>;
+
 class CampaignEngineControl final : public IEngineControl {
 public:
-    explicit CampaignEngineControl(BeginScenarioFn begin) : begin_(std::move(begin)) {}
+    CampaignEngineControl(BeginScenarioFn begin, QueryScenarioProgressFn progress)
+        : begin_(std::move(begin)), progress_(std::move(progress)) {}
 
     [[nodiscard]] EngineCapabilities Capabilities() const override {
         EngineCapabilities capabilities;
@@ -90,13 +103,24 @@ public:
     }
 
     [[nodiscard]] Expected<float> QueryLoadProgress() const override {
-        // The campaign entry point does not report progress, and inventing a curve would
-        // be a number that means nothing. It returns having committed to the load, so from
-        // the lobby's point of view this machine is as loaded as it can report being; the
-        // launch waits on every peer reaching that same point.
-        return lifecycle_ == EngineLifecycle::Loading || lifecycle_ == EngineLifecycle::InMatch
-                   ? 1.0f
-                   : 0.0f;
+        if (lifecycle_ == EngineLifecycle::InMatch) {
+            return 1.0f;
+        }
+        if (lifecycle_ != EngineLifecycle::Loading) {
+            return 0.0f;
+        }
+
+        // Asked, not assumed.
+        //
+        // This used to answer one as soon as the phase became Loading, which reported the
+        // machine as ready before it had begun. Everything downstream of that reading is
+        // the launch sequence's only real guarantee, so the guarantee was worthless: the
+        // host released both peers while neither had loaded anything.
+        //
+        // The supplier reports what has actually happened, which is nothing until the
+        // campaign call has run, part of the way once it has returned successfully, and all
+        // of it once there is a world to stand in.
+        return progress_ ? progress_() : 0.0f;
     }
 
     [[nodiscard]] Result LaunchMatch() override {
@@ -144,7 +168,8 @@ private:
         return Result::Fail(ErrorCode::NotImplemented, kNoSandbox);
     }
 
-    BeginScenarioFn begin_;
+    BeginScenarioFn         begin_;
+    QueryScenarioProgressFn progress_;
     MatchSettings   settings_;
     EngineLifecycle lifecycle_{EngineLifecycle::Idle};
 };

@@ -555,6 +555,54 @@ void PublishEngineReflection(const unreal::Reflection& reflection) {
     g_engine_reflection = reflection;
 }
 
+// --- How far this machine has actually got into the map ---------------------
+//
+// The lobby releases every peer only once all of them report a load progress of one, which
+// is the whole of what a synchronised launch is. Reporting one before anything has happened
+// therefore does not merely mis-draw a bar, it dissolves the guarantee: measured across two
+// machines, both reported ready inside a second and then began loading 4.7 and 44.6 seconds
+// later. One player stood in the map while the other watched a loading screen.
+//
+// These are the three things this machine can honestly say about itself.
+enum class ScenarioStage : std::uint8_t {
+    Idle = 0,
+    /// The campaign call has been posted to the game thread and has not run yet.
+    Requested,
+    /// It ran and the engine accepted it. The level is now genuinely loading.
+    Begun,
+    /// It ran and the engine refused.
+    Failed,
+};
+std::atomic<ScenarioStage>            g_scenario_stage{ScenarioStage::Idle};
+std::chrono::steady_clock::time_point g_scenario_requested_at{};
+
+/// What to report to the launch sequence, between zero and one.
+[[nodiscard]] float ScenarioProgress() {
+    switch (g_scenario_stage.load(std::memory_order_acquire)) {
+        case ScenarioStage::Requested:
+            // Asked for and not yet started. Deliberately not zero, so a peer that is
+            // waiting can see the difference between a machine that is getting on with it
+            // and one that has not been told anything.
+            return 0.25F;
+
+        case ScenarioStage::Begun:
+            // The engine has taken the scenario. There is no further signal to wait for:
+            // the campaign entry point reports nothing after this, and holding the release
+            // back for something that will never arrive would replace an early launch with
+            // a launch that never happens.
+            return 1.0F;
+
+        case ScenarioStage::Failed:
+            // Nothing will come of this one. Reported as no progress so the host's load
+            // timeout ends the wait rather than every peer sitting on it.
+            return 0.0F;
+
+        case ScenarioStage::Idle:
+        default:
+            return 0.0F;
+    }
+}
+
 /// Takes a copy of both, or reports that they are not ready.
 ///
 /// Optionals rather than references, because neither type is default constructible: a
@@ -4765,8 +4813,9 @@ void Initialize() {
     // address, so an install that was never set up for testing behaves exactly as if this
     // code were not here. Started after the identity is written, so the very first report
     // already says which machine it came from.
-    debugshare::Start(DataDirectory(),
-                      std::format("{} ({})", SteamPlayerName(), steam::GetLocalSteamId()));
+    debugshare::Start(DataDirectory(), []() {
+        return std::format("{} ({})", SteamPlayerName(), steam::GetLocalSteamId());
+    });
 
     // The FName adapter is written in early, but never called here.
     //
@@ -4849,6 +4898,8 @@ void Initialize() {
             // Everything the job needs is copied into it. Nothing is captured by reference,
             // because nobody is waiting and there is no frame left to refer to.
             const std::string wanted(scenario);
+            g_scenario_stage.store(ScenarioStage::Requested, std::memory_order_release);
+            g_scenario_requested_at = std::chrono::steady_clock::now();
             return unreal::PostToGameThread(
                 [objects_copy, reflection_copy, wanted, friendly_fire]() {
                     const Result began =
@@ -4856,10 +4907,16 @@ void Initialize() {
                                               kDefaultCampaignAsset, friendly_fire);
                     if (!began.ok()) {
                         MPE_LOG_ERROR("beginning the campaign failed: {}", began.message());
+                        g_scenario_stage.store(ScenarioStage::Failed, std::memory_order_release);
                         ReportLaunchFailure(began.message());
+                        return;
                     }
+                    MPE_LOG_INFO("the campaign call has been made; this machine is now loading "
+                                "for real");
+                    g_scenario_stage.store(ScenarioStage::Begun, std::memory_order_release);
                 });
-        });
+        },
+        &ScenarioProgress);
 
     // The lobby manager needs both a backend and a transport. Without them the mod
     // stays loaded and the globals surface still works, which is why this is not a
