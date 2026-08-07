@@ -821,6 +821,25 @@ void TickLoop() {
         // the previous instance goes away with it. Watching for a menu we have not yet
         // decorated makes the entry behave like a shipped one: it is simply always there,
         // rather than something that appears only after a command is run.
+        // Nothing on screen to maintain once the match has the display.
+        //
+        // The frontend and every widget in it are destroyed when a level loads, which takes
+        // the game thread pump with them. Continuing to push screen updates then is not
+        // merely wasted: each one waits out its deadline against a pump that no longer
+        // exists, several times a second, on the thread that is meanwhile supposed to be
+        // telling the host this machine has finished loading. The host waits, sees no
+        // progress, and stays on its own loading screen long after the other player is in
+        // the map.
+        if (InMatchOrLoadingLevel()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (next_tick > now) {
+                std::this_thread::sleep_for(next_tick - now);
+            } else {
+                next_tick = now;
+            }
+            continue;
+        }
+
         MaintainMainMenuButton();
 
         // Built ahead of the player, so pressing MULTIPLAYER is a visibility change rather
@@ -1114,7 +1133,7 @@ void TickLoop() {
                 unreal::LobbyUIContext measured = g_lobby_ui;
                 if (unreal::BindLobbyMenu(g_live_menu, measured).ok()) {
                     (void)unreal::RunOnGameThread(
-                        [&]() { unreal::MeasureLobby(measured); }, 5000);
+                        [&]() { unreal::MeasureLobby(measured); }, kUiJobTimeoutMs);
                 }
             }
         }
@@ -1408,7 +1427,7 @@ void OnMultiplayerClicked() {
     // Already built and waiting, so opening it is one visibility change rather than a
     // hundred widget creations.
     if (unreal::LobbyIsBuilt()) {
-        (void)unreal::RunOnGameThread([&]() { unreal::ShowLobbyUI(ui, true); }, 5000);
+        (void)unreal::RunOnGameThread([&]() { unreal::ShowLobbyUI(ui, true); }, kUiJobTimeoutMs);
         // A real session behind the screen, so the slots have something to invite into and
         // the browser has something to list.
         EnsureSessionHosted();
@@ -1505,7 +1524,7 @@ void SwitchLobbyTab(bool browsing) {
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
     }
-    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyTab(ui, browsing); }, 5000);
+    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyTab(ui, browsing); }, kUiJobTimeoutMs);
 }
 
 /// Where the server name is kept between sessions.
@@ -1571,7 +1590,7 @@ void CaptureServerName() {
         return;
     }
     std::string typed;
-    (void)unreal::RunOnGameThread([&]() { typed = unreal::ReadServerName(ui); }, 5000);
+    (void)unreal::RunOnGameThread([&]() { typed = unreal::ReadServerName(ui); }, kUiJobTimeoutMs);
     if (typed.empty() || typed == g_lobby.server_name) {
         return;
     }
@@ -1698,7 +1717,7 @@ void RefreshInvitePanelState() {
         return;
     }
     (void)unreal::RunOnGameThread(
-        [&]() { unreal::SetInvitePanelState(ui, state.text, state.readiness); }, 5000);
+        [&]() { unreal::SetInvitePanelState(ui, state.text, state.readiness); }, kUiJobTimeoutMs);
 }
 
 /// The lobby this machine is hosting, or zero when it is not hosting one.
@@ -1841,7 +1860,7 @@ void ShowInviteList(bool visible) {
             }
             unreal::ShowInvitePanel(ui, visible);
         },
-        5000);
+        kUiJobTimeoutMs);
 }
 
 void CloseInviteList() {
@@ -2049,7 +2068,7 @@ void RefreshLobbyRoster() {
         return;
     }
     (void)unreal::RunOnGameThread(
-        [&]() { unreal::SetLobbyRoster(ui, blue, red, host_name); }, 5000);
+        [&]() { unreal::SetLobbyRoster(ui, blue, red, host_name); }, kUiJobTimeoutMs);
     MPE_LOG_INFO("lobby roster: {} on blue, {} on red", blue.size(), red.size());
 }
 
@@ -2198,7 +2217,7 @@ void RefreshLobbyAuthority() {
             unreal::SetLobbyMode(ui, slayer);
             unreal::SetLobbyMap(ui, chosen);
         },
-        5000);
+        kUiJobTimeoutMs);
     MPE_LOG_INFO("lobby authority: {}, mode {}, map {}, {}min, friendly fire {}, respawn {}s",
                 is_host ? "host" : "guest", mode, scenario, settings.game_time_minutes,
                 settings.friendly_fire ? "on" : "off", settings.respawn_seconds);
@@ -2584,7 +2603,7 @@ void RefreshLobbyStatus() {
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
     }
-    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyStatus(ui, status); }, 5000);
+    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyStatus(ui, status); }, kUiJobTimeoutMs);
 
     // Done last, and outside the state lock, because both of these take it themselves.
     // The status above is written first so the final second of the countdown is drawn
@@ -2631,7 +2650,7 @@ void ApplyServerFilter() {
             unreal::SetLobbyServers(ui, matching, selected);
             unreal::SetLobbyFilters(ui, g_server_filter);
         },
-        5000);
+        kUiJobTimeoutMs);
     MPE_LOG_INFO("server filter applied: {} of {} server(s) match (mode '{}', slots {}, "
                 "ping {})",
                 matching.size(), DiscoveredServers().size(),
@@ -2679,7 +2698,7 @@ void SelectLobbyMode(bool slayer) {
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
     }
-    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMode(ui, slayer); }, 5000);
+    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMode(ui, slayer); }, kUiJobTimeoutMs);
 
     // Told to the session as well as the screen, so everybody else sees it.
     PublishSelectedMatchSettings();
@@ -2700,7 +2719,7 @@ void SelectLobbyMap(int map_index) {
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
     }
-    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMap(ui, map_index); }, 5000);
+    (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMap(ui, map_index); }, kUiJobTimeoutMs);
     PublishSelectedMatchSettings();
 }
 
@@ -3627,7 +3646,7 @@ void RefreshLoadingScreen() {
             unreal::LobbyUIContext ui = g_lobby_ui;
             if (unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
                 (void)unreal::RunOnGameThread(
-                    [&]() { unreal::ShowLoadingOverlay(ui, false); }, 5000);
+                    [&]() { unreal::ShowLoadingOverlay(ui, false); }, kUiJobTimeoutMs);
             }
             MPE_LOG_INFO("loading screen closed after {}s",
                         std::chrono::duration_cast<std::chrono::seconds>(now - g_loading_since)
