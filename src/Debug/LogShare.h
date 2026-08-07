@@ -32,6 +32,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 
 #include "Core/Result.h"
@@ -52,7 +53,10 @@ namespace mpe::debugshare {
 ///
 /// Sending happens on its own thread and never on the mod tick, because an upload waits on
 /// a network and the tick counts down countdowns.
-void Start(const std::filesystem::path& data_directory, std::string label);
+/// describe is asked for the machine's name on every report rather than once at startup.
+/// Sharing begins before Steam is signed in, so a label captured then reads PLAYER (0) on
+/// every machine, which defeats the only job a label has.
+void Start(const std::filesystem::path& data_directory, std::function<std::string()> describe);
 
 /// Queues the current log to be sent, with a reason recorded alongside it.
 ///
