@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <format>
+#include <functional>
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
@@ -45,7 +46,16 @@ private:
 };
 
 std::string             g_endpoint;
-std::string             g_label;
+/// Asked for each report rather than taken once.
+///
+/// Sharing starts before Steam is up, so a label captured at that moment says PLAYER (0) on
+/// every machine, which is exactly the one thing a label has to do: tell them apart. Asking
+/// at send time means the first report after sign in carries the real identity.
+std::function<std::string()> g_describe;
+
+[[nodiscard]] std::string Label() {
+    return g_describe ? g_describe() : std::string("unidentified");
+}
 std::filesystem::path   g_log_path;
 std::thread             g_worker;
 std::mutex              g_mutex;
@@ -148,7 +158,18 @@ void Post(const std::string& body) {
         return;
     }
 
-    const Handle session(WinHttpOpen(L"MultiplayerEvolved", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    // No proxy, not automatic proxy detection.
+    //
+    // AUTOMATIC_PROXY asks Windows to discover a proxy, which on a machine with no proxy to
+    // discover means waiting for WPAD to give up. On one of the two machines this was tested
+    // on, every single report failed with error 12002, a WinHTTP timeout, and none of that
+    // machine's logs ever arrived: the half of the picture that was missing was the half
+    // that had the interesting fault in it.
+    //
+    // Nothing here needs a proxy. A collector address is a plain https URL on the public
+    // internet, and a player who genuinely is behind a proxy can lose the reports rather
+    // than have the mod spend fifteen seconds a time finding that out.
+    const Handle session(WinHttpOpen(L"MultiplayerEvolved", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         return;
@@ -233,7 +254,7 @@ void Worker() {
         ++g_sequence;
         std::ostringstream body;
         body << "==== MultiplayerEvolved report ====\n"
-             << "from     : " << g_label << '\n'
+             << "from     : " << Label() << '\n'
              << "sequence : " << g_sequence << '\n'
              << "reason   : " << reason << '\n'
              << "bytes    : " << delta.size() << '\n'
@@ -300,13 +321,13 @@ bool SharingEnabled() {
     return g_running.load(std::memory_order_acquire);
 }
 
-void Start(const std::filesystem::path& data_directory, std::string label) {
+void Start(const std::filesystem::path& data_directory, std::function<std::string()> describe) {
     g_endpoint = ConfiguredEndpoint(data_directory);
     if (g_endpoint.empty()) {
         return;
     }
     g_log_path = data_directory / "MultiplayerEvolved.log";
-    g_label    = std::move(label);
+    g_describe = std::move(describe);
     g_running.store(true, std::memory_order_release);
     g_worker = std::thread(&Worker);
 
@@ -356,7 +377,7 @@ void Stop() {
         ++g_sequence;
         std::ostringstream body;
         body << "==== MultiplayerEvolved report ====\n"
-             << "from     : " << g_label << '\n'
+             << "from     : " << Label() << '\n'
              << "sequence : " << g_sequence << " (final)\n"
              << "reason   : shutdown\n"
              << "bytes    : " << delta.size() << "\n\n"
