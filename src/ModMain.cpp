@@ -67,6 +67,8 @@
 #include <iterator>
 #include <format>
 #include <memory>
+#include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -235,6 +237,7 @@ void RefreshLobbyAuthority();
 void PrepareLobby();
 void PrepareStatusOverlay();
 void PrepareLoadingOverlay();
+void SurveyNetworkSurface(const unreal::ObjectArray& objects);
 void RegisterLoadingCancel();
 void RefreshLoadingScreen();
 void OnCancelLoading();
@@ -340,7 +343,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.5";
+constexpr const char* kModVersion = "0.2.6";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -920,6 +923,20 @@ void TickLoop() {
         PrepareLobby();
         PrepareLoadingOverlay();
         RegisterLoadingCancel();
+
+        // Once, as soon as there is an object array worth walking. The result is what the
+        // work on making players visible to each other is built from.
+        {
+            static bool s_surveyed = false;
+            if (!s_surveyed) {
+                std::optional<unreal::ObjectArray> objects;
+                std::optional<unreal::Reflection>  reflection;
+                if (TakeEngineView(objects, reflection) && objects->Count() > 20000) {
+                    s_surveyed = true;
+                    SurveyNetworkSurface(*objects);
+                }
+            }
+        }
 
         // Twelve and a half times a second, which is enough for the dots to read as a cycle
         // and the sweep as motion. Sixty would be smoother and would cost sixty game thread
@@ -1738,6 +1755,93 @@ void LogMachineIdentity() {
                     now.time_since_epoch())
                     .count());
     MPE_LOG_INFO("--- end machine ---");
+}
+
+/// Writes down the game's own networking surface, once.
+///
+/// WHY THIS IS THE NEXT STEP AND NOT MORE GUESSING
+///
+/// Two players now load the same scenario at the same moment and cannot see each other,
+/// because nothing about a player crosses between machines. There are two ways to change
+/// that. One is to read the local player out of the simulation, send it, and construct a
+/// second player on the far side by hand: months of work, and every part of it invented.
+///
+/// The other is that this game already has working networked play. It ships co-op. Somewhere
+/// in it is the code that puts two people in one world, replicates their bipeds, and applies
+/// one player's bullets to another, and all of it is written, shipped and debugged. Driving
+/// that is the same move that made launching a match work at all: the engine's own campaign
+/// entry point did in one call what a pile of reflection could not.
+///
+/// What is missing is the map. This walks the object array once and writes down every class
+/// and every function whose name places it in that machinery, which turns "find the co-op
+/// path" from an unbounded search into reading a list.
+///
+/// Deliberately one pass and one time. The array is around fifty thousand entries and every
+/// read is guarded, so this is not something to repeat.
+void SurveyNetworkSurface(const unreal::ObjectArray& objects) {
+    static constexpr std::string_view kWanted[] = {
+        "Network", "Session", "Fireteam", "Coop", "CoOp",     "Replicat", "NetDriver",
+        "NetConn", "Online",  "Party",    "Join", "Matchmak", "Multiplay",
+    };
+    const auto interesting = [](std::string_view name) {
+        for (const std::string_view fragment : kWanted) {
+            if (name.find(fragment) != std::string_view::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Grouped by owner, because a function's name alone rarely says enough. Knowing that
+    // Join sits on the co-op session subsystem rather than on a widget is the whole point.
+    std::map<std::string, std::vector<std::string>> functions_by_owner;
+    std::set<std::string>                           classes;
+    std::size_t                                     scanned = 0;
+
+    objects.ForEach([&](const unreal::ObjectInfo& object) {
+        ++scanned;
+        if (object.class_name == "Function") {
+            if (!interesting(object.name)) {
+                return true;
+            }
+            std::string owner = objects.BuildPath(object);
+            // The path is the full outer chain; the owning class is the part before the
+            // function, which is what identifies where to call it.
+            if (const std::size_t cut = owner.rfind('.'); cut != std::string::npos) {
+                owner.resize(cut);
+            }
+            functions_by_owner[owner].push_back(object.name);
+            return true;
+        }
+        if (interesting(object.class_name)) {
+            classes.insert(object.class_name);
+        }
+        if (object.name.rfind("Default__", 0) != 0 && interesting(object.name)) {
+            classes.insert(object.name + " (object)");
+        }
+        return true;
+    });
+
+    MPE_LOG_INFO("=== the game's own networking surface ({} object(s) scanned) ===", scanned);
+
+    MPE_LOG_INFO("--- types ---");
+    for (const std::string& name : classes) {
+        MPE_LOG_INFO("  {}", name);
+    }
+
+    MPE_LOG_INFO("--- functions, by what owns them ---");
+    for (const auto& [owner, names] : functions_by_owner) {
+        std::string joined;
+        for (const std::string& name : names) {
+            if (!joined.empty()) {
+                joined += ", ";
+            }
+            joined += name;
+        }
+        MPE_LOG_INFO("  {}", owner);
+        MPE_LOG_INFO("      {}", joined);
+    }
+    MPE_LOG_INFO("=== end networking surface ===");
 }
 
 /// Writes a full picture of the session into the log, on demand.
