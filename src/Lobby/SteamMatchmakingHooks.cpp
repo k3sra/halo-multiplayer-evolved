@@ -113,6 +113,7 @@ Result SteamMatchmakingHooks::Create(LobbyVisibility visibility, std::uint32_t m
 
     lobby_created_call_.Set(call, this, &SteamMatchmakingHooks::OnLobbyCreatedResult);
     operation_in_flight_ = true;
+    entry_delivered_     = false;
 
     MPE_LOG_INFO("creating {} lobby for up to {} member(s)", ToString(visibility), max_members);
     return Result::Success();
@@ -138,6 +139,7 @@ Result SteamMatchmakingHooks::Join(LobbyId lobby) {
     }
     operation_in_flight_ = true;
     requested_lobby_     = lobby;
+    entry_delivered_     = false;
 
     MPE_LOG_INFO("joining lobby {}", lobby);
     return Result::Success();
@@ -153,6 +155,7 @@ void SteamMatchmakingHooks::Leave() {
     is_owner_            = false;
     operation_in_flight_ = false;
     requested_lobby_     = 0;
+    entry_delivered_     = false;
     name_cache_.clear();
     ClearJoinablePresence();
 
@@ -377,6 +380,7 @@ void SteamMatchmakingHooks::Enqueue(Event event) {
 }
 
 void SteamMatchmakingHooks::Poll(ILobbyBackendObserver& observer) {
+    AbandonStalledOperation(observer);
     NoticeEntryWithoutCallback();
 
     std::deque<Event> batch;
@@ -386,6 +390,53 @@ void SteamMatchmakingHooks::Poll(ILobbyBackendObserver& observer) {
     }
     for (const Event& event : batch) {
         Dispatch(event, observer);
+    }
+}
+
+void SteamMatchmakingHooks::AbandonStalledOperation(ILobbyBackendObserver& observer) {
+    // An operation that never answers must not block every later one.
+    //
+    // Create and Join both refuse while one is outstanding, which is right: two at once
+    // would be two lobbies. But the flag that records "outstanding" was only ever cleared
+    // by the answer arriving, and the answer is a Steam callback this mod does not control
+    // the dispatch of. One that never came left the flag set for the life of the process,
+    // and from then on every attempt to host was refused before it started. That is a
+    // player pressing MULTIPLAYER, going back to the menu, and pressing it again, several
+    // times, and being told OFFLINE every time by a mod that had stopped trying.
+    //
+    // Twenty seconds is far longer than either call takes and short enough to recover
+    // inside one sitting. Reported as a failure rather than cleared quietly, so whatever
+    // asked for it learns that it did not happen.
+    if (!operation_in_flight_) {
+        operation_started_ = {};
+        return;
+    }
+    if (operation_started_ == std::chrono::steady_clock::time_point{}) {
+        operation_started_ = std::chrono::steady_clock::now();
+        return;
+    }
+    if (std::chrono::steady_clock::now() - operation_started_ <
+        std::chrono::seconds(kOperationTimeoutSeconds)) {
+        return;
+    }
+
+    const bool was_joining = requested_lobby_ != 0;
+    MPE_LOG_WARN("a lobby {} has gone {} seconds without an answer; abandoning it so the "
+                "next attempt is not refused",
+                was_joining ? "join" : "creation", kOperationTimeoutSeconds);
+
+    operation_in_flight_ = false;
+    operation_started_   = {};
+    requested_lobby_     = 0;
+    entry_delivered_     = false;
+
+    const Error error{ErrorCode::Timeout,
+                      was_joining ? "Steam never answered the request to enter that lobby"
+                                  : "Steam never answered the request to create a lobby"};
+    if (was_joining) {
+        observer.OnLobbyEnterFailed(error);
+    } else {
+        observer.OnLobbyCreateFailed(error);
     }
 }
 
@@ -480,9 +531,25 @@ void SteamMatchmakingHooks::Dispatch(const Event& event, ILobbyBackendObserver& 
                 MPE_LOG_INFO("ignoring lobby {}, which this mod did not open", event.lobby);
                 return;
             }
+
+            // Told once, however many times it is noticed.
+            //
+            // Entry is now both observed directly and delivered by Steam's own callback,
+            // which is deliberate: reading it is fast and being told is reliable, and having
+            // both means neither can hold the join up. What must not happen is the observer
+            // hearing about it twice. It did, and the second telling ran the whole entry
+            // path again: another connect on a transport that already had one in flight,
+            // which fails, which faults the session. That is the error a player got the
+            // instant they picked a friend's game.
+            if (entry_delivered_ && event.lobby == current_lobby_) {
+                MPE_LOG_DEBUG("entry into lobby {} was already reported", event.lobby);
+                return;
+            }
+
             current_lobby_       = event.lobby;
             operation_in_flight_ = false;
             requested_lobby_     = 0;
+            entry_delivered_     = true;
             steam::SetCurrentLobby(event.lobby);
             RefreshOwnership();
             observer.OnLobbyEntered(event.lobby, is_owner_);

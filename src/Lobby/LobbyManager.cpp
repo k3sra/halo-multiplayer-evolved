@@ -941,6 +941,20 @@ void LobbyManager::OnLobbyEntered(LobbyId lobby, bool is_owner) {
         return;
     }
 
+    // Only from Joining. Anything else is a repeat.
+    //
+    // The backend already reports an entry once, and this is the second lock on the same
+    // door, because the cost of getting it wrong is out of all proportion to the mistake:
+    // running this path again starts a second connection on a transport that already has
+    // one in flight, that attempt fails, and the failure faults the whole session. A player
+    // who picked a friend's game got an error in the same instant they clicked, from a join
+    // that was in fact proceeding normally.
+    if (phase_ != LobbyPhase::Joining) {
+        MPE_LOG_DEBUG("ignoring a repeated entry into lobby {} while {}", lobby,
+                     ToString(phase_));
+        return;
+    }
+
     // Validate compatibility from metadata before connecting, so a mismatched
     // client gets an explanation instead of a failed handshake.
     const Expected<std::string> protocol = backend_.GetLobbyData(keys::kProtocolVersion);
