@@ -130,7 +130,7 @@ struct LobbyFriend {
 };
 
 /// How many invite rows the panel draws. A longer friends list is paged.
-inline constexpr int kFriendRows = 10;
+inline constexpr int kFriendRows = 8;
 
 /// How the server browser is filtered.
 struct ServerFilter {

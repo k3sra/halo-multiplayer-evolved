@@ -1040,50 +1040,95 @@ void DrawBrowseTab(const Builder& builder, std::uintptr_t canvas, const LobbyVie
 /// this lobby directly, which needs no overlay and no fireteam.
 void DrawInvitePanel(const Builder& builder, std::uintptr_t canvas,
                      std::vector<LobbyControl>& controls) {
+    // Sized like the rest of the lobby, because it is part of it.
+    //
+    // This panel was built to its own proportions and looked borrowed from another
+    // program: rows seven hundred and twenty wide by fifty two tall, stretching the
+    // frontend's button art to an aspect it was never drawn at, and a close button running
+    // the full width of the card, which is a shape the game uses nowhere.
+    //
+    // Everything here now matches the numbers the lobby's own controls already use and
+    // that the frontend's art was drawn for. The mode buttons are 360 by 66 and read
+    // correctly; a row is the same height, and the card is only as wide as the content
+    // needs rather than as wide as it could be.
+    constexpr float kCardX  = 610.0F;
+    constexpr float kCardY  = 150.0F;
+    constexpr float kCardW  = 700.0F;
+    constexpr float kCardH  = 790.0F;
+    constexpr float kInsetX = kCardX + 26.0F;   // 636
+    constexpr float kInsetW = kCardW - 52.0F;   // 648
+    constexpr float kRowH   = 62.0F;
+    constexpr float kRowGap = 68.0F;
+    constexpr float kListY  = 286.0F;
+
     // Full bleed, and deliberately opaque enough to read against. This also swallows every
     // click that misses a row, so the lobby underneath cannot be operated by accident while
     // a modal choice is open.
     (void)builder.Panel(canvas, 0.0F, 0.0F, kDesignWidth, kDesignHeight, {0, 0, 0, 0.78F});
 
-    (void)builder.Backer(canvas, 580.0F, 150.0F, 760.0F, 840.0F, kPanel);
-    (void)builder.Panel(canvas, 604.0F, 228.0F, 712.0F, 2.0F, kAccent);
-    (void)builder.Text(canvas, 604.0F, 182.0F, 712.0F, 40.0F, "INVITE TO THIS SESSION",
-                       kAccent, 26.0F);
-    (void)builder.Text(canvas, 604.0F, 236.0F, 712.0F, 26.0F,
-                       "Anyone here joins this multiplayer session, not a fireteam.",
-                       kTextDim, 17.0F);
+    // The frontend's own panel backing, which is what the game puts behind a menu panel.
+    (void)builder.Backer(canvas, kCardX, kCardY, kCardW, kCardH, kPanel);
 
-    float row_y = 278.0F;
+    // The heading in the frontend's own heading art, the way every other heading on this
+    // screen is done, rather than as loose text that happened to be tinted.
+    (void)builder.Label(canvas, kInsetX - 6.0F, kCardY + 20.0F, 400.0F, 72.0F, "INVITE");
+    (void)builder.Text(canvas, kInsetX, kCardY + 92.0F, kInsetW, 26.0F,
+                       "They join this multiplayer session, not a fireteam.", kTextDim,
+                       17.0F);
+    (void)builder.Panel(canvas, kInsetX, kCardY + 124.0F, kInsetW, 2.0F, kAccentDim);
+
+    // A backing behind the list, so the rows read as one group rather than as buttons
+    // floating on the card.
+    (void)builder.Backer(canvas, kInsetX - 10.0F, kListY - 12.0F, kInsetW + 20.0F,
+                         static_cast<float>(kFriendRows) * kRowGap + 20.0F, kPanelLight);
+
+    float row_y = kListY;
     for (int index = 0; index < kFriendRows; ++index) {
         FriendRowWidgets& row = g_friend_row[index];
-        row.highlight = builder.Panel(canvas, 600.0F, row_y, 720.0F, 52.0F, kAccentDim);
-        row.button    = builder.Button(canvas, 600.0F, row_y, 720.0F, 52.0F, " ",
-                                       kStretchFill);
-        row.name      = builder.Text(canvas, 618.0F, row_y + 12.0F, 500.0F, 30.0F, "", kText,
-                                     22.0F);
-        row.status    = builder.Text(canvas, 1130.0F, row_y + 14.0F, 180.0F, 28.0F, "",
-                                     kTextDim, 18.0F);
+
+        // Marker behind the button, the same arrangement the mode and map buttons use, so
+        // an invited row is marked without covering the art that marks it.
+        row.highlight = builder.Panel(canvas, kInsetX - 4.0F, row_y - 3.0F, kInsetW + 8.0F,
+                                      kRowH + 6.0F, kAccentDim);
+
+        // Filled rather than fitted, because the whole row has to be pressable: art scaled
+        // to fit is centred, which would leave the clickable part a fraction of the row and
+        // the rest of it dead. The name and status are drawn over it and made non
+        // interactive so the press still reaches the row underneath.
+        row.button = builder.Button(canvas, kInsetX, row_y, kInsetW, kRowH, " ",
+                                    kStretchFill);
+        row.name   = builder.Text(canvas, kInsetX + 18.0F, row_y + 17.0F, kInsetW - 190.0F,
+                                  30.0F, "", kText, 22.0F);
+        row.status = builder.Text(canvas, kInsetX + kInsetW - 170.0F, row_y + 19.0F, 158.0F,
+                                  26.0F, "", kTextDim, 17.0F);
+
         builder.SetVisibilityOf(row.name, kHitTestInvisible);
         builder.SetVisibilityOf(row.status, kHitTestInvisible);
         builder.SetVisibilityOf(row.highlight, kCollapsedValue);
         builder.SetVisibilityOf(row.button, kCollapsedValue);
         controls.push_back({row.button, LobbyAction::SelectFriend, index});
-        row_y += 58.0F;
+        row_y += kRowGap;
     }
 
-    g_friend_empty = builder.Text(canvas, 604.0F, 420.0F, 712.0F, 40.0F,
+    g_friend_empty = builder.Text(canvas, kInsetX, kListY + 40.0F, kInsetW, 40.0F,
                                   "Nobody on your Steam friends list is online.", kTextDim,
-                                  22.0F);
+                                  20.0F);
     builder.SetVisibilityOf(g_friend_empty, kHitTestInvisible);
 
-    controls.push_back({builder.Button(canvas, 600.0F, 866.0F, 210.0F, 62.0F, "PREV"),
+    // The footer, on one line: page back, what page this is, page forward, and a close
+    // button the size of a button rather than the width of the card.
+    const float footer_y = kCardY + kCardH - 96.0F;
+    controls.push_back({builder.Button(canvas, kInsetX, footer_y, 180.0F, 60.0F, "PREV"),
                         LobbyAction::FriendsPrevious, 0});
-    controls.push_back({builder.Button(canvas, 1110.0F, 866.0F, 210.0F, 62.0F, "NEXT"),
+    controls.push_back({builder.Button(canvas, kInsetX + kInsetW - 180.0F, footer_y, 180.0F,
+                                       60.0F, "NEXT"),
                         LobbyAction::FriendsNext, 0});
-    g_friend_page = builder.Text(canvas, 830.0F, 880.0F, 260.0F, 30.0F, "", kTextDim, 19.0F);
+    g_friend_page = builder.Text(canvas, kInsetX + 190.0F, footer_y + 18.0F,
+                                 kInsetW - 380.0F, 30.0F, "", kTextDim, 18.0F);
     builder.SetVisibilityOf(g_friend_page, kHitTestInvisible);
 
-    controls.push_back({builder.Button(canvas, 600.0F, 916.0F, 720.0F, 74.0F, "CLOSE"),
+    controls.push_back({builder.Button(canvas, kCardX + (kCardW - 300.0F) * 0.5F,
+                                       footer_y + 66.0F, 300.0F, 66.0F, "CLOSE"),
                         LobbyAction::CloseInvite, 0});
 }
 
