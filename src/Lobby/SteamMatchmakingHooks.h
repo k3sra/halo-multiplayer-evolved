@@ -156,6 +156,24 @@ private:
     /// request cannot be started concurrently.
     bool operation_in_flight_{false};
 
+    /// Which lobby Join was asked for, until entering it succeeds or fails.
+    ///
+    /// Without it, "is this enter event ours" was answered by "is anything outstanding",
+    /// which cannot tell one lobby from another. Leaving a lobby and immediately joining
+    /// another is exactly the case that breaks: the enter event for the lobby just left can
+    /// still be in the queue, and it would consume the outstanding request, be reported as
+    /// the lobby that was joined, and leave the real one to arrive with nothing expecting it
+    /// and be discarded. The join then never completed and never failed, which is a session
+    /// stuck on Joining with nothing to time it out.
+    LobbyId requested_lobby_{0};
+
+    /// Detects a completed entry by reading the lobby's member list.
+    ///
+    /// Inside the game the host application owns the Steam callback pump, so waiting to be
+    /// told about an entry means waiting on something this mod neither controls nor can
+    /// measure. Asking is synchronous and owes it nothing.
+    void NoticeEntryWithoutCallback();
+
     /// Cached display names, so a member who has left can still be named in the
     /// roster and in log output.
     std::unordered_map<PlatformId, std::string> name_cache_;

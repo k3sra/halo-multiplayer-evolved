@@ -144,6 +144,13 @@ private:
     /// Handles one dequeued status change on the mod tick thread.
     void ProcessStatusChange(const PendingStatusChange& change, ITransportObserver& observer);
 
+    /// Reads the state of every connection not yet reported connected.
+    ///
+    /// Inside the game the host application owns the Steam callback pump, so being told
+    /// about a transition means waiting on something this mod neither controls nor can
+    /// measure. Asking is synchronous and costs a handful of reads per tick.
+    void NoticeConnectionStates();
+
     /// Pulls and dispatches everything waiting on the poll group.
     void DrainReceivedMessages(ITransportObserver& observer);
 

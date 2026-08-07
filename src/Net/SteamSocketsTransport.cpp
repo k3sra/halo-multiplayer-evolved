@@ -389,6 +389,8 @@ void SteamSocketsTransport::Poll(ITransportObserver& observer) {
         steam::RunCallbacks();
     }
 
+    NoticeConnectionStates();
+
     // Drain under the lock, process outside it, so an observer callback that calls
     // back into the transport cannot deadlock.
     std::deque<PendingStatusChange> batch;
@@ -401,6 +403,55 @@ void SteamSocketsTransport::Poll(ITransportObserver& observer) {
     }
 
     DrainReceivedMessages(observer);
+}
+
+void SteamSocketsTransport::NoticeConnectionStates() {
+    // Connection state is asked for, not only waited on.
+    //
+    // SteamNetConnectionStatusChanged is a broadcast callback, and inside the game this
+    // mod does not own the Steam callback pump: the host application does. So every
+    // transition on a connection this mod opened arrived whenever the game next chose to
+    // dispatch, which is not something this mod controls, cannot measure, and has no
+    // upper bound on. That is time a player spends watching a screen that says nothing is
+    // happening, because as far as this code knows nothing is.
+    //
+    // The state of a connection we already hold is readable synchronously, so it is read
+    // every tick and any change is queued exactly as the callback would have queued it.
+    // Discovering a brand new inbound connection still needs the callback, because there
+    // is no handle to ask about until one exists; everything after that no longer does.
+    //
+    // Duplicate notifications are harmless: ProcessStatusChange already ignores a
+    // Connected for a peer it has marked connected, which is what makes reading and being
+    // told safe to have at once.
+    // Peers are only touched from this thread, so the map is read directly.
+    std::vector<steam::HSteamNetConnection> waiting;
+    waiting.reserve(peers_.size());
+    for (const auto& [handle, entry] : peers_) {
+        (void)handle;
+        if (!entry.connected) {
+            waiting.push_back(entry.connection);
+        }
+    }
+    if (waiting.empty()) {
+        return;
+    }
+
+    for (const steam::HSteamNetConnection connection : waiting) {
+        steam::SteamNetConnectionInfo info{};
+        if (!steam::GetConnectionInfo(connection, &info)) {
+            continue;
+        }
+        if (info.m_eState != steam::ESteamNetworkingConnectionState::Connected) {
+            continue;
+        }
+        PendingStatusChange change{};
+        change.connection         = connection;
+        change.state              = info.m_eState;
+        change.inbound            = false;
+        change.remote_platform_id = info.m_identityRemote.m_steamID64;
+        std::lock_guard lock(queue_mutex_);
+        pending_.push_back(change);
+    }
 }
 
 void SteamSocketsTransport::ProcessStatusChange(const PendingStatusChange& change,
