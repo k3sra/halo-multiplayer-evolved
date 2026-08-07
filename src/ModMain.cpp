@@ -198,7 +198,28 @@ void SwitchLobbyTab(bool browsing);
 void SelectLobbyMode(bool slayer);
 void PublishSelectedMatchSettings();
 void SelectLobbyMap(int map_index);
+/// How long a periodic screen update may hold the mod thread.
+///
+/// A quarter of a second, not five. These run several times a second on the same thread
+/// that counts down a countdown, reads button presses and reports load progress to the
+/// host. A five second deadline on one of them means an unlucky frame costs five seconds of
+/// all of that, and the frontend genuinely does go away mid match, which is exactly when
+/// the host is waiting to hear that this machine has finished loading.
+///
+/// Nothing drawn here is worth waiting for. A dropped screen update is invisible; a tick
+/// that does not happen is not.
+constexpr unsigned kUiJobTimeoutMs = 250;
+
+/// True once the display belongs to the match rather than to the frontend.
+///
+/// While that is so, every widget this mod created has been destroyed with the frontend and
+/// there is nothing to draw on. The session keeps running; only the screen work stops.
+[[nodiscard]] bool InMatchOrLoadingLevel();
+
 void EnsureSessionHosted();
+void CloseIdleSessionAwayFromLobby();
+void LogMachineIdentity();
+void CollectDiagnostics();
 void InviteToSession();
 void ApplyServerFilter();
 void PublishSessionDetails();
@@ -972,17 +993,41 @@ void TickLoop() {
         // Phase changes are logged, so a session that never becomes joinable says why
         // instead of simply never appearing.
         {
-            static lobby::LobbyPhase s_phase = lobby::LobbyPhase::Idle;
-            std::lock_guard          lock(g_state_mutex);
-            if (g_state && g_state->manager) {
-                const lobby::LobbyPhase now = g_state->manager->Phase();
-                if (now != s_phase) {
-                    s_phase = now;
-                    MPE_LOG_INFO("session phase is now {} (lobby {}, error '{}')",
-                                static_cast<int>(now),
-                                g_state->manager->Snapshot().lobby_id,
-                                g_state->manager->Snapshot().last_error);
+            static lobby::LobbyPhase s_phase   = lobby::LobbyPhase::Idle;
+            static auto              s_entered = std::chrono::steady_clock::now();
+            bool                     dump      = false;
+            {
+                std::lock_guard lock(g_state_mutex);
+                if (g_state && g_state->manager) {
+                    const lobby::LobbyPhase now = g_state->manager->Phase();
+                    if (now != s_phase) {
+                        const auto held = std::chrono::steady_clock::now() - s_entered;
+                        // How long the previous phase took, every time.
+                        //
+                        // "It was slow" and "it hung" are the two reports that arrive most
+                        // and the two that say least. A number against every transition
+                        // turns both into a question with an answer, and it is the one
+                        // measurement nobody can take after the fact.
+                        MPE_LOG_INFO("session phase {} -> {} after {} ms (lobby {}, error "
+                                    "'{}')",
+                                    lobby::ToString(s_phase), lobby::ToString(now),
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        held)
+                                        .count(),
+                                    g_state->manager->Snapshot().lobby_id,
+                                    g_state->manager->Snapshot().last_error);
+                        // A full picture at every moment worth having one, so a report
+                        // needs no reproduction: entering a match, and every failure.
+                        dump = (now == lobby::LobbyPhase::Faulted ||
+                                now == lobby::LobbyPhase::InMatch ||
+                                now == lobby::LobbyPhase::Loading);
+                        s_phase   = now;
+                        s_entered = std::chrono::steady_clock::now();
+                    }
                 }
+            }
+            if (dump) {
+                CollectDiagnostics();
             }
         }
 
@@ -1604,7 +1649,152 @@ void CaptureServerName() {
 /// The screen on its own is only a picture: without a session there is nothing for anyone
 /// to join and nothing for an invite to point at. Hosting is idempotent here, so opening
 /// the lobby twice does not create two sessions.
+// --- Diagnostics -------------------------------------------------------------
+//
+// WHAT IS COLLECTED, AND WHAT IS NOT
+//
+// The log is written to the game folder and stays there. Nothing in this mod uploads it,
+// and nothing in this mod should: sending a player's Steam identity and their friends list
+// to a server because they installed a mod is not something to do quietly, whatever it is
+// for. Collecting means putting everything a diagnosis needs into one file the player can
+// find and send if they choose to.
+//
+// What goes in is what two logs need to be readable side by side: which machine wrote this
+// one, which build, and a clock. The rest is already there, because the whole log is at
+// trace level while this is being tested.
+
+/// Writes who and where, at the top of the log.
+void LogMachineIdentity() {
+    MPE_LOG_INFO("--- machine ---");
+    MPE_LOG_INFO("  steam id   : {}", steam::GetLocalSteamId());
+    MPE_LOG_INFO("  steam name : {}", SteamPlayerName());
+    MPE_LOG_INFO("  mod version: {}", kModVersion);
+    MPE_LOG_INFO("  protocol   : {}", net::kProtocolVersion);
+    MPE_LOG_INFO("  game build : {}", GameBuildString());
+
+    // A wall clock, so two logs from two machines can be lined up. Steady clock timestamps
+    // in the log are per process and say nothing about which of two events came first.
+    const auto now = std::chrono::system_clock::now();
+    MPE_LOG_INFO("  started at : {} (epoch ms {})",
+                std::format("{:%Y-%m-%d %H:%M:%S}", now),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch())
+                    .count());
+    MPE_LOG_INFO("--- end machine ---");
+}
+
+/// Writes a full picture of the session into the log, on demand.
+///
+/// Every fault reported so far has been diagnosed from what happened to be written down
+/// while it was happening. This is the same idea aimed at one moment: when something looks
+/// wrong, one line records everything about it at once rather than leaving a diagnosis to
+/// be assembled out of whatever the running log happened to catch.
+void CollectDiagnostics() {
+    MPE_LOG_INFO("=== diagnostics ===");
+    LogMachineIdentity();
+
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            MPE_LOG_INFO("  session    : networking is unavailable");
+        } else {
+            const lobby::LobbySnapshot& snapshot = g_state->manager->Snapshot();
+            MPE_LOG_INFO("  phase      : {} ({})", lobby::ToString(snapshot.phase),
+                        static_cast<int>(snapshot.phase));
+            MPE_LOG_INFO("  is host    : {}", snapshot.is_host);
+            MPE_LOG_INFO("  lobby id   : {}", snapshot.lobby_id);
+            MPE_LOG_INFO("  status     : {}", snapshot.status_text);
+            MPE_LOG_INFO("  last error : {}", snapshot.last_error);
+            MPE_LOG_INFO("  countdown  : {}", snapshot.countdown_seconds);
+            MPE_LOG_INFO("  mode       : {}, scenario '{}', seed {}",
+                        engine::ToString(snapshot.settings.mode),
+                        snapshot.settings.scenario, snapshot.settings.random_seed);
+            MPE_LOG_INFO("  players    : {}", snapshot.players.size());
+            for (const lobby::PlayerSlot& player : snapshot.players) {
+                MPE_LOG_INFO("    {} '{}' team {} slot {} host {} local {} map {} "
+                            "load {:.2f} ping {}ms",
+                            player.platform_id, player.display_name, player.team,
+                            player.slot, player.is_host, player.is_local, player.has_map,
+                            player.load_progress, player.ping_milliseconds);
+            }
+        }
+    }
+
+    MPE_LOG_INFO("  lobby ui   : built {}, visible {}, build id {}", unreal::LobbyIsBuilt(),
+                unreal::LobbyIsVisible(), unreal::LobbyBuildId());
+    MPE_LOG_INFO("  overlays   : status {}, loading built {} open {}",
+                unreal::StatusOverlayIsBuilt(), unreal::LoadingOverlayIsBuilt(),
+                unreal::LoadingOverlayIsOpen());
+    MPE_LOG_INFO("  game thread: pump {}, on game thread {}",
+                unreal::GameThreadPumpActive(), unreal::OnGameThread());
+    MPE_LOG_INFO("  controls   : {} watched", g_lobby_controls.size());
+
+    const std::vector<steam::LobbyListing> listings = steam::BrowseLobbies();
+    MPE_LOG_INFO("  browser    : {} listing(s)", listings.size());
+    for (const steam::LobbyListing& listing : listings) {
+        MPE_LOG_INFO("    {} '{}' {} on {} {}/{} phase '{}' host {}", listing.id,
+                    listing.name, listing.mode, listing.map, listing.members,
+                    listing.capacity, listing.phase, listing.host_id);
+    }
+    MPE_LOG_INFO("=== end diagnostics ===");
+}
+
+bool InMatchOrLoadingLevel() {
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->manager) {
+        return false;
+    }
+    switch (g_state->manager->Phase()) {
+        case lobby::LobbyPhase::InMatch:
+        case lobby::LobbyPhase::PostMatch:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// Closes a session nobody is in, once the player has left the lobby screen.
+///
+/// BACK already leaves the session, but BACK is not the only way off that screen, and a
+/// session left running is this mod advertising the player as joinable while they are
+/// sitting on the main menu. The game has its own online presence for co-op there, and a
+/// deathmatch lobby standing in front of it is not what somebody who opened the game to
+/// play co-op asked for.
+///
+/// Deliberately narrow. Only a session this machine is hosting, only while nobody else is
+/// in it, and only while it has not started anything. A match in progress has no lobby
+/// screen either, and closing that would end the game somebody is playing.
+void CloseIdleSessionAwayFromLobby() {
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->manager || !g_state->manager->IsHost()) {
+        return;
+    }
+    const lobby::LobbySnapshot& snapshot = g_state->manager->Snapshot();
+    if (snapshot.phase != lobby::LobbyPhase::Hosting || snapshot.players.size() > 1) {
+        return;
+    }
+    MPE_LOG_INFO("closing the empty session; the lobby screen is not open");
+    g_state->manager->LeaveSession();
+}
+
 void EnsureSessionHosted() {
+    // Only while the player is actually looking at the lobby.
+    //
+    // A session is not free to leave running. Hosting one publishes this player as
+    // joinable, and the game has its own online presence for co-op that people use without
+    // ever touching this mod. Sitting on the main menu advertising a deathmatch lobby
+    // stands in front of that, and it is not what somebody who opened the game to play
+    // co-op asked for.
+    //
+    // The test is visibility rather than existence, and this is the whole bug: the lobby is
+    // built ahead of the player and kept hidden so opening it is instant, so "is there a
+    // lobby" has been true since the game finished loading. Every caller here asked that
+    // question, which is why leaving the screen closed the session and something opened it
+    // again a moment later.
+    if (!unreal::LobbyIsVisible()) {
+        return;
+    }
+
     std::lock_guard lock(g_state_mutex);
     if (!g_state || !g_state->manager) {
         MPE_LOG_WARN("no session can be hosted: networking is unavailable");
@@ -4523,15 +4713,33 @@ void Initialize() {
     // join, which is exactly the part nobody can reconstruct afterwards. Dropping to Debug
     // costs a larger file and nothing else that matters here.
     //
-    // MultiplayerEvolved/trace.on adds every packet and every reflection lookup, which is
-    // only worth having when a specific question needs it.
+    // Trace by default while this is being tested with real people.
+    //
+    // Every fault reported so far has needed two machines, and every one of them was
+    // diagnosed from what happened to be written down at the time rather than from what
+    // anybody could remember afterwards. A deadlock, a lost handshake, a duplicated lobby
+    // entry: none of those leave a trace a player can describe, and asking somebody to
+    // reproduce one on request is asking for the thing that already took an evening.
+    //
+    // So it records everything, on both machines, all the time, and the two files can be
+    // read side by side. That costs a larger file and nothing else. It is a development
+    // setting, and MultiplayerEvolved/quiet.on turns it back down for anybody who would
+    // rather it did not.
     const log::Level level =
-        DisableFlagPresent(L"trace.on") ? log::Level::Trace : log::Level::Debug;
+        DisableFlagPresent(L"quiet.on") ? log::Level::Info : log::Level::Trace;
     log::Initialize(DataDirectory() / "MultiplayerEvolved.log", level);
     MPE_LOG_INFO("MultiplayerEvolved {} starting, logging at {}", MPE_VERSION_STRING,
                 log::ToString(level));
     MPE_LOG_INFO("game build: {}", GameBuildString());
     MPE_LOG_INFO("data directory: {}", DataDirectory().string());
+
+    // Who and where, at the top of every log.
+    //
+    // Two logs of the same session have to be matchable, and the only things that do that
+    // are the identity at each end and a clock they can both be read against. Without them,
+    // two files describing the same failed join cannot be told from two files describing
+    // two different ones.
+    LogMachineIdentity();
 
     // The FName adapter is written in early, but never called here.
     //
