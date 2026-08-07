@@ -1989,8 +1989,13 @@ void RefreshLobbyStatus() {
             // The engine's own vocabulary is what goes on the wire and into lobby data:
             // capture_the_flag, a30. Correct there and wrong on a panel a player reads,
             // where it looks like a debug string that escaped.
-            status.mode = DisplayMode(snapshot.settings.mode);
-            status.map  = DisplayMap(snapshot.settings.scenario);
+            // Only while there is a session. On the main menu the manager is idle and its
+            // settings are whatever it was constructed with, so reporting them there
+            // described a match that did not exist.
+            if (g_state->manager->Phase() != lobby::LobbyPhase::Idle) {
+                status.mode = DisplayMode(snapshot.settings.mode);
+                status.map  = DisplayMap(snapshot.settings.scenario);
+            }
 
             // A phase that is going nowhere says so.
             //

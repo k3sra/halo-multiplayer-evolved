@@ -125,8 +125,8 @@ std::uintptr_t g_empty_notice     = 0;
 /// point in a box three hundred and ten points wide could not hold a sentence: a session
 /// line reading "CONNECTING TO HOST  STALLED" ran off the right of the screen, because a
 /// text block given more than it can draw simply keeps going.
-constexpr std::size_t kStatusLines = 5;
-std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0};
+constexpr std::size_t kStatusLines = 6;
+std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0, 0};
 
 /// Turns UTF-8 into the wide string the engine's text conversion expects.
 ///
@@ -182,6 +182,14 @@ std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0};
 ///
 /// Its own viewport widget, above the lobby's and never hidden, so the panel is on the
 /// main menu as well as over the lobby.
+/// Incremented every time the lobby is built.
+///
+/// Anything that decides what to draw by comparing against what it drew last time has to
+/// know the widgets it drew onto no longer exist. Without it, a screen rebuilt with the
+/// same settings keeps whatever the new widgets happen to default to, which for a guest
+/// means the host's controls come back.
+std::uint32_t g_lobby_build_id = 0;
+
 std::uintptr_t g_status_host    = 0;
 std::uintptr_t g_status_scaler  = 0;
 std::uintptr_t g_status_root    = 0;
@@ -1921,6 +1929,7 @@ Result BuildLobbyUI(const LobbyUIContext& context, const LobbyView& view,
 
     out_root          = root;
     g_open_lobby_root = root;
+    ++g_lobby_build_id;
     MPE_LOG_INFO("lobby UI built: host tab 0x{:X}, browse tab 0x{:X}, {} control(s)",
                 g_host_tab, g_browse_tab, out_controls.size());
     return Result::Success();
@@ -2182,6 +2191,31 @@ bool StatusOverlayIsBuilt() {
     return g_status_host != 0 && g_status_root != 0;
 }
 
+std::uintptr_t StatusOverlayWidget() {
+    return g_status_host;
+}
+
+void ForgetStatusOverlay() {
+    // The widgets are gone, not being removed. Called when the object they lived in has
+    // been collected, so there is nothing to detach from and nothing to free; the handles
+    // are simply no longer addresses of anything.
+    g_status_host   = 0;
+    g_status_scaler = 0;
+    g_status_root   = 0;
+    for (std::uintptr_t& line : g_status_line) {
+        line = 0;
+    }
+    g_notice_panel     = 0;
+    g_notice_rule      = 0;
+    g_notice_title     = 0;
+    g_notice_detail[0] = 0;
+    g_notice_detail[1] = 0;
+}
+
+std::uint32_t LobbyBuildId() {
+    return g_lobby_build_id;
+}
+
 Result BuildStatusOverlay(const LobbyUIContext& context) {
     if (StatusOverlayIsBuilt()) {
         return Result::Success();
@@ -2215,7 +2249,7 @@ Result BuildStatusOverlay(const LobbyUIContext& context) {
     // and the panel reads as an instrument rather than a headline.
     constexpr float kPanelX = 1396.0F;
     constexpr float kPanelW = 484.0F;
-    constexpr float kPanelH = 186.0F;
+    constexpr float kPanelH = 210.0F;
     constexpr float kTextX  = 1414.0F;
     constexpr float kTextW  = 452.0F;
 
@@ -2294,28 +2328,33 @@ void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status) {
     lines[1] = {std::format("SESSION: {}", status.session),
                 status.invitable ? kGood : kText};
 
-    // What is being played, when there is anything to play. Empty rather than a placeholder
-    // when the session has not settled on one, because a map name that is not the map is
-    // worse than no map name.
+    // What is being played, one fact per line and labelled.
+    //
+    // Both were on one line and neither was labelled, which read as two words with no
+    // relationship, and they were shown on the main menu as well, where a session that has
+    // not been created yet still carries whatever settings it was constructed with. A mode
+    // reported for a session that does not exist is a wrong answer to a question nobody
+    // asked, so both are left off unless the caller has something real to say.
     if (!status.mode.empty()) {
-        lines[2] = {status.map.empty() ? status.mode
-                                       : std::format("{}  {}", status.mode, status.map),
-                    kTextDim};
+        lines[2] = {std::format("MODE: {}", status.mode), kTextDim};
+    }
+    if (!status.map.empty()) {
+        lines[3] = {std::format("MAP:  {}", status.map), kTextDim};
     }
 
     // The host's name when this machine is not the host, and the ping to them. Neither is
     // shown alone in an empty lobby: there is no round trip to a session of one, and a
     // number invented for that case is one a player could act on wrongly.
     if (status.ping_ms >= 0) {
-        lines[3] = {status.host_name.empty()
+        lines[4] = {status.host_name.empty()
                         ? std::format("PING: {} ms", status.ping_ms)
                         : std::format("{}  {} ms", status.host_name, status.ping_ms),
                     PingColour(status.ping_ms)};
     } else if (!status.host_name.empty()) {
-        lines[3] = {status.host_name, kTextDim};
+        lines[4] = {status.host_name, kTextDim};
     }
 
-    lines[4] = {status.version, status.update_available ? kWarn : kTextDim};
+    lines[5] = {status.version, status.update_available ? kWarn : kTextDim};
 
     for (std::size_t index = 0; index < kStatusLines; ++index) {
         builder.SetTextLive(g_status_line[index], lines[index].text);
