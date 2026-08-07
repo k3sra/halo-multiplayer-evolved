@@ -39,6 +39,7 @@
 #include "Unreal/GameThread.h"
 #include "Unreal/LobbyUI.h"
 #include "Update/UpdateCheck.h"
+#include "Engine/CampaignEngineControl.h"
 #include "Engine/InertEngineControl.h"
 #include "Lobby/Discovery.h"
 #include "Lobby/LobbyManager.h"
@@ -202,6 +203,7 @@ void PublishSessionDetails();
 void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
+void ShowSessionNotice(std::string title, std::string detail);
 void CheckOwnSessionIsFindable();
 void RefreshLobbyAuthority();
 void PrepareLobby();
@@ -1949,6 +1951,30 @@ void CheckOwnSessionIsFindable() {
     }
 }
 
+/// A short lived message for the notice panel, from anywhere.
+///
+/// The panel already carries a staged update and a session error, both of which the status
+/// refresh works out for itself. This is for the things it cannot: a refusal that happened
+/// because of something the player just pressed, which has no phase of its own and would
+/// otherwise only reach the log.
+///
+/// Clears itself, because a message about a press that has passed should not outlive the
+/// player's memory of pressing it.
+struct TransientNotice {
+    std::string                           title;
+    std::string                           detail;
+    std::chrono::steady_clock::time_point until{};
+};
+std::mutex      g_notice_mutex;
+TransientNotice g_notice;
+
+void ShowSessionNotice(std::string title, std::string detail) {
+    std::lock_guard lock(g_notice_mutex);
+    g_notice.title  = std::move(title);
+    g_notice.detail = std::move(detail);
+    g_notice.until  = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+}
+
 void RefreshLobbyStatus() {
     static auto s_last = std::chrono::steady_clock::time_point{};
 
@@ -2011,7 +2037,13 @@ void RefreshLobbyStatus() {
                                                  LobbyState::kMaxPlayers);
                     break;
                 case lobby::LobbyPhase::Countdown:
-                    status.session = "STARTING MATCH";
+                    // The number, not just the word. Every peer is counting the same one
+                    // down from the host's broadcast, so seeing it is what makes a
+                    // synchronised launch feel synchronised rather than sudden.
+                    status.session = snapshot.countdown_seconds > 0
+                                         ? std::format("STARTING IN {}",
+                                                       snapshot.countdown_seconds)
+                                         : std::string{"STARTING MATCH"};
                     break;
                 case lobby::LobbyPhase::Loading:
                     status.session = "LOADING";
@@ -2154,9 +2186,28 @@ void RefreshLobbyStatus() {
     // A session error wins over a staged update: one explains why the thing the player is
     // trying to do right now did not work, and the other can wait until they next look at
     // the screen.
+    std::string flash_title;
+    std::string flash_detail;
+    {
+        std::lock_guard lock(g_notice_mutex);
+        if (!g_notice.title.empty()) {
+            if (now < g_notice.until) {
+                flash_title  = g_notice.title;
+                flash_detail = g_notice.detail;
+            } else {
+                g_notice = TransientNotice{};
+            }
+        }
+    }
+
     if (!session_error.empty()) {
         status.notice_title  = "SESSION ERROR";
         status.notice_detail = session_error;
+    } else if (!flash_title.empty()) {
+        // Above a staged update: this is about something the player did a moment ago, and
+        // an update can wait until they are not being told why a press did nothing.
+        status.notice_title  = flash_title;
+        status.notice_detail = flash_detail;
     } else if (staged) {
         status.notice_title  = latest.empty()
                                    ? std::string{"UPDATE INSTALLED"}
@@ -2455,30 +2506,38 @@ void RefreshServerList() {
 /// is still holding input focus, which looks exactly like a hang.
 void OnStartMatch() {
     CaptureServerName();
-    const std::string scenario = g_lobby.scenario;
-    const bool        friendly_fire = g_lobby.friendly_fire;
-    MPE_LOG_INFO("starting a {} match on {} (friendly fire {})", g_lobby.mode, scenario,
-                friendly_fire ? "on" : "off");
+    PublishSelectedMatchSettings();
 
-    OnLeaveLobby();
+    MPE_LOG_INFO("starting a {} match on {} (friendly fire {})", g_lobby.mode,
+                g_lobby.scenario, g_lobby.friendly_fire ? "on" : "off");
 
-    Result       outcome = Result::Success();
-    const Result ran     = unreal::RunOnGameThread(
-        [&]() {
-            std::lock_guard lock(g_state_mutex);
-            if (!g_state || !g_state->objects.has_value() ||
-                !g_state->reflection.has_value()) {
-                outcome = Result::Fail(ErrorCode::InvalidState, "reflection is not ready");
-                return;
-            }
-            outcome = unreal::BeginCampaign(*g_state->objects, *g_state->reflection,
-                                            scenario, kDefaultCampaignAsset, friendly_fire);
-        },
-        60000);
+    // Everybody, or nobody.
+    //
+    // This used to leave the lobby and begin the campaign here, which started a match on
+    // this machine and told no one: a client watched the host disappear and stayed sitting
+    // in a lobby that no longer had anyone in it.
+    //
+    // The lobby owns the sequence instead. It counts down out loud so every peer sees the
+    // same number, broadcasts the launch with the scenario and a shared seed, waits for
+    // every peer to report it has loaded, and only then releases them. This machine begins
+    // its own campaign through exactly the same path as everyone else, when the lobby says
+    // to, not before.
+    Result started = Result::Success();
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            MPE_LOG_WARN("cannot start a match: networking is unavailable");
+            return;
+        }
+        started = g_state->manager->StartCountdown();
+    }
 
-    if (!ran.ok() || !outcome.ok()) {
-        MPE_LOG_WARN("the match did not start: {}",
-                    ran.ok() ? outcome.message() : ran.message());
+    if (!started.ok()) {
+        // Said on screen rather than only to the log. The usual reason is being alone, and
+        // a player who presses START in an empty lobby deserves to be told that rather
+        // than watching nothing happen.
+        MPE_LOG_WARN("the match did not start: {}", started.message());
+        ShowSessionNotice("CANNOT START", std::string(started.message()));
     }
 }
 
@@ -3849,10 +3908,40 @@ void Initialize() {
     // that reference dangling. Binding status is reported through the log and through
     // the globals surface instead, both of which can appear later without
     // invalidating anything already handed out.
-    state->engine = std::make_unique<engine::InertEngineControl>(
-        "the engine command binding for this game build is not resolved: the command "
-        "descriptors were located but their call ABI has not been derived, so hosting a "
-        "match is refused rather than guessed at");
+    // The campaign path, not the inert one.
+    //
+    // Every launch this project has ever made went through the engine's own reflected
+    // campaign entry point, and it works. The inert control was installed regardless, so
+    // the lobby's launch sequence, which drives everything through this interface, refused
+    // at its first step: no countdown, no LaunchNow, and a client left in the lobby while
+    // the host loaded alone.
+    //
+    // The reflection stays on the Unreal side. This hands the engine control a callable
+    // and nothing else, so Engine/ still knows nothing about object arrays or the game
+    // thread.
+    state->engine = std::make_unique<engine::CampaignEngineControl>(
+        [](std::string_view scenario, bool friendly_fire) -> Result {
+            const std::string wanted(scenario);
+            Result            outcome = Result::Success();
+            const Result      ran     = unreal::RunOnGameThread(
+                [&]() {
+                    // The lock is taken inside the job rather than around it: the caller
+                    // is the lobby manager, which is already holding nothing, and the game
+                    // thread is where the reflection may be read.
+                    std::lock_guard lock(g_state_mutex);
+                    if (!g_state || !g_state->objects.has_value() ||
+                        !g_state->reflection.has_value()) {
+                        outcome = Result::Fail(ErrorCode::InvalidState,
+                                               "UE reflection is not ready yet");
+                        return;
+                    }
+                    outcome = unreal::BeginCampaign(*g_state->objects, *g_state->reflection,
+                                                    wanted, kDefaultCampaignAsset,
+                                                    friendly_fire);
+                },
+                60000);
+            return ran.ok() ? outcome : ran;
+        });
 
     // The lobby manager needs both a backend and a transport. Without them the mod
     // stays loaded and the globals surface still works, which is why this is not a
