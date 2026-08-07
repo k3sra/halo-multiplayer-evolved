@@ -192,6 +192,7 @@ void OnLeaveLobby();
 void RefreshServerList();
 void SwitchLobbyTab(bool browsing);
 void SelectLobbyMode(bool slayer);
+void PublishSelectedMatchSettings();
 void SelectLobbyMap(int map_index);
 void EnsureSessionHosted();
 void InviteToSession();
@@ -2072,6 +2073,36 @@ void ApplyServerFilter() {
 }
 
 /// Marks the chosen mode on screen without rebuilding.
+/// Pushes the lobby screen's mode and map into the live session.
+///
+/// Without this the two drifted apart the moment a session existed. The screen tracked what
+/// the host had picked and the session kept whatever it was created with, so the status
+/// panel reported the original choice forever and a client was never told about a change at
+/// all: nothing was broadcast because nothing had changed as far as the session knew.
+///
+/// Host only, and quiet on a client, because a client has nothing to publish.
+void PublishSelectedMatchSettings() {
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->manager || !g_state->manager->IsHost()) {
+        return;
+    }
+    engine::MatchSettings settings = g_state->manager->Snapshot().settings;
+    settings.mode     = (g_lobby.mode == "SLAYER") ? engine::GameMode::TeamSlayer
+                                                   : engine::GameMode::CaptureTheFlag;
+    settings.scenario     = g_lobby.scenario;
+    settings.variant_name = g_lobby.scenario;
+    settings.team_count   = g_lobby.teams ? 2 : 1;
+    // Capture the flag has no meaning without two sides to carry it between.
+    if (settings.mode == engine::GameMode::CaptureTheFlag && settings.team_count < 2) {
+        settings.team_count = 2;
+    }
+    settings.friendly_fire = g_lobby.friendly_fire;
+
+    if (const Result updated = g_state->manager->UpdateMatchSettings(settings); !updated.ok()) {
+        MPE_LOG_WARN("the session did not accept the new settings: {}", updated.message());
+    }
+}
+
 void SelectLobbyMode(bool slayer) {
     MPE_LOG_INFO("mode is now {}", g_lobby.mode);
     if (!g_lobby_ui_ready) {
@@ -2082,6 +2113,9 @@ void SelectLobbyMode(bool slayer) {
         return;
     }
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMode(ui, slayer); }, 5000);
+
+    // Told to the session as well as the screen, so everybody else sees it.
+    PublishSelectedMatchSettings();
 }
 
 /// Chooses the scenario a match will be played on, and marks it on screen.
@@ -2100,6 +2134,7 @@ void SelectLobbyMap(int map_index) {
         return;
     }
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMap(ui, map_index); }, 5000);
+    PublishSelectedMatchSettings();
 }
 
 /// Builds the whole lobby ahead of time and leaves it hidden.
