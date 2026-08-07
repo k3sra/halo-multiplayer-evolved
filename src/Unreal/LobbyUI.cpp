@@ -2247,29 +2247,39 @@ Result BuildStatusOverlay(const LobbyUIContext& context) {
     // "CONNECTING TO HOST  STALLED" overran, running off the right of the screen. It
     // reaches further left now and the text is smaller, so a long line has somewhere to go
     // and the panel reads as an instrument rather than a headline.
-    constexpr float kPanelX = 1396.0F;
-    constexpr float kPanelW = 484.0F;
-    constexpr float kPanelH = 210.0F;
-    constexpr float kTextX  = 1414.0F;
-    constexpr float kTextW  = 452.0F;
+    // Thirty percent smaller than it was, and higher up.
+    //
+    // At full size it was the loudest thing on screen and it overlapped the lobby's own
+    // LOBBY SETTINGS heading, which is content the panel has no business covering. It
+    // reports on the mod; it should sit in the corner and be read when wanted rather than
+    // compete with the screen it is drawn over. Every number is scaled together so the
+    // proportions hold: box, margins, line spacing and both font sizes.
+    constexpr float kPanelX = 1541.0F;
+    constexpr float kPanelY = 14.0F;
+    constexpr float kPanelW = 339.0F;
+    constexpr float kPanelH = 147.0F;
+    constexpr float kTextX  = 1554.0F;
+    constexpr float kTextW  = 313.0F;
+    constexpr float kLineY  = 48.0F;
+    constexpr float kLineH  = 17.0F;
 
     const std::uintptr_t status_panel =
-        builder.Panel(root, kPanelX, 20.0F, kPanelW, kPanelH, kStatusPanel);
+        builder.Panel(root, kPanelX, kPanelY, kPanelW, kPanelH, kStatusPanel);
     // A rule down the left edge, because a translucent panel over a starfield has no edge
     // of its own to read against and simply disappears.
     const std::uintptr_t status_rule =
-        builder.Panel(root, kPanelX, 20.0F, 3.0F, kPanelH, kAccent);
+        builder.Panel(root, kPanelX, kPanelY, 3.0F, kPanelH, kAccent);
 
     // The mod's own name, so a player who has forgotten what put this here can tell.
     const std::uintptr_t status_title = builder.Text(
-        root, kTextX, 28.0F, kTextW, 26.0F, "MULTIPLAYER EVOLVED", kAccent, 18.0F);
+        root, kTextX, 20.0F, kTextW, 18.0F, "MULTIPLAYER EVOLVED", kAccent, 13.0F);
     const std::uintptr_t status_divider =
-        builder.Panel(root, kTextX, 56.0F, kTextW - 8.0F, 2.0F, kAccentDim);
+        builder.Panel(root, kTextX, 40.0F, kTextW - 8.0F, 2.0F, kAccentDim);
 
     for (std::size_t line = 0; line < kStatusLines; ++line) {
         g_status_line[line] =
-            builder.Text(root, kTextX, 68.0F + static_cast<float>(line) * 24.0F, kTextW,
-                         22.0F, "", kText, 15.0F);
+            builder.Text(root, kTextX, kLineY + static_cast<float>(line) * kLineH, kTextW,
+                         16.0F, "", kText, 11.0F);
     }
 
     // The notice panel, opposite the status panel and part of the same overlay, so a
@@ -2356,14 +2366,26 @@ void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status) {
 
     lines[5] = {status.version, status.update_available ? kWarn : kTextDim};
 
-    for (std::size_t index = 0; index < kStatusLines; ++index) {
-        builder.SetTextLive(g_status_line[index], lines[index].text);
-        builder.SetColourLive(g_status_line[index], lines[index].colour);
-        // An empty line is collapsed rather than left blank, so the panel is only as tall
-        // as it has something to say.
-        builder.SetVisibilityOf(g_status_line[index],
-                                lines[index].text.empty() ? kCollapsedValue
-                                                          : kHitTestInvisible);
+    // Packed, not just hidden.
+    //
+    // Each line is a canvas slot at a fixed position, so collapsing an empty one does not
+    // close the space it occupied: it leaves a hole. With no session there is no ping, and
+    // the panel showed a blank band between the map and the version where the ping would
+    // have been. Writing the lines that have something to say into consecutive slots is
+    // what makes the panel as short as its content.
+    std::size_t slot = 0;
+    for (const Line& line : lines) {
+        if (line.text.empty()) {
+            continue;
+        }
+        builder.SetTextLive(g_status_line[slot], line.text);
+        builder.SetColourLive(g_status_line[slot], line.colour);
+        builder.SetVisibilityOf(g_status_line[slot], kHitTestInvisible);
+        ++slot;
+    }
+    for (; slot < kStatusLines; ++slot) {
+        builder.SetTextLive(g_status_line[slot], "");
+        builder.SetVisibilityOf(g_status_line[slot], kCollapsedValue);
     }
 
     // The notice panel. Shown only when there is something worth a whole sentence.
