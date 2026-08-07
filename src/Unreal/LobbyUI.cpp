@@ -2705,7 +2705,9 @@ Result BuildLoadingOverlay(const LobbyUIContext& context) {
     // Full bleed and nearly opaque. It also swallows every click, which is the point: while
     // a session is being joined or a match is being started, the lobby underneath is
     // describing a state that is already gone, and a press landing on it would act on it.
-    (void)builder.Panel(root, 0.0F, 0.0F, kDesignWidth, kDesignHeight, {0, 0, 0, 0.93F});
+    // Nearly solid, because the lobby is still being drawn underneath rather than taken
+    // away. At 0.93 the team cards read faintly through it, which looks like a fault.
+    (void)builder.Panel(root, 0.0F, 0.0F, kDesignWidth, kDesignHeight, {0, 0, 0, 0.985F});
 
     // The card. Wide and short, sitting on the horizon rather than filling the screen,
     // because there is very little to say and a large box with a little in it reads as
@@ -2801,41 +2803,37 @@ void ShowLoadingOverlay(const LobbyUIContext& context, bool visible) {
     // that is not being drawn, and nothing can intercept a press meant for a widget that is
     // not being hit tested. It is also what the screen means: while this is up, the lobby
     // is describing a session that has already moved on.
+    // The lobby is made deaf, not taken away, and the pump stays exactly where it was.
+    //
+    // Both of those are corrections to the same mistake. Collapsing the lobby stopped
+    // anything drawing over this screen or intercepting its clicks, which was the intent,
+    // and it also stopped the lobby receiving events. The lobby was carrying the game
+    // thread pump, and a widget that receives no events pumps nothing.
+    //
+    // What that cost is not subtle. Beginning the campaign is posted work, and posted work
+    // runs on the pump: measured across two machines, the call that starts the map load ran
+    // 4.7 seconds late on one and 44.6 seconds late on the other. The lobby had long since
+    // announced the match as live on both. One player stood in the map while the other
+    // stared at a loading screen for the better part of a minute.
+    //
+    // Moving the pump to this screen instead does not work either, and that was the version
+    // that shipped: a canvas of borders and text blocks receives almost no engine events,
+    // so it is the worst pump in the process. The lobby is a tree of the frontend's own
+    // button widgets, which are alive with them.
+    //
+    // HitTestInvisible gets both properties at once. The lobby keeps receiving events, so
+    // the pump keeps running, and it answers no mouse, so every press lands on this screen.
     if (g_open_host_widget != 0 && LobbyIsBuilt()) {
         if (visible) {
-            g_lobby_hidden_by_loading = ReadWidgetVisibility(context, g_open_host_widget) ==
-                                        kVisible;
+            g_lobby_hidden_by_loading =
+                ReadWidgetVisibility(context, g_open_host_widget) == kVisible;
             if (g_lobby_hidden_by_loading) {
-                SetWidgetVisibility(context, g_open_host_widget, kCollapsedValue);
+                SetWidgetVisibility(context, g_open_host_widget, kHitTestInvisible);
             }
         } else if (g_lobby_hidden_by_loading) {
             g_lobby_hidden_by_loading = false;
             SetWidgetVisibility(context, g_open_host_widget, kVisible);
         }
-    }
-
-    // The pump moves with the screen, and this is not a detail.
-    //
-    // Queued game thread work runs from a widget's own event path, and a collapsed widget
-    // receives no events. Collapsing the lobby therefore stopped the pump dead, and the
-    // pump is what the entire mod thread runs on: every job fell back to the slow path or
-    // timed out, the tick loop lost seconds at a time, and the countdown, which advances by
-    // however much real time each tick observed, was clamped to a second per tick and
-    // stretched a five second countdown into a minute. Pressing CANCEL did nothing for the
-    // same reason, because presses are read on that same starved tick.
-    //
-    // Whichever screen is actually on the display carries the pump. While this one is up,
-    // that is this one.
-    if (visible) {
-        if (const Result pump = InstallGameThreadPump(g_loading_host); !pump.ok()) {
-            MPE_LOG_WARN("the loading screen could not take over the game thread pump: {}",
-                        pump.message());
-        }
-    } else if (g_open_host_widget != 0 && LobbyIsBuilt() &&
-               ReadWidgetVisibility(context, g_open_host_widget) == kVisible) {
-        (void)InstallGameThreadPump(g_open_host_widget);
-    } else if (context.outer != 0) {
-        (void)InstallGameThreadPump(context.outer);
     }
 
     g_loading_open = visible;
