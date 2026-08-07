@@ -2339,6 +2339,25 @@ void PrepareLobby() {
 
 /// Takes the lobby down and gives the frontend back.
 void OnLeaveLobby() {
+    // The session goes too, not just the screen.
+    //
+    // Hiding the lobby used to be all this did, which left whoever pressed BACK still in
+    // the session they were in. A guest who backed out was still occupying a slot in
+    // somebody else's lobby, still on their roster, and had no way to tell: their own
+    // screen was gone. A host who backed out left a session advertised that they were no
+    // longer watching.
+    //
+    // Leaving is what BACK means from a multiplayer screen. Opening it again hosts a fresh
+    // session, which is the state a player expects to return to.
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (g_state && g_state->manager &&
+            g_state->manager->Phase() != lobby::LobbyPhase::Idle) {
+            MPE_LOG_INFO("leaving the session on the way out of the lobby");
+            g_state->manager->LeaveSession();
+        }
+    }
+
     // The buttons are kept watched and the controls kept mapped: the lobby is hidden, not
     // destroyed, so its widgets are the same ones when it is shown again. Dropping them
     // here would make every button dead the second time the screen was opened.
