@@ -47,6 +47,21 @@ void SetMinLevel(Level level) noexcept;
 /// Writes one pre-formatted line. Prefer the macros below.
 void Write(Level level, std::string_view category, std::string_view message);
 
+/// Called for every record at or above a threshold, after it has been written.
+///
+/// For anything that needs to react to the fact that something was logged rather than to
+/// the log itself. The one use is report sharing, which sends the log when something goes
+/// wrong: waiting for a timer to come round means the report describing a failure arrives
+/// after whatever the failure caused, which is the wrong way round for reading it.
+///
+/// Called on whichever thread wrote the record, with the sink's lock released, so a hook may
+/// log. It must not block: it runs inline on threads that are counting down countdowns and
+/// answering Steam.
+using RecordHook = void (*)(Level level, std::string_view category, std::string_view message);
+
+/// Installs the hook, or clears it with nullptr. Records below threshold are not delivered.
+void SetRecordHook(RecordHook hook, Level threshold) noexcept;
+
 /// Internal: used by the macros so std::format runs only when enabled.
 template <typename... Args>
 void WriteFormatted(Level level, std::string_view category,

@@ -13,6 +13,7 @@
 #pragma comment(lib, "winhttp.lib")
 
 #include <atomic>
+#include <format>
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
@@ -53,24 +54,55 @@ std::string             g_pending_reason;
 bool                    g_has_pending = false;
 std::atomic<bool>       g_running{false};
 
-/// The most recent tail of the log, capped.
+/// How far into the log has already been sent.
+std::uintmax_t g_sent_offset = 0;
+/// Which report this is, so a gap in the sequence is visible rather than assumed away.
+std::uint32_t g_sequence = 0;
+
+/// Everything written since the last report.
 ///
-/// Capped because a trace level log of a long session runs to megabytes and the useful part
-/// is always the end. A cap also means one badly behaved session cannot post something
-/// enormous at somebody's connection.
-[[nodiscard]] std::string ReadLogTail(const std::filesystem::path& path,
-                                      std::size_t                  max_bytes) {
+/// Incremental rather than a tail, and this is what makes complete coverage affordable.
+/// Sending the last N kilobytes each time re-sends most of what the previous report already
+/// carried, so the choice is between sending often and sending everything. A delta is both:
+/// each report carries exactly what is new, the reports read in order are the whole log with
+/// nothing missing, and a long session costs no more than a short one per minute.
+///
+/// out_gap reports bytes skipped because a single delta was larger than the cap, so a reader
+/// is told about a hole rather than shown a join that looks continuous and is not.
+[[nodiscard]] std::string ReadNewLogBytes(const std::filesystem::path& path,
+                                          std::size_t max_bytes, std::uintmax_t& out_gap) {
+    out_gap = 0;
+
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         return {};
     }
-    const auto        size  = static_cast<std::uintmax_t>(file.tellg());
-    const std::size_t wanted = size > max_bytes ? max_bytes : static_cast<std::size_t>(size);
-    file.seekg(static_cast<std::streamoff>(size - wanted), std::ios::beg);
+    const auto size = static_cast<std::uintmax_t>(file.tellg());
 
+    // A smaller file than last time means the log was rotated under us, which happens when
+    // the game restarts. Start again from the beginning rather than reading past the end.
+    if (size < g_sent_offset) {
+        g_sent_offset = 0;
+    }
+    if (size == g_sent_offset) {
+        return {};
+    }
+
+    std::uintmax_t from      = g_sent_offset;
+    const std::uintmax_t available = size - from;
+    if (available > max_bytes) {
+        // Keep the newest. The end of a delta is where the thing being investigated is.
+        out_gap = available - max_bytes;
+        from    = size - max_bytes;
+    }
+
+    file.seekg(static_cast<std::streamoff>(from), std::ios::beg);
+    const auto wanted = static_cast<std::size_t>(size - from);
     std::string text(wanted, '\0');
     file.read(text.data(), static_cast<std::streamsize>(wanted));
     text.resize(static_cast<std::size_t>(file.gcount()));
+
+    g_sent_offset = size;
     return text;
 }
 
@@ -159,41 +191,88 @@ void Post(const std::string& body) {
 }
 
 void Worker() {
-    // The log is cumulative, so a burst of reasons is one upload carrying all of them.
-    // Waiting a few seconds after the first also means a failure and whatever it causes
-    // immediately afterwards travel together.
-    constexpr auto kCoalesce = std::chrono::seconds(5);
+    // Waiting a few seconds after the first reason means a failure and everything it causes
+    // immediately afterwards travel in one report, which is how they want to be read.
+    constexpr auto kCoalesce = std::chrono::seconds(6);
+
+    // Nothing is sent unprompted forever, but a session that is running normally still has
+    // to be recorded: the interesting question is often what a machine was doing in the
+    // minute before somebody noticed anything, and nothing about that minute is a failure.
+    constexpr auto kHeartbeat = std::chrono::seconds(45);
+
+    // Each report carries what is new, so this is a cap on a burst rather than on the log.
+    constexpr std::size_t kMaxDeltaBytes = 700u * 1024u;
 
     while (g_running.load(std::memory_order_acquire)) {
         std::string reason;
         {
             std::unique_lock lock(g_mutex);
-            g_wake.wait(lock, [] {
+            g_wake.wait_for(lock, kHeartbeat, [] {
                 return g_has_pending || !g_running.load(std::memory_order_acquire);
             });
             if (!g_running.load(std::memory_order_acquire)) {
                 return;
             }
+            const bool prompted = g_has_pending;
             lock.unlock();
-            std::this_thread::sleep_for(kCoalesce);
+            if (prompted) {
+                std::this_thread::sleep_for(kCoalesce);
+            }
             lock.lock();
-            reason        = g_pending_reason;
+            reason = g_pending_reason.empty() ? std::string("heartbeat") : g_pending_reason;
             g_pending_reason.clear();
             g_has_pending = false;
         }
 
-        const std::string tail = ReadLogTail(g_log_path, 512u * 1024u);
-        if (tail.empty()) {
-            continue;
+        std::uintmax_t    gap = 0;
+        const std::string delta = ReadNewLogBytes(g_log_path, kMaxDeltaBytes, gap);
+        if (delta.empty()) {
+            continue; // Nothing has happened since the last report.
         }
+
+        ++g_sequence;
         std::ostringstream body;
         body << "==== MultiplayerEvolved report ====\n"
-             << "from   : " << g_label << '\n'
-             << "reason : " << reason << '\n'
-             << "bytes  : " << tail.size() << "\n\n"
-             << tail;
+             << "from     : " << g_label << '\n'
+             << "sequence : " << g_sequence << '\n'
+             << "reason   : " << reason << '\n'
+             << "bytes    : " << delta.size() << '\n'
+             << "upto     : " << g_sent_offset << '\n';
+        if (gap != 0) {
+            body << "MISSING  : " << gap
+                 << " bytes were skipped between this report and the last\n";
+        }
+        body << '\n' << delta;
         Post(body.str());
     }
+}
+
+/// Every record at Warn or worse asks for a report.
+///
+/// Warn rather than Error, because the mod says a great deal at Warn that is the first
+/// sign of a fault and not itself one: a send that failed, a widget that could not be
+/// found, a refusal that was handled. Those are the lines that explain the error that
+/// arrives ten seconds later, and a report triggered only by the error has already had to
+/// wait for it.
+void OnRecord(log::Level level, std::string_view category, std::string_view message) {
+    // This sender's own complaints do not ask it to send.
+    //
+    // It warns when a report fails, which would queue a report, which would fail, which
+    // would warn. A collector that is down would become a loop rather than a dropped
+    // report, on somebody's machine, in the middle of the session it was meant to be
+    // quietly recording.
+    if (category == MPE_LOG_CATEGORY) {
+        return;
+    }
+
+    // Truncated in the reason line, because the whole record is in the log this is about
+    // to send anyway. It is here to make the report identifiable at a glance.
+    std::string summary(message);
+    if (summary.size() > 120) {
+        summary.resize(120);
+        summary += "...";
+    }
+    Queue(std::format("{} in {}: {}", log::ToString(level), category, summary));
 }
 
 } // namespace
@@ -231,6 +310,10 @@ void Start(const std::filesystem::path& data_directory, std::string label) {
     g_running.store(true, std::memory_order_release);
     g_worker = std::thread(&Worker);
 
+    // Everything at Warn or worse asks for a report as it happens, so a failure and the
+    // lines that explain it arrive together rather than whenever a timer next comes round.
+    log::SetRecordHook(&OnRecord, log::Level::Warn);
+
     MPE_LOG_INFO("log sharing is on for this install; reports go to the address in "
                 "MultiplayerEvolved/report.url");
     Queue("startup");
@@ -255,9 +338,30 @@ void Stop() {
     if (!g_running.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+    // Cleared first. The worker is about to be joined, and a record written during that
+    // join would otherwise queue work for a thread that is leaving.
+    log::SetRecordHook(nullptr, log::Level::Error);
+
     g_wake.notify_all();
     if (g_worker.joinable()) {
         g_worker.join();
+    }
+
+    // One last delta, sent on this thread, carrying whatever the worker did not live to
+    // send. The end of a session is the part most worth having and it is the part a
+    // background sender is least likely to get out in time.
+    std::uintmax_t    gap   = 0;
+    const std::string delta = ReadNewLogBytes(g_log_path, 700u * 1024u, gap);
+    if (!delta.empty()) {
+        ++g_sequence;
+        std::ostringstream body;
+        body << "==== MultiplayerEvolved report ====\n"
+             << "from     : " << g_label << '\n'
+             << "sequence : " << g_sequence << " (final)\n"
+             << "reason   : shutdown\n"
+             << "bytes    : " << delta.size() << "\n\n"
+             << delta;
+        Post(body.str());
     }
 }
 
