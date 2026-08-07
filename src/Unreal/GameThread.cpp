@@ -15,8 +15,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <format>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -36,32 +39,123 @@ std::mutex g_mutex;
 CallLayout g_layout;
 bool       g_detected = false;
 
-// --- The pending game thread job -------------------------------------------
+// --- The game thread job queue ---------------------------------------------
 //
-// The job is owned here rather than pointed at on a caller's stack.
+// A queue of shared jobs, not a single slot holding a copy.
 //
-// An earlier version stored a pointer to a std::function local to the calling frame. That
-// frame is alive while the caller blocks, but not after a timeout: the caller returned, the
-// frame died, and a game thread already inside the handler then called through the dangling
-// pointer and faulted on a stack address. Owning the job removes the dangling pointer, and
-// the active count below removes the race that let a handler still be running when it was
-// replaced.
-std::function<void()> g_job;
-std::atomic<bool>     g_job_waiting{false};
-std::atomic<bool>     g_job_done{false};
-std::atomic<int>      g_handlers_active{0};
+// The single slot was replaced because it could not survive being reached twice. Two
+// separate faults came out of it, and the launch hit both at once.
+//
+// The first was ownership. A caller blocks on its job and captures its own locals by
+// reference, which is safe only for as long as the caller is still there. On a timeout it
+// was not: the waiter returned, its frame died, and a game thread still inside the job then
+// wrote its result through references into that dead frame. Writing a std::string into
+// whatever now occupies those bytes is not a wrong answer, it is a throw or a fault from
+// somewhere unrelated.
+//
+// The second was replacement. Queuing a second job simply overwrote g_job, destroying a
+// std::function while a game thread was executing it.
+//
+// Both go away with shared ownership and a real queue: a job stays alive as long as anybody
+// can still reach it, a claimed job is never discarded, and a waiter that gives up before
+// its job was claimed cancels it so it can never run at all.
+struct Job {
+    std::function<void()> work;
+    /// A game thread has taken it. From here the job will run, and the waiter must not
+    /// return until it has, because it may still touch the waiter's stack.
+    std::atomic<bool> claimed{false};
+    std::atomic<bool> done{false};
+    /// The waiter gave up before anybody claimed it. It must not run afterwards.
+    std::atomic<bool> cancelled{false};
+    /// Whether the caller is still waiting. A posted job has nobody to write back to, so
+    /// nothing it does can reach a stack frame.
+    bool awaited{true};
+};
 
-/// Blocks until no exception handler is inside the job.
+std::mutex                       g_queue_mutex;
+std::deque<std::shared_ptr<Job>> g_queue;
+std::atomic<int>                 g_handlers_active{0};
+
+/// Which thread the pump last fired on.
 ///
-/// Disarming is not instantaneous: it walks every thread, and one can already be past the
-/// check by then. Nothing may replace or destroy the job until they have all left.
-void DrainHandlers() {
-    for (int attempt = 0; attempt < 1000; ++attempt) {
-        if (g_handlers_active.load(std::memory_order_acquire) == 0) {
-            return;
+/// Not decoration: it is what makes a job dispatched from the game thread run inline rather
+/// than deadlock. Anything reached from a widget event is already on this thread, and a
+/// queued job would then be waiting for a frame that cannot arrive until the wait ends.
+std::atomic<unsigned long> g_game_thread_id{0};
+
+/// Set while the mod is being unloaded, so a waiter cannot outlive the process.
+std::atomic<bool> g_dispatch_shutting_down{false};
+
+/// Runs one job, and never lets it throw into the caller.
+///
+/// The caller is the engine. A job runs from inside ProcessEvent, so an exception leaving
+/// it unwinds through the game's own frames looking for a handler, finds none, and the
+/// process dies with 0xE06D7363 and a stack that names this mod without saying why. Every
+/// job is fallible by nature: they allocate, format strings and walk the object array.
+///
+/// The failure is swallowed here and reported through the log rather than through the
+/// stack, because there is no stack to report it on.
+void RunJobGuarded(const std::shared_ptr<Job>& job) {
+    try {
+        if (job->work) {
+            job->work();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } catch (const std::exception& error) {
+        MPE_LOG_ERROR("a game thread job threw: {}. The game is unaffected; the work it was "
+                     "doing did not complete.",
+                     error.what());
+    } catch (...) {
+        MPE_LOG_ERROR("a game thread job threw an unrecognised exception. The game is "
+                     "unaffected; the work it was doing did not complete.");
     }
+    job->done.store(true, std::memory_order_release);
+}
+
+/// Takes the next job nobody has claimed, or nothing.
+[[nodiscard]] std::shared_ptr<Job> ClaimNextJob() {
+    std::lock_guard lock(g_queue_mutex);
+    while (!g_queue.empty()) {
+        std::shared_ptr<Job> job = std::move(g_queue.front());
+        g_queue.pop_front();
+        if (job->cancelled.load(std::memory_order_acquire)) {
+            continue; // The waiter gave up before this ran. Dropping it is the contract.
+        }
+        job->claimed.store(true, std::memory_order_release);
+        return job;
+    }
+    return nullptr;
+}
+
+/// Runs everything queued. Called on the game thread.
+///
+/// Bounded, because the queue is fed from a thread that never blocks and a frame that runs
+/// jobs until the queue is empty could be held indefinitely by a caller that keeps posting.
+/// Whatever is left waits for the next event, which is the next frame.
+void RunPendingJobs() {
+    constexpr int kMaxPerPass = 16;
+
+    g_game_thread_id.store(::GetCurrentThreadId(), std::memory_order_release);
+    g_handlers_active.fetch_add(1, std::memory_order_acq_rel);
+    for (int ran = 0; ran < kMaxPerPass; ++ran) {
+        const std::shared_ptr<Job> job = ClaimNextJob();
+        if (!job) {
+            break;
+        }
+        RunJobGuarded(job);
+    }
+    g_handlers_active.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+/// True while anything is waiting to run.
+[[nodiscard]] bool AnyJobQueued() {
+    std::lock_guard lock(g_queue_mutex);
+    return !g_queue.empty();
+}
+
+/// Queues a job and reports it.
+void EnqueueJob(const std::shared_ptr<Job>& job) {
+    std::lock_guard lock(g_queue_mutex);
+    g_queue.push_back(job);
 }
 
 /// Reads the size of the function containing an address, from the exception directory.
@@ -154,21 +248,9 @@ void DrainHandlers() {
 
 /// The trampoline the exception handler calls. Runs on a game thread.
 bool OnGameThreadHit(std::uintptr_t) {
-    // The count is taken before the check and released at the end, so a waiter can tell
-    // whether any thread is still inside.
-    g_handlers_active.fetch_add(1, std::memory_order_acq_rel);
+    RunPendingJobs();
 
-    // Claim the job so a second thread hitting the same breakpoint cannot run it twice.
-    if (g_job_waiting.exchange(false, std::memory_order_acq_rel)) {
-        if (g_job) {
-            g_job();
-        }
-        g_job_done.store(true, std::memory_order_release);
-    }
-
-    g_handlers_active.fetch_sub(1, std::memory_order_acq_rel);
-
-    // Once the job is claimed there is nothing left for any thread to do here, so each one
+    // Once the queue is drained there is nothing left for any thread to do here, so each one
     // disarms itself as it arrives rather than continuing to trap on every call.
     return false;
 }
@@ -274,9 +356,37 @@ Result DetectCallLayout(const ObjectArray& objects, CallLayout& out_layout) {
     return Result::Success();
 }
 
+bool OnGameThread() {
+    const unsigned long known = g_game_thread_id.load(std::memory_order_acquire);
+    return known != 0 && known == ::GetCurrentThreadId();
+}
+
+void ShutdownGameThreadDispatch() {
+    g_dispatch_shutting_down.store(true, std::memory_order_release);
+    std::lock_guard lock(g_queue_mutex);
+    for (const std::shared_ptr<Job>& job : g_queue) {
+        job->cancelled.store(true, std::memory_order_release);
+    }
+    g_queue.clear();
+}
+
 Result RunOnGameThread(const std::function<void()>& job, unsigned timeout_milliseconds) {
     if (!job) {
         return Result::Fail(ErrorCode::InvalidArgument, "no job given");
+    }
+
+    // Already there. Run it and return.
+    //
+    // Without this, work reached from a widget event that dispatches again waits for a frame
+    // that cannot arrive until the wait ends, which is a deadlock for the whole timeout and
+    // then a job left running with nobody expecting it. Being on the thread the job wants is
+    // not a special case to handle; it is the answer.
+    if (OnGameThread()) {
+        const auto inline_job = std::make_shared<Job>();
+        inline_job->work      = job;
+        inline_job->claimed.store(true, std::memory_order_release);
+        RunJobGuarded(inline_job);
+        return Result::Success();
     }
 
     std::uintptr_t anchor = 0;
@@ -289,65 +399,94 @@ Result RunOnGameThread(const std::function<void()>& job, unsigned timeout_millis
         anchor = g_layout.dispatch_anchor;
     }
 
-    // Nothing may replace the job while a handler could still be running the previous one.
-    DrainHandlers();
+    const auto pending = std::make_shared<Job>();
+    pending->work      = job;
+    EnqueueJob(pending);
 
-    // One job at a time. The handler reads these without a lock, so publishing order
-    // matters: everything it will read is in place before the job can be picked up.
-    g_job = job;
-    g_job_done.store(false, std::memory_order_release);
-    g_job_waiting.store(true, std::memory_order_release);
-
-    // With a pump installed the job runs on the widget's next event, which for anything on
-    // screen is the next frame. No threads are suspended and no exceptions are raised, so
-    // the whole thing costs a frame rather than several seconds.
-    if (GameThreadPumpActive()) {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(timeout_milliseconds);
-        while (!g_job_done.load(std::memory_order_acquire)) {
-            if (std::chrono::steady_clock::now() > deadline) {
-                g_job_waiting.store(false, std::memory_order_release);
-                DrainHandlers();
-                return Result::Fail(ErrorCode::Timeout,
-                                    "the pump widget stopped receiving events");
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool pumped = GameThreadPumpActive();
+    if (!pumped) {
+        // No pump: trap the dispatch point instead. Slower, and only used before a widget
+        // long lived enough to pump from exists.
+        debugtrap::SetHitCallback(&OnGameThreadHit);
+        if (const Result armed = debugtrap::Arm(anchor, 1, debugtrap::Condition::Execute,
+                                                "game thread dispatch");
+            !armed.ok()) {
+            pending->cancelled.store(true, std::memory_order_release);
+            debugtrap::SetHitCallback(nullptr);
+            return armed;
         }
-        DrainHandlers();
-        return Result::Success();
-    }
-
-    debugtrap::SetHitCallback(&OnGameThreadHit);
-
-    const Result armed = debugtrap::Arm(anchor, 1, debugtrap::Condition::Execute,
-                                        "game thread dispatch");
-    if (!armed.ok()) {
-        g_job_waiting.store(false, std::memory_order_release);
-        debugtrap::SetHitCallback(nullptr);
-        DrainHandlers();
-        return armed;
     }
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_milliseconds);
-    while (!g_job_done.load(std::memory_order_acquire)) {
+
+    Result outcome = Result::Success();
+    while (!pending->done.load(std::memory_order_acquire)) {
         if (std::chrono::steady_clock::now() > deadline) {
-            g_job_waiting.store(false, std::memory_order_release);
-            debugtrap::DisarmAll();
-            debugtrap::SetHitCallback(nullptr);
-            // Draining before returning is what makes it safe for a caller to capture its
-            // own locals by reference: once this returns, no handler is inside the job.
-            DrainHandlers();
-            return Result::Fail(ErrorCode::Timeout,
-                                "the game thread never reached the dispatch point; the game "
-                                "may be paused, loading, or without a world");
+            // Giving up is only ever safe before somebody has claimed it.
+            //
+            // A claimed job is running now, on a thread holding references into this frame,
+            // so returning would hand it a stack that is about to stop existing. Waiting a
+            // while longer is unpleasant; returning is memory corruption, and that is the
+            // trade every time.
+            pending->cancelled.store(true, std::memory_order_release);
+            if (!pending->claimed.load(std::memory_order_acquire)) {
+                outcome = Result::Fail(ErrorCode::Timeout,
+                                       pumped ? "the pump widget stopped receiving events"
+                                              : "the game thread never reached the dispatch "
+                                                "point; the game may be paused, loading, or "
+                                                "without a world");
+                break;
+            }
+            MPE_LOG_WARN("a game thread job passed its {}ms deadline while already running; "
+                        "waiting for it rather than abandoning the memory it is using",
+                        timeout_milliseconds);
+            while (!pending->done.load(std::memory_order_acquire)) {
+                if (g_dispatch_shutting_down.load(std::memory_order_acquire)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            break;
+        }
+        if (g_dispatch_shutting_down.load(std::memory_order_acquire)) {
+            pending->cancelled.store(true, std::memory_order_release);
+            outcome = Result::Fail(ErrorCode::InvalidState, "the mod is shutting down");
+            break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    debugtrap::DisarmAll();
-    debugtrap::SetHitCallback(nullptr);
-    DrainHandlers();
+    if (!pumped && !AnyJobQueued()) {
+        debugtrap::DisarmAll();
+        debugtrap::SetHitCallback(nullptr);
+    }
+    return outcome;
+}
+
+Result PostToGameThread(std::function<void()> job) {
+    if (!job) {
+        return Result::Fail(ErrorCode::InvalidArgument, "no job given");
+    }
+    if (g_dispatch_shutting_down.load(std::memory_order_acquire)) {
+        return Result::Fail(ErrorCode::InvalidState, "the mod is shutting down");
+    }
+    if (!GameThreadPumpActive()) {
+        return Result::Fail(ErrorCode::InvalidState,
+                            "there is no game thread pump, so nothing would ever run this");
+    }
+
+    // Run it here if this already is the game thread, so posting is never a way to defer
+    // work past the frame that asked for it.
+    const auto posted = std::make_shared<Job>();
+    posted->work      = std::move(job);
+    posted->awaited   = false;
+    if (OnGameThread()) {
+        posted->claimed.store(true, std::memory_order_release);
+        RunJobGuarded(posted);
+        return Result::Success();
+    }
+    EnqueueJob(posted);
     return Result::Success();
 }
 
@@ -698,23 +837,14 @@ std::uintptr_t              g_pump_original_vtable = 0;
 std::vector<std::uintptr_t> g_pump_vtable_copy;
 ProcessEventSignature       g_pump_real_process_event = nullptr;
 
-/// Runs any queued job. Called from the pump's event path, on the game thread.
-void DrainQueuedJob() {
-    if (!g_job_waiting.load(std::memory_order_acquire)) {
-        return;
-    }
-    g_handlers_active.fetch_add(1, std::memory_order_acq_rel);
-    if (g_job_waiting.exchange(false, std::memory_order_acq_rel)) {
-        if (g_job) {
-            g_job();
-        }
-        g_job_done.store(true, std::memory_order_release);
-    }
-    g_handlers_active.fetch_sub(1, std::memory_order_acq_rel);
-}
-
 void __fastcall PumpProcessEvent(void* self, void* function, void* parameters) {
-    DrainQueuedJob();
+    // The thread is recorded even when there is nothing to run, because knowing which thread
+    // this is is what lets a job dispatched from inside an event run inline instead of
+    // waiting on a frame it is itself blocking.
+    g_game_thread_id.store(::GetCurrentThreadId(), std::memory_order_release);
+    if (AnyJobQueued()) {
+        RunPendingJobs();
+    }
     if (g_pump_real_process_event != nullptr) {
         g_pump_real_process_event(self, function, parameters);
     }

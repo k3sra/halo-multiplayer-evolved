@@ -59,8 +59,33 @@ struct CallLayout {
 ///
 /// Returns a failure if the game thread never reaches the anchor within the timeout, which
 /// is what happens when the game is paused, loading, or has not created a world yet.
+///
+/// A job may capture the caller's locals by reference. That is only sound because this
+/// never returns while a job that has already started could still write to them: a deadline
+/// that passes before anybody claimed the job cancels it, and one that passes after keeps
+/// waiting. Calling it from the game thread runs the job inline rather than queueing it,
+/// which is what stops work reached from a widget event deadlocking on its own frame.
 [[nodiscard]] Result RunOnGameThread(const std::function<void()>& job,
                                      unsigned timeout_milliseconds = 5000);
+
+/// Queues a job and returns immediately.
+///
+/// For work whose result nobody is waiting for, where blocking is the actual problem rather
+/// than an acceptable cost. Beginning a match is the case this exists for: it runs inside
+/// the lobby tick, and waiting there stops the tick, the keepalives and every screen update
+/// for as long as the load takes.
+///
+/// The job must own everything it touches. Nothing is waiting on it, so it may run after the
+/// calling frame has gone, and a reference capture would be a reference to nothing.
+///
+/// Fails when there is no pump, because without one nothing would ever run it.
+[[nodiscard]] Result PostToGameThread(std::function<void()> job);
+
+/// True when the calling thread is the one the pump last fired on.
+[[nodiscard]] bool OnGameThread();
+
+/// Cancels everything queued and stops any waiter, for unload.
+void ShutdownGameThreadDispatch();
 
 /// Finds a UFunction by name, optionally requiring a particular owning class.
 [[nodiscard]] std::uintptr_t FindFunction(const ObjectArray& objects, std::string_view name,
