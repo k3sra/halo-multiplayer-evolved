@@ -724,6 +724,63 @@ int main() {
     EverybodyLaunchesTogether();
     AloneCannotStart();
 
+    std::printf("the loading screen's arithmetic\n");
+    {
+        using namespace mpe::lobby;
+
+        // The property that matters, and the one no amount of looking at the drawing code
+        // would establish: the bar never goes backwards. A player watching a wait restart
+        // at zero reads it as the wait having got longer.
+        const LoadingStep order[] = {LoadingStep::JoiningLobby, LoadingStep::StartingSession,
+                                     LoadingStep::LoadingMap, LoadingStep::WaitingForPlayers};
+        bool ascending = true;
+        int  previous  = 0;
+        for (const LoadingStep step : order) {
+            const LoadingBand band = BandForLoadingStep(step);
+            if (band.begin != previous || band.end <= band.begin) {
+                ascending = false;
+            }
+            previous = band.end;
+        }
+        Check(ascending, "the four bands are contiguous and ascending");
+        Check(previous == 100, "the last band ends at a hundred");
+
+        // Each step fills its own band from a real count and nothing else.
+        Check(LoadingPercent(LoadingStep::JoiningLobby, 0, 3) == 0,
+              "a wait that has not started reports the start of its band");
+        Check(LoadingPercent(LoadingStep::JoiningLobby, 3, 3) == 30,
+              "a wait that has finished reports the end of its band");
+        Check(LoadingPercent(LoadingStep::WaitingForPlayers, 1, 2) ==
+                  75 + (100 - 75) / 2,
+              "one of two players loaded is halfway through the last band");
+        Check(LoadingPercent(LoadingStep::WaitingForPlayers, 2, 2) == 100,
+              "every player loaded is a hundred");
+
+        // Loading the map cannot be measured, so it reports the start of its band and the
+        // screen is expected to show motion rather than a number.
+        Check(!BandForLoadingStep(LoadingStep::LoadingMap).measurable,
+              "loading the map is honestly unmeasurable");
+        Check(LoadingPercent(LoadingStep::LoadingMap, 5, 10) == 55,
+              "an unmeasurable step ignores any count handed to it");
+
+        // Nothing a caller can pass produces a number outside the step's own band, which is
+        // what stops one stage drawing over another's range.
+        bool bounded = true;
+        for (const LoadingStep step : order) {
+            const LoadingBand band = BandForLoadingStep(step);
+            for (int done = -4; done <= 12; ++done) {
+                const int percent = LoadingPercent(step, done, 8);
+                if (percent < band.begin || percent > band.end) {
+                    bounded = false;
+                }
+            }
+        }
+        Check(bounded, "a count out of range cannot push a step outside its band");
+        Check(LoadingPercent(LoadingStep::StartingSession, 1, 0) == 30,
+              "a total of zero reports the start of the band rather than dividing by it");
+        Check(LoadingPercent(LoadingStep::None, 1, 1) == 0, "no wait is no progress");
+    }
+
     std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
