@@ -33,6 +33,7 @@ cl /nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor /u
    "%~dp0steam_check.cpp" ^
    "%ROOT%\src\Net\PacketProtocol.cpp" ^
    "%ROOT%\src\Lobby\Discovery.cpp" ^
+   "%ROOT%\src\Net\SteamSocketsTransport.cpp" ^
    "%ROOT%\src\Lobby\SteamMatchmakingHooks.cpp" ^
    "%ROOT%\src\Steam\SteamApi.cpp" ^
    "%ROOT%\src\Core\GameBuild.cpp" ^
