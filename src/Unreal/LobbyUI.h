@@ -188,6 +188,14 @@ struct LobbyUIContext {
     /// Reads a widget's visibility so folding the menu away can put it back exactly as it
     /// was. Restoring it to Visible instead is what left the main menu drawn and dead.
     std::uintptr_t get_visibility{0};
+    /// Dims a control instead of removing it.
+    ///
+    /// A guest cannot change the mode, the map or the settings, and the screen used to say
+    /// so by collapsing all of it, which left three empty panels and no way to see what the
+    /// host had actually chosen. Render opacity applies to a widget and everything beneath
+    /// it, which is what makes it work on the frontend's button: its label and its bracket
+    /// art are children this code did not create and cannot recolour one by one.
+    std::uintptr_t set_render_opacity{0};
     /// Walking the menu root's children, so the widgets to fold away are the ones actually
     /// parented there rather than a list of offsets guessed from a header.
     std::uintptr_t get_children_count{0};
@@ -355,12 +363,32 @@ void ShowLobbyUI(const LobbyUIContext& context, bool visible);
 /// Must run on the game thread.
 void SetLobbyTab(const LobbyUIContext& context, bool browsing);
 
-/// Shows or hides everything only a host may use: the mode and map choices, and START
-/// MATCH.
+/// Enables or greys out everything only a host may use.
 ///
-/// A client cannot change any of it, so it is taken off the screen rather than left inert.
+/// That is the mode and map choices, the three lobby settings, the server name field and
+/// START MATCH. A client cannot change any of it, but has to be able to read all of it,
+/// because those are the terms of the match it is about to play. Greyed out and unpressable
+/// says both things; collapsing them, which is what this used to do, left empty panels and
+/// told a guest nothing.
+///
 /// Must run on the game thread.
 void SetLobbyHostControls(const LobbyUIContext& context, bool is_host);
+
+/// The three lobby settings and the server name, as they should read right now.
+struct LobbySettingsView {
+    int         game_time_minutes{15};
+    bool        friendly_fire{false};
+    int         respawn_seconds{5};
+    /// Empty leaves whatever the field holds, which is what a host typing into it wants.
+    std::string server_name;
+};
+
+/// Writes the settings panel.
+///
+/// Driven from the session rather than from what this machine last chose, because on a
+/// guest those are different things and only one of them describes the match. Must run on
+/// the game thread.
+void SetLobbySettings(const LobbyUIContext& context, const LobbySettingsView& settings);
 
 /// Marks which game mode is selected, without rebuilding the screen.
 ///

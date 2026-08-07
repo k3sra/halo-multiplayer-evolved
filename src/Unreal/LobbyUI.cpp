@@ -85,6 +85,12 @@ std::uintptr_t g_map_marker[4] = {0, 0, 0, 0};
 /// The server name field, so its contents can be read back when hosting.
 std::uintptr_t g_server_name_field = 0;
 
+/// The three values in the settings panel: game time, friendly fire, respawn time.
+///
+/// Values rather than whole lines, so writing the host's settings into them costs three
+/// short strings and leaves the names they belong to alone.
+std::uintptr_t g_setting_value[3] = {0, 0, 0};
+
 /// ESlateVisibility values used throughout.
 constexpr std::uint8_t kVisibleValue          = 0;
 constexpr std::uint8_t kCollapsedValue        = 1;
@@ -92,6 +98,12 @@ constexpr std::uint8_t kHitTestInvisible      = 3;
 /// EStretch::Fill. Stretches a widget to its whole box rather than fitting it centred.
 constexpr std::uint8_t kStretchFill           = 1;
 constexpr std::uint8_t kSelfHitTestInvisibleValue = 4;
+
+/// How faded a control is when it belongs to somebody else.
+///
+/// Low enough to read as unavailable at a glance and high enough that the value on it is
+/// still legible, which is the entire point of showing it rather than removing it.
+constexpr float kDisabledOpacity = 0.42F;
 
 /// The server table, built once and then only rewritten.
 ///
@@ -561,6 +573,33 @@ public:
         (void)CallFunction(widget, context_.set_visibility, &parameters);
     }
 
+    /// Fades a widget and everything under it.
+    void SetOpacityOf(std::uintptr_t widget, float opacity) const {
+        if (context_.set_render_opacity == 0 || widget == 0) {
+            return;
+        }
+        struct Parameters {
+            float opacity;
+        };
+        Parameters parameters{opacity};
+        (void)CallFunction(widget, context_.set_render_opacity, &parameters);
+    }
+
+    /// Shows a control as somebody else's to change.
+    ///
+    /// Dimmed and unpressable, rather than collapsed. A guest has to be able to see the mode,
+    /// the map and the settings the host picked, because those decide the match they are
+    /// about to play; taking the controls away left three empty panels that said nothing at
+    /// all. Hit testing is what stops it being pressed, and the fade is what stops it looking
+    /// like it should be.
+    void SetControlEnabled(std::uintptr_t widget, bool enabled) const {
+        if (widget == 0) {
+            return;
+        }
+        SetVisibilityOf(widget, enabled ? kVisibleValue : kHitTestInvisible);
+        SetOpacityOf(widget, enabled ? 1.0F : kDisabledOpacity);
+    }
+
     /// A field the player can type into.
     ///
     ///   EditableTextBox +0x2E8 Text (FText, written directly)
@@ -874,20 +913,35 @@ void DrawHostTab(const Builder& builder, std::uintptr_t canvas, const LobbyView&
     SetLobbyRoster(builder.Context(), view.blue, view.red, view.host_name);
 
     // Right: settings and server name.
+    //
+    // Drawn as name and value rather than as one sentence per line.
+    //
+    // Every one of these was a fixed label built from whatever this machine happened to
+    // think when the screen was made, and never touched again. On a guest that is simply
+    // wrong: it showed this machine's defaults while describing somebody else's match. They
+    // are text now, so the host's real values can be written into them, and the value sits
+    // in its own column so a change of one does not reflow the line it is on.
     (void)builder.Backer(canvas, 1440.0F, 250.0F, 440.0F, 190.0F, kPanelLight);
     (void)builder.Label(canvas, 1444.0F, 172.0F, 440.0F, 74.0F, "LOBBY SETTINGS");
-    (void)builder.Label(canvas, 1456.0F, 262.0F, 408.0F, 54.0F,
-                        std::format("GAME TIME: {}min", view.game_time_minutes));
-    (void)builder.Label(canvas, 1456.0F, 320.0F, 408.0F, 54.0F,
-                        std::format("FRIENDLY FIRE: {}", view.friendly_fire ? "ON" : "OFF"));
-    (void)builder.Label(canvas, 1456.0F, 378.0F, 408.0F, 54.0F,
-                        std::format("RESPAWN TIME: {}s", view.respawn_seconds));
+    const std::array<const char*, 3> setting_names = {"GAME TIME", "FRIENDLY FIRE",
+                                                      "RESPAWN TIME"};
+    for (std::size_t line = 0; line < setting_names.size(); ++line) {
+        const float y = 274.0F + static_cast<float>(line) * 50.0F;
+        (void)builder.Text(canvas, 1462.0F, y, 240.0F, 30.0F, setting_names[line], kTextDim,
+                           20.0F);
+        g_setting_value[line] =
+            builder.Text(canvas, 1706.0F, y, 156.0F, 30.0F, "", kText, 20.0F);
+        builder.SetVisibilityOf(g_setting_value[line], kHitTestInvisible);
+    }
 
     (void)builder.Panel(canvas, 1452.0F, 498.0F, 416.0F, 68.0F, kPanelLight);
     (void)builder.Text(canvas, 1456.0F, 462.0F, 400.0F, 28.0F, "SERVER NAME", kAccent,
                        18.0F);
     g_server_name_field = builder.Field(canvas, 1468.0F, 512.0F, 384.0F, 40.0F,
                                         view.server_name);
+    // A guest sees the host's name here and cannot type over it, so the field is one of the
+    // things the authority pass governs.
+    g_host_only.push_back(g_server_name_field);
 
     // Bottom right action.
     // The host starts the match; a client waits for them to.
@@ -1838,6 +1892,11 @@ Result ResolveLobbyStatics(const ObjectArray& objects, LobbyUIContext& out_conte
     context.get_child_at          = find("GetChildAt", "PanelWidget");
     context.get_desired_size      = find("GetDesiredSize", "Widget");
     context.set_stretch           = find("SetStretch", "ScaleBox");
+    // Greying a control out rather than taking it off the screen. Render opacity applies to
+    // a widget and everything under it, which is the only way to dim the frontend's button:
+    // its label, its brackets and its art are its own children, and none of them are text
+    // blocks whose colour this code could write.
+    context.set_render_opacity    = find("SetRenderOpacity", "Widget");
     context.set_keyboard_focus    = find("SetKeyboardFocus", "Widget");
     context.get_player_controller = find("GetPlayerController", "GameplayStatics");
     context.set_input_mode_ui  = find("SetInputMode_UIOnlyEx", "WidgetBlueprintLibrary");
@@ -2263,26 +2322,51 @@ void SetLobbyRoster(const LobbyUIContext& context, const std::vector<std::string
 void SetLobbyHostControls(const LobbyUIContext& context, bool is_host) {
     const Builder builder(context);
 
-    // Removed rather than greyed out.
+    // Greyed out rather than removed.
     //
-    // A client cannot choose the mode or the map, and cannot start the match; those belong
-    // to whoever is hosting. Leaving the controls on screen and inert is the worst of both:
-    // it looks like the mod ignoring a press. Taking them away says the truth, which is
-    // that there is nothing here for a guest to decide.
-    const std::uint8_t visibility = is_host ? kVisibleValue : kCollapsedValue;
+    // Taking them away was the previous answer and it was the wrong one. A guest cannot
+    // choose the mode, the map, the settings or the server name, and cannot start the
+    // match, but they very much need to see what was chosen: those are the terms of the
+    // game they are about to play. Collapsing the lot left three empty panels and a screen
+    // that told a guest less than the browser row they joined from.
+    //
+    // Dimmed and unpressable says both things at once. The value is legible, and the fade
+    // and the dead mouse together say it is not theirs to change, which is the same
+    // vocabulary every other program uses for the same idea.
     for (const std::uintptr_t widget : g_host_only) {
-        builder.SetVisibilityOf(widget, visibility);
+        builder.SetControlEnabled(widget, is_host);
     }
 
-    // The markers go with them, or a collapsed button leaves its highlight bar floating
-    // over the backdrop with nothing behind it.
-    if (!is_host) {
-        for (const std::uintptr_t marker : g_mode_marker) {
-            builder.SetVisibilityOf(marker, kCollapsedValue);
-        }
-        for (const std::uintptr_t marker : g_map_marker) {
-            builder.SetVisibilityOf(marker, kCollapsedValue);
-        }
+    // The selection markers stay, dimmed with what they mark. They are how a guest can see
+    // which mode and which map the host settled on, so removing them would take away the
+    // one thing the mode and map lists are for on a screen nobody can press.
+    for (const std::uintptr_t marker : g_mode_marker) {
+        builder.SetOpacityOf(marker, is_host ? 1.0F : kDisabledOpacity);
+    }
+    for (const std::uintptr_t marker : g_map_marker) {
+        builder.SetOpacityOf(marker, is_host ? 1.0F : kDisabledOpacity);
+    }
+}
+
+void SetLobbySettings(const LobbyUIContext& context, const LobbySettingsView& settings) {
+    const Builder builder(context);
+
+    const std::array<std::string, 3> values = {
+        settings.game_time_minutes > 0 ? std::format("{} MIN", settings.game_time_minutes)
+                                       : std::string("NO LIMIT"),
+        settings.friendly_fire ? "ON" : "OFF",
+        std::format("{} SEC", settings.respawn_seconds),
+    };
+    for (std::size_t line = 0; line < values.size(); ++line) {
+        builder.SetTextLive(g_setting_value[line], values[line]);
+    }
+
+    // Written into the field rather than beside it, because the field is where a player
+    // looks for the name. On a guest it is the host's name, and the field is dimmed and
+    // unpressable by the authority pass, so it reads as a value rather than a prompt.
+    if (!settings.server_name.empty() && g_server_name_field != 0) {
+        builder.SetTextLiveOn(g_server_name_field, context.set_editable_text,
+                              settings.server_name);
     }
 }
 

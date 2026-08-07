@@ -220,6 +220,17 @@ void                      SaveServerName(const std::string& name);
 [[nodiscard]] lobby::LobbyId HostedLobbyLocked();
 [[nodiscard]] lobby::LobbyId CurrentSessionLobbyLocked();
 
+/// True when this machine may change what the lobby is playing.
+///
+/// The mode, the map, the settings, the server name and the start of the match all belong
+/// to whoever is hosting. Not being in a session at all counts as being the host, because
+/// pressing MULTIPLAYER and choosing a mode before anybody has joined is how a session gets
+/// its settings in the first place.
+[[nodiscard]] bool LocalPlayerHasAuthority();
+
+/// The same, said on screen. Returns false when the press should be ignored.
+[[nodiscard]] bool RefuseWithoutAuthority(std::string_view what);
+
 /// What the invite panel should say about the session behind it.
 struct InviteSessionState {
     lobby::LobbyId          lobby{0};
@@ -951,14 +962,23 @@ void TickLoop() {
                     ApplyServerFilter();
                     break;
                 case unreal::LobbyAction::SelectCaptureTheFlag:
+                    if (RefuseWithoutAuthority("the game mode")) {
+                        break;
+                    }
                     g_lobby.mode = "CAPTURE THE FLAG";
                     SelectLobbyMode(false);
                     break;
                 case unreal::LobbyAction::SelectSlayer:
+                    if (RefuseWithoutAuthority("the game mode")) {
+                        break;
+                    }
                     g_lobby.mode = "SLAYER";
                     SelectLobbyMode(true);
                     break;
                 case unreal::LobbyAction::StartMatch:
+                    if (RefuseWithoutAuthority("when the match starts")) {
+                        break;
+                    }
                     OnStartMatch();
                     break;
                 case unreal::LobbyAction::JoinMatch:
@@ -1015,6 +1035,9 @@ void TickLoop() {
                     ApplyServerFilter();
                     break;
                 case unreal::LobbyAction::SelectMap:
+                    if (RefuseWithoutAuthority("the map")) {
+                        break;
+                    }
                     SelectLobbyMap(pressed_index);
                     break;
 
@@ -1485,6 +1508,12 @@ void CaptureServerName() {
     if (!g_lobby_ui_ready) {
         return;
     }
+    // A guest's field holds the host's name, put there by the authority pass. Reading it
+    // back would take somebody else's name, save it as this machine's own, and advertise it
+    // the next time this player hosted anything.
+    if (!LocalPlayerHasAuthority()) {
+        return;
+    }
     unreal::LobbyUIContext ui = g_lobby_ui;
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
@@ -1715,6 +1744,33 @@ InviteSessionState DescribeInviteSession() {
             break;
     }
     return state;
+}
+
+bool LocalPlayerHasAuthority() {
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->manager) {
+        return true; // Nothing to be a guest of.
+    }
+    if (g_state->manager->Phase() == lobby::LobbyPhase::Idle) {
+        return true;
+    }
+    return g_state->manager->IsHost();
+}
+
+bool RefuseWithoutAuthority(std::string_view what) {
+    if (LocalPlayerHasAuthority()) {
+        return false;
+    }
+    // Two gates, not one, and the second is the one that matters.
+    //
+    // The screen already greys these out, and that is the right thing to show. It is not a
+    // rule: a widget's hit testing is a drawing decision, one rebuild away from being wrong,
+    // and a bug that lets a guest change the map is a bug that desynchronises the match. The
+    // rule lives here, where every path to changing something has to pass.
+    MPE_LOG_INFO("ignoring a guest's attempt to change {}", what);
+    ShowSessionNotice("THE HOST DECIDES",
+                      std::format("Only the host can change {} in this session.", what));
+    return true;
 }
 
 /// Puts the invite list on screen, or takes it off.
@@ -1996,10 +2052,12 @@ void RefreshLobbyAuthority() {
         return;
     }
 
-    bool        is_host = true;
-    bool        in_session = false;
-    std::string mode;
-    std::string scenario;
+    bool                      is_host    = true;
+    bool                      in_session = false;
+    std::string               mode;
+    std::string               scenario;
+    lobby::LobbyId            lobby = 0;
+    unreal::LobbySettingsView settings;
     {
         std::lock_guard lock(g_state_mutex);
         if (!g_state || !g_state->manager) {
@@ -2012,6 +2070,21 @@ void RefreshLobbyAuthority() {
                          ? "SLAYER"
                          : "CAPTURE THE FLAG";
         scenario   = snapshot.settings.scenario;
+        lobby      = snapshot.lobby_id;
+
+        settings.game_time_minutes = snapshot.settings.time_limit_seconds / 60;
+        settings.friendly_fire     = snapshot.settings.friendly_fire;
+        settings.respawn_seconds   = snapshot.settings.respawn_delay_seconds;
+    }
+
+    // The server name is lobby metadata rather than a match setting, because it names the
+    // session rather than the rules. A guest reads the host's out of the lobby it joined;
+    // a host is left alone, since the field is the one they are typing into.
+    if (!is_host && lobby != 0) {
+        if (const char* const advertised = steam::GetLobbyData(lobby, "name");
+            advertised != nullptr) {
+            settings.server_name = advertised;
+        }
     }
 
     // Only when something changed, so this costs one comparison a tick while nobody is
@@ -2025,14 +2098,21 @@ void RefreshLobbyAuthority() {
     static bool          s_host = true;
     static std::string   s_mode;
     static std::string   s_scenario;
+    static std::string   s_settings;
     static std::uint32_t s_build = 0;
     const std::uint32_t  build   = unreal::LobbyBuildId();
-    if (is_host == s_host && mode == s_mode && scenario == s_scenario && build == s_build) {
+    const std::string    summary =
+        std::format("{}|{}|{}|{}", settings.game_time_minutes,
+                    settings.friendly_fire ? 1 : 0, settings.respawn_seconds,
+                    settings.server_name);
+    if (is_host == s_host && mode == s_mode && scenario == s_scenario && build == s_build &&
+        summary == s_settings) {
         return;
     }
     s_host     = is_host;
     s_mode     = mode;
     s_scenario = scenario;
+    s_settings = summary;
     s_build    = build;
 
     int chosen = 0;
@@ -2056,13 +2136,15 @@ void RefreshLobbyAuthority() {
     }
     (void)unreal::RunOnGameThread(
         [&]() {
+            unreal::SetLobbySettings(ui, settings);
             unreal::SetLobbyHostControls(ui, is_host);
             unreal::SetLobbyMode(ui, slayer);
             unreal::SetLobbyMap(ui, chosen);
         },
         5000);
-    MPE_LOG_INFO("lobby authority: {}, mode {}, map {}", is_host ? "host" : "guest", mode,
-                scenario);
+    MPE_LOG_INFO("lobby authority: {}, mode {}, map {}, {}min, friendly fire {}, respawn {}s",
+                is_host ? "host" : "guest", mode, scenario, settings.game_time_minutes,
+                settings.friendly_fire ? "on" : "off", settings.respawn_seconds);
 }
 
 /// Proves, against real Steam, that a hosted session can be found by a search.
