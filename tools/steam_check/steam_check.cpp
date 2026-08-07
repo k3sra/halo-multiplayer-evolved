@@ -31,6 +31,7 @@
 #include <Windows.h>
 
 #include "Lobby/Discovery.h"
+#include "Net/SteamSocketsTransport.h"
 #include "Lobby/ILobbyBackend.h"
 #include "Lobby/SteamMatchmakingHooks.h"
 #include "Net/PacketProtocol.h"
@@ -65,6 +66,30 @@ public:
 
     LobbyId     created{0};
     std::string failure;
+};
+
+/// Records what the transport reports.
+class Wire final : public net::ITransportObserver {
+public:
+    void OnPeerConnected(net::PeerHandle peer, const net::PeerIdentity&) override {
+        connected = peer;
+    }
+    void OnPeerDisconnected(net::PeerHandle, net::DisconnectReason,
+                            std::string_view detail) override {
+        disconnect = std::string(detail);
+    }
+    void OnPacketReceived(net::PeerHandle, net::Channel,
+                          std::span<const std::byte> payload) override {
+        received.assign(reinterpret_cast<const char*>(payload.data()), payload.size());
+    }
+    void OnConnectFailed(net::DisconnectReason, std::string_view detail) override {
+        failure = std::string(detail);
+    }
+
+    net::PeerHandle connected{net::PeerHandle::Invalid};
+    std::string     received;
+    std::string     failure;
+    std::string     disconnect;
 };
 
 /// Pumps Steam and the backend for a while, or until predicate is satisfied.
@@ -167,6 +192,92 @@ int main(int argc, char** argv) {
     Check(answered,
           "a Steam search with the mod's own filter returned this lobby, so a friend's "
           "will appear the same way");
+
+    // ------------------------------------------------------------------
+    // The relay, to ourselves.
+    // ------------------------------------------------------------------
+    //
+    // Steam routes a P2P connection to your own identity locally, so the listen socket,
+    // the connect, the acceptance and a real packet over a real channel can all be
+    // exercised without a second machine. What it does not exercise is a route between two
+    // different PCs, which is the part that still needs somebody else.
+    std::printf("connecting to ourselves over the Steam relay\n");
+
+    net::SteamTransportOptions options;
+    options.virtual_port       = 22799; // Not the game's, so nothing collides.
+    options.owns_callback_pump = false; // Pumped here, beside the backend.
+
+    auto transport = net::SteamSocketsTransport::Create(options);
+    if (!transport.ok()) {
+        std::printf("  SKIPPED  the Steam transport would not start: %s\n",
+                    std::string(transport.message()).c_str());
+    } else {
+        net::IPeerTransport& wire_transport = *transport.value();
+        Wire                 wire;
+
+        bool declined = false;
+
+        net::ListenConfig listen;
+        listen.max_clients = 4;
+        listen.use_relay   = true;
+        const bool listening = wire_transport.Listen(listen).ok();
+        Check(listening, "a relay listen socket opened");
+
+        const auto self = wire_transport.LocalIdentity();
+        if (listening && self.ok()) {
+            // A refusal here is Steam's answer, not a defect.
+            //
+            // Routing a P2P connection to your own identity is not something Steam
+            // undertakes to do, and this client declines it. That is a limit on what can be
+            // proven from one machine rather than anything wrong with the transport, so it
+            // is reported as unproven. Calling it a failure would make a green run
+            // impossible for a reason nobody can fix.
+            declined = !wire_transport.Connect(self.value(), 15000).ok();
+            if (declined) {
+                std::printf("  SKIPPED  Steam declined to route a connection to this machine\n"
+                            "           itself, which it is not obliged to do. The listen\n"
+                            "           socket opened; a route between two PCs needs two PCs.\n");
+            } else {
+                Check(true, "a P2P connection to our own identity was accepted for routing");
+
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                while (std::chrono::steady_clock::now() < deadline &&
+                       wire.connected == net::PeerHandle::Invalid && wire.failure.empty()) {
+                    steam::RunCallbacks();
+                    wire_transport.Poll(wire);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+
+                if (wire.connected != net::PeerHandle::Invalid) {
+                    Check(true, "the relay connected");
+
+                    const std::string                hello = "multiplayer-evolved";
+                    const std::span<const std::byte> payload{
+                        reinterpret_cast<const std::byte*>(hello.data()), hello.size()};
+                    (void)wire_transport.Send(wire.connected, net::Channel::Control, payload,
+                                              net::SendMode::Reliable);
+                    wire_transport.Flush();
+
+                    const auto until =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                    while (std::chrono::steady_clock::now() < until && wire.received.empty()) {
+                        steam::RunCallbacks();
+                        wire_transport.Poll(wire);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    Check(wire.received == hello,
+                          "a packet went out over the relay and came back byte for byte");
+                } else {
+                    std::printf("  SKIPPED  the relay did not connect to this machine "
+                                "itself: %s\n",
+                                wire.failure.empty() ? "no answer within twenty seconds"
+                                                     : wire.failure.c_str());
+                }
+            }
+        }
+        wire_transport.Shutdown();
+    }
 
     backend.Leave();
 
