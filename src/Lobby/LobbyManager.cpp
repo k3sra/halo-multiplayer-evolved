@@ -9,6 +9,7 @@
 #include "Map/MapVariantParser.h"
 
 #include <algorithm>
+#include <random>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -125,21 +126,27 @@ std::string_view ToString(LobbyPhase phase) noexcept {
     return "unknown";
 }
 
+// READINESS WAS REMOVED
+//
+// Everybody in a session is ready, always. There is no ready button, nothing to toggle,
+// and nothing that waits for one.
+//
+// It was modelled on a lobby where players opt in before a match starts. This is Halo's
+// multiplayer: the host decides when the game begins and everyone present plays. A ready
+// gate here could only ever do one thing, which is stop a match from starting for a reason
+// nobody asked for, and it very nearly did: the countdown refused to run and then cancelled
+// itself whenever a client's ready flag had not arrived yet.
+//
+// The one byte it occupied on the wire is still written, always true, so a build from
+// before this change still reads a roster it understands. That is cheaper than a protocol
+// version bump, which would stop two players who are mid session from seeing each other.
+
 std::size_t LobbySnapshot::ReadyCount() const noexcept {
-    return static_cast<std::size_t>(
-        std::count_if(players.begin(), players.end(),
-                      [](const PlayerSlot& p) { return p.is_ready; }));
+    return players.size();
 }
 
 bool LobbySnapshot::EveryoneReady() const noexcept {
-    if (players.empty()) {
-        return false;
-    }
-    // The host is excluded from the ready requirement: the host starts the match,
-    // which is their equivalent of pressing ready.
-    return std::all_of(players.begin(), players.end(), [](const PlayerSlot& p) {
-        return p.is_host || (p.is_ready && p.has_map);
-    });
+    return !players.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -348,32 +355,9 @@ void LobbyManager::LeaveSession() {
 }
 
 Result LobbyManager::SetLocalReady(bool ready) {
-    if (phase_ != LobbyPhase::InLobby && phase_ != LobbyPhase::Hosting &&
-        phase_ != LobbyPhase::Countdown) {
-        return Result::Fail(ErrorCode::InvalidState,
-                            std::format("ready state cannot change while {}", ToString(phase_)));
-    }
-
-    if (is_host_) {
-        // The host is implicitly ready; toggling would be meaningless because the
-        // host is the one who starts the match.
-        return Result::Fail(ErrorCode::InvalidState, "the host does not use ready state");
-    }
-    if (ready && !local_has_map_) {
-        return Result::Fail(ErrorCode::InvalidState,
-                            "cannot ready up until the map has finished downloading");
-    }
-
-    // A request, not an assignment. The host's roster snapshot is what actually
-    // changes local state, which keeps every machine agreeing on who is ready.
-    std::vector<std::byte> packet;
-    PacketBuilder builder(packet, MessageType::ReadyStateChange, Channel::Lobby);
-    builder.Body().WriteBool(ready);
-    MPE_TRY(SendTo(host_peer_, MessageType::ReadyStateChange, packet, SendMode::Reliable));
-
-    // Also published as lobby member data so the host sees it even if the
-    // transport connection is briefly disturbed.
-    MPE_TRY(backend_.SetMemberData(keys::kMemberReady, ready ? "1" : "0"));
+    // Kept only so the export that calls it still links. Readiness was removed: everybody
+    // in a session is ready, always, so there is nothing for this to change.
+    (void)ready;
     return Result::Success();
 }
 
@@ -473,7 +457,7 @@ Result LobbyManager::SelectMapVariant(std::string_view path) {
     for (PlayerSlot& player : players_) {
         if (!player.is_host) {
             player.has_map  = false;
-            player.is_ready = false;
+            player.is_ready = true; // Readiness was removed; everyone always is.
         }
     }
     // A map change while a countdown is running invalidates it.
@@ -535,10 +519,6 @@ Result LobbyManager::StartCountdown() {
             return Result::Fail(ErrorCode::InvalidState,
                                 std::format("{} is still downloading the map",
                                             player.display_name));
-        }
-        if (!player.is_ready) {
-            return Result::Fail(ErrorCode::InvalidState,
-                                std::format("{} is not ready", player.display_name));
         }
     }
 
@@ -731,11 +711,11 @@ void LobbyManager::TickCountdown(double delta_seconds) {
         if (player.is_host) {
             continue;
         }
-        if (!player.is_ready || !player.has_map) {
+        if (!player.has_map) {
             const Result cancelled = CancelCountdown(
-                std::format("{} is no longer ready", player.display_name));
+                std::format("{} is still downloading the map", player.display_name));
             if (!cancelled.ok()) {
-                MPE_LOG_WARN("cancel after readiness regression failed: {}", cancelled.message());
+                MPE_LOG_WARN("cancel after a map regression failed: {}", cancelled.message());
             }
             return;
         }
@@ -993,20 +973,9 @@ void LobbyManager::OnMemberDataChanged(PlatformId member) {
     }
     // Ready state also arrives over the transport. Metadata is the fallback path
     // for the window between lobby entry and a completed handshake.
-    const Expected<std::string> ready = backend_.GetMemberData(member, keys::kMemberReady);
-    if (!ready.ok()) {
-        return;
-    }
-    PlayerSlot* const player = FindPlayer(member);
-    if (player == nullptr || player->is_host) {
-        return;
-    }
-    const bool is_ready = (ready.value() == "1") && player->has_map;
-    if (player->is_ready != is_ready) {
-        player->is_ready = is_ready;
-        BroadcastRoster();
-        MarkDirty();
-    }
+    // Nothing to read. Readiness was removed, and it was the only thing this member data
+    // carried, so a change to it can no longer mean anything.
+    (void)member;
 }
 
 void LobbyManager::OnJoinRequested(LobbyId lobby, PlatformId inviter) {
@@ -1290,7 +1259,7 @@ Result LobbyManager::HandleHandshakeRequest(PeerHandle peer, ByteReader& reader)
     player.team     = AssignTeam();
     player.is_host  = false;
     player.is_local = false;
-    player.is_ready = false;
+    player.is_ready = true; // Readiness was removed; everyone always is.
     player.has_map  = !selected_map_.has_value(); // No map means nothing to fetch.
     players_.push_back(player);
 
@@ -1384,7 +1353,7 @@ Result LobbyManager::HandleRosterUpdate(ByteReader& reader) {
         player.team              = entry.team;
         player.is_host           = entry.is_host;
         player.is_local          = (entry.platform_id == local_id_);
-        player.is_ready          = entry.is_ready;
+        player.is_ready          = true; // Readiness was removed; everyone always is.
         player.has_map           = entry.has_map;
         player.ping_milliseconds = entry.ping_milliseconds;
         player.load_progress     = player.is_local ? local_progress : 0.0f;
@@ -1421,15 +1390,9 @@ Result LobbyManager::HandleReadyStateChange(PeerHandle peer, ByteReader& reader)
                             "ready state from a peer with no roster entry");
     }
 
-    // Readiness requires the map. A client that reports ready without it is not
-    // malicious, just racing a transfer, so this is corrected rather than punished.
-    const bool effective = ready && player->has_map;
-    if (player->is_ready != effective) {
-        player->is_ready = effective;
-        MPE_LOG_INFO("{} is {}", player->display_name, effective ? "ready" : "not ready");
-        BroadcastRoster();
-        MarkDirty();
-    }
+    // Accepted and ignored. Readiness was removed, so a build from before that change can
+    // still send this without being disconnected for it, and it changes nothing.
+    (void)player;
     return Result::Success();
 }
 
@@ -1755,7 +1718,7 @@ void LobbyManager::BroadcastRoster() {
         entry.slot              = player.slot;
         entry.team              = player.team;
         entry.is_host           = player.is_host;
-        entry.is_ready          = player.is_ready;
+        entry.is_ready          = true; // Always true on the wire, for older builds.
         entry.has_map           = player.has_map;
         entry.ping_milliseconds = player.ping_milliseconds;
         body.entries.push_back(std::move(entry));
@@ -1960,8 +1923,29 @@ std::uint8_t LobbyManager::AssignTeam() const {
             ++counts[player.team];
         }
     }
-    const auto smallest = std::min_element(counts.begin(), counts.end());
-    return static_cast<std::uint8_t>(std::distance(counts.begin(), smallest));
+
+    const std::size_t fewest = *std::min_element(counts.begin(), counts.end());
+
+    // Ties are broken at random rather than by team number.
+    //
+    // Taking the first smallest is correct arithmetic and a bad experience: every session
+    // starts level, so the first player to arrive always landed on blue, and with people
+    // joining and leaving in pairs the same side filled first every time. Choosing among
+    // the tied teams means an even lobby is genuinely even.
+    std::vector<std::uint8_t> candidates;
+    candidates.reserve(counts.size());
+    for (std::size_t team = 0; team < counts.size(); ++team) {
+        if (counts[team] == fewest) {
+            candidates.push_back(static_cast<std::uint8_t>(team));
+        }
+    }
+    if (candidates.size() == 1) {
+        return candidates.front();
+    }
+
+    static std::mt19937 generator{std::random_device{}()};
+    std::uniform_int_distribution<std::size_t> pick(0, candidates.size() - 1);
+    return candidates[pick(generator)];
 }
 
 void LobbyManager::RemovePlayerByPeer(PeerHandle peer) {

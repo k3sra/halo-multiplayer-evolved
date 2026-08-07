@@ -55,6 +55,7 @@
 #include <random>
 #include <cstring>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -99,9 +100,9 @@ public:
     void OnSnapshotChanged(const lobby::LobbySnapshot& snapshot) override {
         // Logged at trace: this fires on every roster or progress change and would
         // drown the log at a higher level.
-        MPE_LOG_TRACE("snapshot: phase={} players={} ready={} countdown={} map={:.0f}%",
+        MPE_LOG_TRACE("snapshot: phase={} players={} countdown={} map={:.0f}%",
                      lobby::ToString(snapshot.phase), snapshot.players.size(),
-                     snapshot.ReadyCount(), snapshot.countdown_seconds,
+                     snapshot.countdown_seconds,
                      snapshot.map_transfer_progress * 100.0f);
     }
 
@@ -191,15 +192,18 @@ void OnLeaveLobby();
 void RefreshServerList();
 void SwitchLobbyTab(bool browsing);
 void SelectLobbyMode(bool slayer);
+void PublishSelectedMatchSettings();
 void SelectLobbyMap(int map_index);
 void EnsureSessionHosted();
-void InviteToSession(int team);
+void InviteToSession();
 void ApplyServerFilter();
 void PublishSessionDetails();
 void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
+void RefreshLobbyAuthority();
 void PrepareLobby();
+void PrepareStatusOverlay();
 void InviteFriendAt(int row);
 void CloseInviteList();
 void PageFriendList(int direction);
@@ -280,7 +284,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.1.7";
+constexpr const char* kModVersion = "0.1.8";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -367,6 +371,17 @@ constexpr const char* kDefaultCampaignAsset = "DA_FirstPlayableCampaign";
         // shown against that rather than as zero.
         entry.capacity = listing.capacity > 0 ? listing.capacity : 10;
         entry.ping     = listing.ping_milliseconds;
+
+        // What the host says it is doing, turned into the two answers a player is choosing
+        // between. Anything the host has not published yet reads as a lobby, because a
+        // session that has just been created is one.
+        if (listing.phase == "in_match" || listing.phase == "loading" ||
+            listing.phase == "countdown") {
+            entry.status = "IN GAME";
+        } else {
+            entry.status = "LOBBY";
+        }
+
         servers.push_back(std::move(entry));
     }
     return servers;
@@ -730,6 +745,7 @@ void TickLoop() {
         // than a hundred widget creations. Called from here rather than from the entry
         // being added, because the buttons it creates can only be watched once the watch
         // they share a virtual table with exists, and that is established last.
+        PrepareStatusOverlay();
         PrepareLobby();
 
         // Kept current while a session is up: the name, mode and map a player picks have to
@@ -756,6 +772,18 @@ void TickLoop() {
         }
 
         RefreshLobbyStatus();
+
+        // Four times a second. It reads the session under the state lock and formats two
+        // strings to compare against the last pair; sixty passes a second to notice a
+        // button press is contention bought for nothing.
+        {
+            static auto s_last_authority = std::chrono::steady_clock::time_point{};
+            const auto  now              = std::chrono::steady_clock::now();
+            if (now - s_last_authority >= std::chrono::milliseconds(250)) {
+                s_last_authority = now;
+                RefreshLobbyAuthority();
+            }
+        }
 
         // Four times a second. Somebody joining should appear promptly, and a quarter of
         // a second is promptly; copying the roster and building a comparison string sixty
@@ -875,10 +903,10 @@ void TickLoop() {
                     OnLeaveLobby();
                     break;
                 case unreal::LobbyAction::InviteRed:
-                    InviteToSession(0);
-                    break;
                 case unreal::LobbyAction::InviteBlue:
-                    InviteToSession(1);
+                    // Which slot was pressed is deliberately not passed on. See
+                    // InviteToSession.
+                    InviteToSession();
                     break;
 
                 case unreal::LobbyAction::FilterModeAny:
@@ -1609,9 +1637,20 @@ void InviteFriendAt(int row) {
     ShowInviteList(true);
 }
 
-void InviteToSession(int team) {
-    MPE_LOG_INFO("opening the invite list for the {} team of this multiplayer session",
-                team == 0 ? "blue" : "red");
+void InviteToSession() {
+    // The slot that was pressed decides nothing.
+    //
+    // It reads like it should: press a red slot, get a red team mate. It cannot work that
+    // way and stay balanced. Somebody invited into a chosen slot would have to keep it
+    // even after two other people join the other side, and the alternative, honouring it
+    // only sometimes, is worse than never honouring it.
+    //
+    // Teams are assigned on arrival by whichever side is smallest, so every slot is the
+    // same button. This used to take the team as an argument and use it for nothing but a
+    // log line, which was itself wrong: the red slot logged blue and the blue slot logged
+    // red. Taking the argument away is what makes it impossible to start honouring it by
+    // accident later.
+    MPE_LOG_INFO("opening the invite list for this multiplayer session");
     EnsureSessionHosted();
     g_invite_pending = true;
     OpenSessionInvite();
@@ -1735,10 +1774,134 @@ void RefreshLobbyRoster() {
     MPE_LOG_INFO("lobby roster: {} on blue, {} on red", blue.size(), red.size());
 }
 
+/// The mode as the lobby names it, rather than as the engine spells it on the wire.
+[[nodiscard]] std::string DisplayMode(engine::GameMode mode) {
+    switch (mode) {
+        case engine::GameMode::CaptureTheFlag: return "CAPTURE THE FLAG";
+        case engine::GameMode::TeamSlayer:     return "SLAYER";
+        default:                               break;
+    }
+    // Anything without a lobby name falls back to the engine's, upper cased and with the
+    // underscores opened out, which is still readable.
+    std::string text(engine::ToString(mode));
+    for (char& character : text) {
+        character = (character == '_') ? ' '
+                                       : static_cast<char>(std::toupper(
+                                             static_cast<unsigned char>(character)));
+    }
+    return text;
+}
+
+/// The map as the lobby names it, from the scenario code the engine uses.
+[[nodiscard]] std::string DisplayMap(std::string_view scenario) {
+    for (const unreal::LobbyMap& map : unreal::kLobbyMaps) {
+        if (scenario == map.scenario) {
+            // The label carries the code in brackets, which the panel has no room for and
+            // the player does not need twice.
+            const std::string_view label{map.label};
+            const std::size_t      bracket = label.find(" (");
+            return std::string(bracket == std::string_view::npos ? label
+                                                                 : label.substr(0, bracket));
+        }
+    }
+    std::string text(scenario);
+    for (char& character : text) {
+        character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+    }
+    return text;
+}
+
+/// Keeps a client's screen following the host, and hides what a client cannot change.
+///
+/// Two things a guest needs and did not have. The mode and map are the host's to pick, so
+/// the controls for picking them come off the screen entirely; and when the host does pick
+/// something, the choice has to arrive here rather than the guest staring at whatever was
+/// selected before they joined.
+///
+/// Driven from the session snapshot rather than from what this machine last clicked,
+/// because for a client those are different things and only one of them is true.
+void RefreshLobbyAuthority() {
+    if (!g_lobby_ui_ready || !unreal::LobbyIsBuilt()) {
+        return;
+    }
+
+    bool        is_host = true;
+    bool        in_session = false;
+    std::string mode;
+    std::string scenario;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            return;
+        }
+        const lobby::LobbySnapshot& snapshot = g_state->manager->Snapshot();
+        in_session = snapshot.phase != lobby::LobbyPhase::Idle;
+        is_host    = !in_session || g_state->manager->IsHost();
+        mode       = (snapshot.settings.mode == engine::GameMode::TeamSlayer)
+                         ? "SLAYER"
+                         : "CAPTURE THE FLAG";
+        scenario   = snapshot.settings.scenario;
+    }
+
+    // Only when something changed, so this costs one comparison a tick while nobody is
+    // touching anything.
+    // The build id is part of the comparison, not decoration.
+    //
+    // A rebuilt lobby has entirely new widgets, and the old ones are what these values
+    // describe. Comparing settings alone meant a screen rebuilt with the same mode and map
+    // was left exactly as the new widgets happened to default to, which for a guest is the
+    // host's controls, visible and useless.
+    static bool          s_host = true;
+    static std::string   s_mode;
+    static std::string   s_scenario;
+    static std::uint32_t s_build = 0;
+    const std::uint32_t  build   = unreal::LobbyBuildId();
+    if (is_host == s_host && mode == s_mode && scenario == s_scenario && build == s_build) {
+        return;
+    }
+    s_host     = is_host;
+    s_mode     = mode;
+    s_scenario = scenario;
+    s_build    = build;
+
+    int chosen = 0;
+    for (std::size_t index = 0; index < std::size(unreal::kLobbyMaps); ++index) {
+        if (scenario == unreal::kLobbyMaps[index].scenario) {
+            chosen = static_cast<int>(index);
+        }
+    }
+    const bool slayer = (mode == "SLAYER");
+
+    // A guest's own idea of the settings follows the host's, so leaving and hosting again
+    // does not resurrect a choice somebody else made.
+    if (!is_host) {
+        g_lobby.mode     = mode;
+        g_lobby.scenario = scenario;
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    (void)unreal::RunOnGameThread(
+        [&]() {
+            unreal::SetLobbyHostControls(ui, is_host);
+            unreal::SetLobbyMode(ui, slayer);
+            unreal::SetLobbyMap(ui, chosen);
+        },
+        5000);
+    MPE_LOG_INFO("lobby authority: {}, mode {}, map {}", is_host ? "host" : "guest", mode,
+                scenario);
+}
+
 void RefreshLobbyStatus() {
     static auto s_last = std::chrono::steady_clock::time_point{};
 
-    if (!g_lobby_ui_ready || !unreal::LobbyIsBuilt() || g_lobby_root == 0) {
+    // Gated on the status overlay, not on the lobby.
+    //
+    // The panel is on the main menu too now, so waiting for the lobby to be built would
+    // leave it blank exactly where a player is most likely to be looking at it.
+    if (!g_lobby_ui_ready || !unreal::StatusOverlayIsBuilt()) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -1751,6 +1914,7 @@ void RefreshLobbyStatus() {
     status.online = steam::IsInitialized() && steam::IsLoggedOn();
     /// Why the session failed, when it has. Read under the lock, shown outside it.
     std::string session_error;
+    bool        faulted = false;
 
     {
         std::lock_guard lock(g_state_mutex);
@@ -1808,7 +1972,49 @@ void RefreshLobbyStatus() {
                     // panel, which has the width to show all of it.
                     status.session = "ERROR";
                     session_error  = snapshot.last_error;
+                    faulted        = true;
                     break;
+            }
+
+            // Who else is here, how far away they are, and what is being played.
+            //
+            // The ping shown is the round trip to the other side of the session, which is
+            // the only one a player can do anything about. A host measures each client
+            // once a second and reports the worst, because a lobby is only as good as its
+            // furthest member; a client is told its own by the host's roster, which is the
+            // same round trip seen from the other end.
+            //
+            // Left at minus one when this machine is alone, so the panel shows nothing
+            // rather than a made up zero.
+            for (const lobby::PlayerSlot& player : snapshot.players) {
+                if (player.is_host && !player.is_local) {
+                    status.host_name = player.display_name;
+                }
+                const bool remote = !player.is_local;
+                if (remote && player.ping_milliseconds > 0) {
+                    status.ping_ms = std::max(status.ping_ms,
+                                              static_cast<int>(player.ping_milliseconds));
+                }
+                if (player.is_local && !snapshot.is_host && player.ping_milliseconds > 0) {
+                    status.ping_ms = std::max(status.ping_ms,
+                                              static_cast<int>(player.ping_milliseconds));
+                }
+            }
+            if (snapshot.players.size() < 2) {
+                status.ping_ms = -1;
+            }
+
+            // Shown the way the lobby names them, not the way the engine does.
+            //
+            // The engine's own vocabulary is what goes on the wire and into lobby data:
+            // capture_the_flag, a30. Correct there and wrong on a panel a player reads,
+            // where it looks like a debug string that escaped.
+            // Only while there is a session. On the main menu the manager is idle and its
+            // settings are whatever it was constructed with, so reporting them there
+            // described a match that did not exist.
+            if (g_state->manager->Phase() != lobby::LobbyPhase::Idle) {
+                status.mode = DisplayMode(snapshot.settings.mode);
+                status.map  = DisplayMap(snapshot.settings.scenario);
             }
 
             // A phase that is going nowhere says so.
@@ -1836,6 +2042,37 @@ void RefreshLobbyStatus() {
     if (!status.online) {
         status.session   = "OFFLINE";
         status.invitable = false;
+    }
+
+    // A dead session recovers on its own, with the player watching it happen.
+    //
+    // When the host leaves, the client faults and the manager stays faulted forever: the
+    // error stayed on screen and there was no session left to be in, so the lobby was a
+    // screen showing a failure with nothing to do about it but press BACK.
+    //
+    // The failure is worth reading, so it is left up for a few seconds and counted down
+    // rather than cleared instantly, and then this machine hosts its own session again.
+    // That is the state a player expects to land in: their own empty lobby, ready to
+    // invite somebody, exactly as if they had just opened the screen.
+    constexpr auto kFaultLinger = std::chrono::seconds(10);
+    static std::chrono::steady_clock::time_point s_faulted_at{};
+    bool                                         recover_now = false;
+    if (faulted) {
+        if (s_faulted_at == std::chrono::steady_clock::time_point{}) {
+            s_faulted_at = now;
+        }
+        const auto elapsed = now - s_faulted_at;
+        if (elapsed >= kFaultLinger) {
+            recover_now = true;
+        } else {
+            const auto left = std::chrono::duration_cast<std::chrono::seconds>(
+                                  kFaultLinger - elapsed)
+                                  .count() +
+                              1;
+            session_error += std::format("  Starting your own session in {}s.", left);
+        }
+    } else {
+        s_faulted_at = {};
     }
 
     std::string latest;
@@ -1882,6 +2119,21 @@ void RefreshLobbyStatus() {
         return;
     }
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyStatus(ui, status); }, 5000);
+
+    // Done last, and outside the state lock, because both of these take it themselves.
+    // The status above is written first so the final second of the countdown is drawn
+    // before the session it describes is replaced.
+    if (recover_now) {
+        s_faulted_at = {};
+        MPE_LOG_INFO("the session failed; leaving it and hosting a new one");
+        {
+            std::lock_guard lock(g_state_mutex);
+            if (g_state && g_state->manager) {
+                g_state->manager->LeaveSession();
+            }
+        }
+        EnsureSessionHosted();
+    }
 }
 
 /// Applies the current filter to the live listing and rewrites the table.
@@ -1922,6 +2174,36 @@ void ApplyServerFilter() {
 }
 
 /// Marks the chosen mode on screen without rebuilding.
+/// Pushes the lobby screen's mode and map into the live session.
+///
+/// Without this the two drifted apart the moment a session existed. The screen tracked what
+/// the host had picked and the session kept whatever it was created with, so the status
+/// panel reported the original choice forever and a client was never told about a change at
+/// all: nothing was broadcast because nothing had changed as far as the session knew.
+///
+/// Host only, and quiet on a client, because a client has nothing to publish.
+void PublishSelectedMatchSettings() {
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->manager || !g_state->manager->IsHost()) {
+        return;
+    }
+    engine::MatchSettings settings = g_state->manager->Snapshot().settings;
+    settings.mode     = (g_lobby.mode == "SLAYER") ? engine::GameMode::TeamSlayer
+                                                   : engine::GameMode::CaptureTheFlag;
+    settings.scenario     = g_lobby.scenario;
+    settings.variant_name = g_lobby.scenario;
+    settings.team_count   = g_lobby.teams ? 2 : 1;
+    // Capture the flag has no meaning without two sides to carry it between.
+    if (settings.mode == engine::GameMode::CaptureTheFlag && settings.team_count < 2) {
+        settings.team_count = 2;
+    }
+    settings.friendly_fire = g_lobby.friendly_fire;
+
+    if (const Result updated = g_state->manager->UpdateMatchSettings(settings); !updated.ok()) {
+        MPE_LOG_WARN("the session did not accept the new settings: {}", updated.message());
+    }
+}
+
 void SelectLobbyMode(bool slayer) {
     MPE_LOG_INFO("mode is now {}", g_lobby.mode);
     if (!g_lobby_ui_ready) {
@@ -1932,6 +2214,9 @@ void SelectLobbyMode(bool slayer) {
         return;
     }
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMode(ui, slayer); }, 5000);
+
+    // Told to the session as well as the screen, so everybody else sees it.
+    PublishSelectedMatchSettings();
 }
 
 /// Chooses the scenario a match will be played on, and marks it on screen.
@@ -1950,6 +2235,7 @@ void SelectLobbyMap(int map_index) {
         return;
     }
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyMap(ui, map_index); }, 5000);
+    PublishSelectedMatchSettings();
 }
 
 /// Builds the whole lobby ahead of time and leaves it hidden.
@@ -1959,6 +2245,49 @@ void SelectLobbyMap(int map_index) {
 /// that when the player presses MULTIPLAYER is work they sit and wait through. Done here it
 /// happens while they are still looking at the main menu, and pressing the entry then costs
 /// one visibility change.
+/// Puts the status panel on screen, once, as soon as there is a menu to host it against.
+///
+/// Separate from the lobby because it outlives it: the panel reports on the mod rather than
+/// on whichever screen is showing, and a player on the main menu wants to know they are
+/// signed in and whether the build is current without opening anything.
+void PrepareStatusOverlay() {
+    if (!g_lobby_ui_ready || g_live_menu == 0) {
+        return;
+    }
+
+    // Built once, but only while it still exists.
+    //
+    // The widgets are created with the menu as their outer, so a menu the engine collects
+    // takes them with it. The handles stay non zero and stop being addresses of anything,
+    // which shows up as a panel that silently stops updating while the mod is certain it
+    // is on screen. Checking the object is still in the array is what turns that into a
+    // rebuild.
+    if (unreal::StatusOverlayIsBuilt()) {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->objects.has_value()) {
+            return;
+        }
+        if (g_state->objects->ClassOf(unreal::StatusOverlayWidget()) != 0) {
+            return; // Still there.
+        }
+        MPE_LOG_INFO("the status overlay was collected with its menu; building it again");
+        unreal::ForgetStatusOverlay();
+    }
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    Result outcome = Result::Success();
+    (void)unreal::RunOnGameThread([&]() { outcome = unreal::BuildStatusOverlay(ui); }, 10000);
+    if (!outcome.ok()) {
+        static bool s_complained = false;
+        if (!s_complained) {
+            s_complained = true;
+            MPE_LOG_WARN("the status overlay could not be built: {}", outcome.message());
+        }
+    }
+}
+
 void PrepareLobby() {
     if (!g_lobby_ui_ready || g_live_menu == 0 || unreal::LobbyIsBuilt()) {
         return;
@@ -2021,6 +2350,25 @@ void PrepareLobby() {
 
 /// Takes the lobby down and gives the frontend back.
 void OnLeaveLobby() {
+    // The session goes too, not just the screen.
+    //
+    // Hiding the lobby used to be all this did, which left whoever pressed BACK still in
+    // the session they were in. A guest who backed out was still occupying a slot in
+    // somebody else's lobby, still on their roster, and had no way to tell: their own
+    // screen was gone. A host who backed out left a session advertised that they were no
+    // longer watching.
+    //
+    // Leaving is what BACK means from a multiplayer screen. Opening it again hosts a fresh
+    // session, which is the state a player expects to return to.
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (g_state && g_state->manager &&
+            g_state->manager->Phase() != lobby::LobbyPhase::Idle) {
+            MPE_LOG_INFO("leaving the session on the way out of the lobby");
+            g_state->manager->LeaveSession();
+        }
+    }
+
     // The buttons are kept watched and the controls kept mapped: the lobby is hidden, not
     // destroyed, so its widgets are the same ones when it is shown again. Dropping them
     // here would make every button dead the second time the screen was opened.
@@ -3686,12 +4034,6 @@ __declspec(dllexport) int MPE_LeaveSession() {
     return 0;
 }
 
-__declspec(dllexport) int MPE_SetReady(int ready) {
-    return mpe::WithManager([&](mpe::lobby::LobbyManager& manager) {
-        return manager.SetLocalReady(ready != 0);
-    });
-}
-
 __declspec(dllexport) int MPE_StartMatch() {
     return mpe::WithManager(
         [](mpe::lobby::LobbyManager& manager) { return manager.StartCountdown(); });
@@ -3908,16 +4250,16 @@ __declspec(dllexport) int MPE_LobbySelfTest(int timeout_seconds) {
         }
     }
 
-    // Member data is the path a ready flag travels before a transport connection
-    // exists, so it is worth proving too.
-    if (const mpe::Result member = backend->SetMemberData(mpe::lobby::keys::kMemberReady, "1");
-        member.ok()) {
+    // Member data still has to round trip, because the roster's display names travel that
+    // way before a transport connection exists. The key used to be a ready flag, which no
+    // longer exists, so the probe writes its own.
+    if (const mpe::Result member = backend->SetMemberData("mpe.probe", "1"); member.ok()) {
         const auto local = backend->LocalId();
         if (local.ok()) {
             const auto read_back =
-                backend->GetMemberData(local.value(), mpe::lobby::keys::kMemberReady);
+                backend->GetMemberData(local.value(), "mpe.probe");
             mpe::log::Write(mpe::log::Level::Info, "Mod",
-                           std::format("lobby self test:   member ready flag round trip: {}",
+                           std::format("lobby self test:   member data round trip: {}",
                                        read_back.ok() ? read_back.value() : "MISSING"));
             if (!read_back.ok()) {
                 ++failures;

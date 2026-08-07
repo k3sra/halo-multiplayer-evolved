@@ -57,6 +57,13 @@ struct ServerEntry {
     int         players{0};
     int         capacity{10};
     int         ping{0};
+    /// What the session is doing, as the host published it: "LOBBY" while people are
+    /// gathering, "IN GAME" once a match is running. Empty when the host has not said.
+    ///
+    /// Worth a column of its own because the two are entirely different invitations. A
+    /// lobby is somewhere to go now; a match in progress is somewhere to go if you do not
+    /// mind arriving late, and until this was shown the row gave no way to tell.
+    std::string status;
 };
 
 /// Everything the lobby draws.
@@ -348,6 +355,13 @@ void ShowLobbyUI(const LobbyUIContext& context, bool visible);
 /// Must run on the game thread.
 void SetLobbyTab(const LobbyUIContext& context, bool browsing);
 
+/// Shows or hides everything only a host may use: the mode and map choices, and START
+/// MATCH.
+///
+/// A client cannot change any of it, so it is taken off the screen rather than left inert.
+/// Must run on the game thread.
+void SetLobbyHostControls(const LobbyUIContext& context, bool is_host);
+
 /// Marks which game mode is selected, without rebuilding the screen.
 ///
 /// Must run on the game thread.
@@ -378,6 +392,20 @@ struct LobbyStatus {
     /// The version that is staged and will be in use after a restart.
     std::string staged_version;
 
+    /// Round trip to whoever this machine is connected to, in milliseconds.
+    ///
+    /// Negative when there is nobody to measure against, which is most of the time: a
+    /// lobby with one person in it has no round trip, and a number invented for that case
+    /// would be a number the player could act on wrongly.
+    int ping_ms{-1};
+
+    /// Who is hosting, when this machine is not. Empty otherwise.
+    std::string host_name;
+
+    /// What the session is playing, for the panel's own summary.
+    std::string mode;
+    std::string map;
+
     /// A message that does not fit on the status line, shown top left instead.
     ///
     /// The status panel gives each line about three hundred points, which is enough for
@@ -391,6 +419,36 @@ struct LobbyStatus {
 
 /// Rewrites the status panel in place. Must run on the game thread.
 void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status);
+
+/// Builds the status overlay, which is separate from the lobby and outlives it.
+///
+/// It reports on the mod rather than on whichever screen is showing, so it belongs to
+/// neither: a player on the main menu wants to know they are signed in, that a session is
+/// up, and whether the build is current, without opening anything. It is hosted in its own
+/// viewport widget above the lobby's, so hiding the lobby does not take it away.
+///
+/// Safe to call repeatedly; it builds once. Must run on the game thread.
+[[nodiscard]] Result BuildStatusOverlay(const LobbyUIContext& context);
+
+/// True once the status overlay is on screen.
+[[nodiscard]] bool StatusOverlayIsBuilt();
+
+/// The widget the viewport holds the overlay in, so a caller can check it still exists.
+[[nodiscard]] std::uintptr_t StatusOverlayWidget();
+
+/// Drops every handle to the overlay without touching them.
+///
+/// For the case where the objects have been collected rather than removed: the addresses
+/// are no longer addresses of anything, so the only correct action is to stop believing
+/// in them and build again.
+void ForgetStatusOverlay();
+
+/// Counts how many times the lobby has been built.
+///
+/// Anything that decides what to draw by comparing against what it drew last time needs
+/// this, because a rebuilt screen has different widgets and the comparison alone cannot
+/// tell. A guest kept the host's controls this way.
+[[nodiscard]] std::uint32_t LobbyBuildId();
 
 /// Rewrites the server table and the details panel in place.
 ///

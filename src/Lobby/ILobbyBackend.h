@@ -63,8 +63,6 @@ struct LobbyMember {
 /// the state machine.
 namespace keys {
 
-/// Wire protocol version. A client compares this before joining and refuses
-/// early with a clear message rather than failing mid handshake.
 /// Marks a lobby as one this mod opened, and which protocol it speaks.
 ///
 /// Steam filters the server browser's search on this key, so it does two jobs at once:
@@ -72,6 +70,8 @@ namespace keys {
 /// set, and a session is only listed for players whose build can actually talk to it.
 inline constexpr const char* kBrowseMarker = "mpe.v";
 
+/// Wire protocol version. A client compares this before joining and refuses
+/// early with a clear message rather than failing mid handshake.
 inline constexpr const char* kProtocolVersion = "fe.protocol";
 
 /// Game build string, from the executable's version resource. Must match
@@ -88,9 +88,6 @@ inline constexpr const char* kMapHash       = "fe.map_hash";
 inline constexpr const char* kBaseScenario  = "fe.scenario";
 inline constexpr const char* kLobbyPhase    = "fe.phase";
 inline constexpr const char* kPlayerCount   = "fe.players";
-
-/// Per member: "1" when that member has pressed ready.
-inline constexpr const char* kMemberReady = "fe.ready";
 
 } // namespace keys
 
@@ -115,7 +112,8 @@ public:
     /// any knowledge of what the keys mean.
     virtual void OnLobbyDataChanged(LobbyId lobby) = 0;
 
-    /// Per member metadata changed, typically a ready flag.
+    /// Per member metadata changed, such as a display name published before the
+    /// transport connection exists.
     virtual void OnMemberDataChanged(PlatformId member) = 0;
 
     /// The local player accepted an invitation or used the friends list join
@@ -150,8 +148,8 @@ public:
                                              std::string_view value) = 0;
     [[nodiscard]] virtual Expected<std::string> GetLobbyData(std::string_view key) const = 0;
 
-    /// Any member may set their own data. This is how a ready flag reaches the
-    /// host before a transport connection exists.
+    /// Any member may set their own data. This is how a member tells the host
+    /// something before a transport connection exists.
     [[nodiscard]] virtual Result SetMemberData(std::string_view key,
                                               std::string_view value) = 0;
     [[nodiscard]] virtual Expected<std::string> GetMemberData(PlatformId member,

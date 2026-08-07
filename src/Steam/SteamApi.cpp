@@ -1008,6 +1008,12 @@ std::vector<LobbyListing> BrowseLobbies() {
     std::lock_guard lock(g_browse_mutex);
     g_browse_results.clear();
 
+    // Counted so an empty browser can be explained rather than guessed at. "Nobody is
+    // hosting" and "everything found was filtered out" look identical on screen, and the
+    // second one has been a bug twice.
+    int skipped_own      = 0;
+    int skipped_unmarked = 0;
+
     // Steam keeps the last result set addressable by index. Reading past the end returns an
     // invalid id, which is the natural place to stop.
     for (int index = 0; index < g_browse_count; ++index) {
@@ -1023,6 +1029,7 @@ std::vector<LobbyListing> BrowseLobbies() {
         // referring to a player who is both host and client. Simply not listing it is the
         // only sane answer: there is nothing useful the host could do with the row.
         if (lobby == CurrentLobby()) {
+            ++skipped_own;
             continue;
         }
 
@@ -1055,6 +1062,7 @@ std::vector<LobbyListing> BrowseLobbies() {
         // game, which is exactly what it would do.
         listing.host_id = read("fe.host");
         if (listing.host_id.empty()) {
+            ++skipped_unmarked;
             continue;
         }
 
@@ -1063,6 +1071,16 @@ std::vector<LobbyListing> BrowseLobbies() {
         listing.phase = read("fe.phase");
 
         g_browse_results.push_back(std::move(listing));
+    }
+
+    // Logged only when the answer changes, because the browser asks every few seconds.
+    static std::string s_last_summary;
+    const std::string  summary =
+        std::format("{} listed, {} own, {} unmarked, of {} returned", g_browse_results.size(),
+                    skipped_own, skipped_unmarked, g_browse_count);
+    if (summary != s_last_summary) {
+        s_last_summary = summary;
+        MPE_LOG_INFO("browse: {}", summary);
     }
     return g_browse_results;
 }
