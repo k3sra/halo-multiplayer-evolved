@@ -644,6 +644,13 @@ void WriteServerName(const LobbyUIContext& context, std::string_view name);
 /// True once the lobby has been built and can simply be shown.
 [[nodiscard]] bool LobbyIsBuilt();
 
+/// True while the lobby is actually on the display.
+///
+/// Not the same question as whether it exists. The lobby is built ahead of the player and
+/// kept hidden, so anything deciding whether this player currently wants a multiplayer
+/// session has to ask this one.
+[[nodiscard]] bool LobbyIsVisible();
+
 /// Removes the lobby from the screen and brings the main menu back. Game thread.
 void RemoveLobbyUI(const LobbyUIContext& context);
 

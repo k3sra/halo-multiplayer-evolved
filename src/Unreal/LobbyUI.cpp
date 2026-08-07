@@ -1392,6 +1392,15 @@ void DrawInvitePanel(const Builder& builder, std::uintptr_t canvas,
 namespace {
 /// The lobby currently on screen, so it can be replaced or closed.
 std::uintptr_t g_open_lobby_root = 0;
+
+/// True while the lobby screen is actually on the display.
+///
+/// Distinct from being built, and the distinction matters outside the drawing: the lobby is
+/// constructed ahead of the player and kept hidden so that opening it costs a visibility
+/// change rather than a hundred widget creations. Anything that asked "is there a lobby" to
+/// decide whether this player wants a multiplayer session got the answer yes from the moment
+/// the game finished loading.
+bool g_lobby_visible = false;
 /// The user widget carrying it, which is what the viewport actually holds.
 std::uintptr_t g_open_lobby_widget = 0;
 
@@ -2246,6 +2255,7 @@ void ShowLobbyUI(const LobbyUIContext& context, bool visible) {
     if (g_open_host_widget == 0) {
         return;
     }
+    g_lobby_visible = visible;
     SetWidgetVisibility(context, g_open_host_widget, visible ? kVisible : kCollapsed);
     if (visible) {
         FoldMenuAway(context);
@@ -3207,5 +3217,7 @@ void WriteServerName(const LobbyUIContext& context, std::string_view name) {
 }
 
 bool LobbyIsBuilt() { return g_open_host_widget != 0 && g_open_lobby_root != 0; }
+
+bool LobbyIsVisible() { return g_lobby_visible && LobbyIsBuilt(); }
 
 } // namespace mpe::unreal

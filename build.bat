@@ -75,6 +75,7 @@ set SOURCES=^
  "%ROOT%src\Core\GameBuild.cpp"^
  "%ROOT%src\Core\Pacing.cpp"^
  "%ROOT%src\Debug\AccessTrap.cpp"^
+ "%ROOT%src\Debug\LogShare.cpp"^
  "%ROOT%src\Steam\SteamApi.cpp"^
  "%ROOT%src\Blam\ModuleImage.cpp"^
  "%ROOT%src\Blam\PatternScanner.cpp"^
