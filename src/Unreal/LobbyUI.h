@@ -433,6 +433,23 @@ void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status);
 /// True once the status overlay is on screen.
 [[nodiscard]] bool StatusOverlayIsBuilt();
 
+/// The widget the viewport holds the overlay in, so a caller can check it still exists.
+[[nodiscard]] std::uintptr_t StatusOverlayWidget();
+
+/// Drops every handle to the overlay without touching them.
+///
+/// For the case where the objects have been collected rather than removed: the addresses
+/// are no longer addresses of anything, so the only correct action is to stop believing
+/// in them and build again.
+void ForgetStatusOverlay();
+
+/// Counts how many times the lobby has been built.
+///
+/// Anything that decides what to draw by comparing against what it drew last time needs
+/// this, because a rebuilt screen has different widgets and the comparison alone cannot
+/// tell. A guest kept the host's controls this way.
+[[nodiscard]] std::uint32_t LobbyBuildId();
+
 /// Rewrites the server table and the details panel in place.
 ///
 /// The rows are built once and then only have their text replaced, so filtering or a

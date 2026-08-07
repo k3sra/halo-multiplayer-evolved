@@ -1834,15 +1834,24 @@ void RefreshLobbyAuthority() {
 
     // Only when something changed, so this costs one comparison a tick while nobody is
     // touching anything.
-    static bool        s_host = true;
-    static std::string s_mode;
-    static std::string s_scenario;
-    if (is_host == s_host && mode == s_mode && scenario == s_scenario) {
+    // The build id is part of the comparison, not decoration.
+    //
+    // A rebuilt lobby has entirely new widgets, and the old ones are what these values
+    // describe. Comparing settings alone meant a screen rebuilt with the same mode and map
+    // was left exactly as the new widgets happened to default to, which for a guest is the
+    // host's controls, visible and useless.
+    static bool          s_host = true;
+    static std::string   s_mode;
+    static std::string   s_scenario;
+    static std::uint32_t s_build = 0;
+    const std::uint32_t  build   = unreal::LobbyBuildId();
+    if (is_host == s_host && mode == s_mode && scenario == s_scenario && build == s_build) {
         return;
     }
     s_host     = is_host;
     s_mode     = mode;
     s_scenario = scenario;
+    s_build    = build;
 
     int chosen = 0;
     for (std::size_t index = 0; index < std::size(unreal::kLobbyMaps); ++index) {
@@ -2231,8 +2240,27 @@ void SelectLobbyMap(int map_index) {
 /// on whichever screen is showing, and a player on the main menu wants to know they are
 /// signed in and whether the build is current without opening anything.
 void PrepareStatusOverlay() {
-    if (!g_lobby_ui_ready || g_live_menu == 0 || unreal::StatusOverlayIsBuilt()) {
+    if (!g_lobby_ui_ready || g_live_menu == 0) {
         return;
+    }
+
+    // Built once, but only while it still exists.
+    //
+    // The widgets are created with the menu as their outer, so a menu the engine collects
+    // takes them with it. The handles stay non zero and stop being addresses of anything,
+    // which shows up as a panel that silently stops updating while the mod is certain it
+    // is on screen. Checking the object is still in the array is what turns that into a
+    // rebuild.
+    if (unreal::StatusOverlayIsBuilt()) {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->objects.has_value()) {
+            return;
+        }
+        if (g_state->objects->ClassOf(unreal::StatusOverlayWidget()) != 0) {
+            return; // Still there.
+        }
+        MPE_LOG_INFO("the status overlay was collected with its menu; building it again");
+        unreal::ForgetStatusOverlay();
     }
     unreal::LobbyUIContext ui = g_lobby_ui;
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
