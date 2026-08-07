@@ -348,6 +348,15 @@ struct LobbyListing {
 /// build can actually speak to.
 void SetBrowseMarker(std::string_view key, std::string_view value);
 
+/// True once a Steam search has returned this machine's own lobby.
+///
+/// The one part of discovery that can be proven without a second person. If our own lobby
+/// comes back from a real search then the marker was published in a form Steam's string
+/// filter matches, the filter was applied, and a lobby carrying it was returned; a friend's
+/// lobby travels the identical path with a different id. If it never comes back, the
+/// browser will be empty for everybody and this says so before anyone tries.
+[[nodiscard]] bool LastSearchSawOwnLobby();
+
 /// Asks Steam for public lobbies advertising this game.
 ///
 /// The request is asynchronous, so this starts one and returns immediately. Results appear
