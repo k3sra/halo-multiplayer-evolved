@@ -300,6 +300,12 @@ constexpr std::size_t kLoadingStages = 4;
 std::uintptr_t g_loading_step_bar[kLoadingStages]   = {0, 0, 0, 0};
 std::uintptr_t g_loading_step_label[kLoadingStages] = {0, 0, 0, 0};
 std::uintptr_t g_loading_cancel = 0;
+/// True when the loading screen collapsed the lobby and owes it a restore.
+///
+/// Recorded rather than assumed, because the lobby is only sometimes open when a wait
+/// starts: accepting an invitation from the main menu has no lobby behind it, and putting
+/// one back afterwards would show the player a screen they never opened.
+bool g_lobby_hidden_by_loading = false;
 
 /// The bar's geometry, shared by the track, the fill and the sweep.
 constexpr float kBarX = 474.0F;
@@ -2531,8 +2537,15 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
         // Every value is cut to its column before it is written. The name is cleaned as well
         // as cut, because a server name is typed by somebody else and arrives with whatever
         // they felt like putting in it.
+        //
+        // Only when there is one, though. CleanDisplayName answers an empty name with
+        // PLAYER, which is right for a team card, where somebody is definitely standing,
+        // and wrong here, where an empty name means the host has not advertised one yet.
+        // Every unnamed server in the browser read as PLAYER because of it.
         builder.SetTextLive(row.name,
-                            text::CleanDisplayName(entry.name, kColumns[0].limit));
+                            entry.name.empty()
+                                ? std::string("UNNAMED SERVER")
+                                : text::CleanDisplayName(entry.name, kColumns[0].limit));
         builder.SetTextLive(row.mode, ShortMode(entry.mode));
         builder.SetTextLive(row.map, text::Ellipsise(entry.map, kColumns[2].limit));
         builder.SetTextLive(row.players,
@@ -2540,8 +2553,17 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
 
         // The same thresholds and the same colours as the status panel, so a number means
         // one thing wherever a player reads it.
-        builder.SetTextLive(row.ping, std::format("{}ms", entry.ping));
-        builder.SetColourLive(row.ping, PingColour(entry.ping));
+        //
+        // A dash rather than a zero when there is nothing to report. A Steam lobby search
+        // returns no round trip, so every row read "0ms" in green, which is not merely
+        // unhelpful: it is the best possible number, shown for every server on the list,
+        // and a player comparing two of them was comparing nothing. Measuring it needs the
+        // host to publish a ping location and the browser to estimate against it, which is
+        // a real round trip and is not this.
+        const bool measured = entry.ping > 0;
+        builder.SetTextLive(row.ping, measured ? std::format("{}ms", entry.ping)
+                                               : std::string("--"));
+        builder.SetColourLive(row.ping, measured ? PingColour(entry.ping) : kTextDim);
 
         builder.SetTextLive(row.status, entry.status);
         builder.SetColourLive(row.status, entry.status == "IN GAME" ? kWarn : kGood);
@@ -2563,8 +2585,10 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
                   std::format("Players: {}/{}",
                               servers[static_cast<std::size_t>(selected)].players,
                               servers[static_cast<std::size_t>(selected)].capacity),
-                  std::format("Ping: {}ms",
-                              servers[static_cast<std::size_t>(selected)].ping)}
+                  servers[static_cast<std::size_t>(selected)].ping > 0
+                      ? std::format("Ping: {}ms",
+                                    servers[static_cast<std::size_t>(selected)].ping)
+                      : std::string("Ping: not measured")}
             : std::array<std::string, 5>{"No server selected", "", "", "", ""};
     for (std::size_t line = 0; line < lines.size(); ++line) {
         builder.SetTextLive(g_detail_line[line], lines[line]);
@@ -2746,6 +2770,57 @@ void ShowLoadingOverlay(const LobbyUIContext& context, bool visible) {
     // is meant to swallow clicks. The screen behind it describes a session that is in the
     // middle of becoming something else, and a press landing on it would act on the old one.
     SetWidgetVisibility(context, g_loading_host, visible ? kVisible : kCollapsedValue);
+
+    // The lobby is taken down, not merely covered.
+    //
+    // Z order was supposed to be enough. It was not: this overlay is added to the viewport
+    // at 1002 and the lobby at 1000, and the lobby still drew over it. A player watched the
+    // team cards print through a screen that was meant to be opaque, and, far worse, every
+    // click landed on the lobby's own full screen backdrop instead of on the one control
+    // this screen offers. CANCEL was drawn, was enabled, and could not be pressed, which is
+    // the exact shape of a modal that traps somebody.
+    //
+    // Collapsing what is behind it removes the question. Nothing can draw over a widget
+    // that is not being drawn, and nothing can intercept a press meant for a widget that is
+    // not being hit tested. It is also what the screen means: while this is up, the lobby
+    // is describing a session that has already moved on.
+    if (g_open_host_widget != 0 && LobbyIsBuilt()) {
+        if (visible) {
+            g_lobby_hidden_by_loading = ReadWidgetVisibility(context, g_open_host_widget) ==
+                                        kVisible;
+            if (g_lobby_hidden_by_loading) {
+                SetWidgetVisibility(context, g_open_host_widget, kCollapsedValue);
+            }
+        } else if (g_lobby_hidden_by_loading) {
+            g_lobby_hidden_by_loading = false;
+            SetWidgetVisibility(context, g_open_host_widget, kVisible);
+        }
+    }
+
+    // The pump moves with the screen, and this is not a detail.
+    //
+    // Queued game thread work runs from a widget's own event path, and a collapsed widget
+    // receives no events. Collapsing the lobby therefore stopped the pump dead, and the
+    // pump is what the entire mod thread runs on: every job fell back to the slow path or
+    // timed out, the tick loop lost seconds at a time, and the countdown, which advances by
+    // however much real time each tick observed, was clamped to a second per tick and
+    // stretched a five second countdown into a minute. Pressing CANCEL did nothing for the
+    // same reason, because presses are read on that same starved tick.
+    //
+    // Whichever screen is actually on the display carries the pump. While this one is up,
+    // that is this one.
+    if (visible) {
+        if (const Result pump = InstallGameThreadPump(g_loading_host); !pump.ok()) {
+            MPE_LOG_WARN("the loading screen could not take over the game thread pump: {}",
+                        pump.message());
+        }
+    } else if (g_open_host_widget != 0 && LobbyIsBuilt() &&
+               ReadWidgetVisibility(context, g_open_host_widget) == kVisible) {
+        (void)InstallGameThreadPump(g_open_host_widget);
+    } else if (context.outer != 0) {
+        (void)InstallGameThreadPump(context.outer);
+    }
+
     g_loading_open = visible;
 }
 
