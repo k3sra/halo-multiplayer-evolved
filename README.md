@@ -145,17 +145,6 @@ What works today, honestly. Anything not yet tested says so.
 - Slayer and CTF scoring
 - The original multiplayer maps
 
-### While this is being tested
-
-This build writes a detailed log on every machine, so a problem that needs two
-people can be diagnosed from what was recorded rather than from what anyone
-remembers. The file is `MultiplayerEvolved.log` in the folder you installed into,
-and the previous run is kept beside it as `MultiplayerEvolved.previous.log`.
-
-Nothing is sent anywhere. The file stays on your machine and it is your choice
-whether to attach it to an issue. If you would rather it stayed brief, put an
-empty file named `quiet.on` in the `MultiplayerEvolved` folder.
-
 ---
 
 ## Problems, questions, ideas
