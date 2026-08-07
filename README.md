@@ -7,7 +7,7 @@
 
 **The multiplayer Halo: Campaign Evolved should have shipped with.**
 
-[![Version](https://img.shields.io/badge/version-0.1.8-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.1.9-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Download](https://img.shields.io/badge/download-latest%20release-2ea44f?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Licence](https://img.shields.io/badge/licence-MIT-blue?style=for-the-badge)](LICENSE)
 
@@ -89,7 +89,7 @@ imaginative than that.
 | | Goal | State |
 | --- | --- | --- |
 | 1 | Two players in one lobby | Done |
-| 2 | A match both players are in | Next |
+| 2 | A match both players are in | Built |
 | 2a | Joining a game already in progress | Built |
 | 3 | Slayer and Capture the Flag scoring exactly as they were | Planned |
 | 4 | The original maps: Blood Gulch, Sidewinder, Hang 'Em High, the rest | Planned |
@@ -116,6 +116,8 @@ What works today, honestly. Anything not yet tested says so.
 - Starting a match
 - Hosting a public session others can find and be invited into
 - Two players in one session, over the Steam relay, with no port forwarding
+- Starting a match for everybody at once: a countdown every player sees, the same
+  scenario and the same random seed, and nobody released until all have loaded
 - Teams that balance themselves, with ties broken at random
 - A status panel on the main menu and the lobby: connection, session, who is
   hosting, ping, and whether the build is current
@@ -124,7 +126,6 @@ What works today, honestly. Anything not yet tested says so.
 **Built, not yet proven with two people**
 
 - Joining a session that is already in a match
-- Synchronized match launch
 
 **Not done yet**
 
@@ -174,7 +175,15 @@ tools\session_check\build.bat
 The second runs a real host and a real client against each other in one process,
 over a loopback transport, through the real protocol. It covers the things that
 otherwise need two machines and two people: a join completing, a guest being told
-the host's mode and map, teams balancing, and leaving a session cleanly.
+the host's mode and map, teams balancing, a match starting on both machines with
+the same random seed, and leaving a session cleanly.
+
+```bash
+tools\steam_check\build.bat
+```
+
+The third talks to the real Steam client: it hosts a lobby, searches for it, and
+calls every Steam function the mod uses. Needs Steam running and the game closed.
 
 ---
 
