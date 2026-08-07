@@ -53,11 +53,12 @@ class FakeEngine final : public engine::IEngineControl {
 public:
     [[nodiscard]] engine::EngineCapabilities Capabilities() const override {
         engine::EngineCapabilities caps;
-        caps.can_execute_commands     = true;
-        caps.can_configure_session    = true;
-        caps.can_load_map_variant     = true;
+        caps.can_begin_scenario        = true;
+        caps.can_execute_commands      = true;
+        caps.can_configure_session     = true;
+        caps.can_load_map_variant      = true;
         caps.can_place_sandbox_objects = true;
-        caps.can_query_load_progress  = true;
+        caps.can_query_load_progress   = true;
         return caps;
     }
     [[nodiscard]] engine::EngineLifecycle Lifecycle() const override {
@@ -71,7 +72,10 @@ public:
         applied = settings;
         return Result::Success();
     }
-    Result BeginLoadScenario(std::string_view, std::uint32_t) override {
+    Result BeginLoadScenario(std::string_view scenario, std::uint32_t seed) override {
+        loaded_scenario = std::string(scenario);
+        loaded_seed     = seed;
+        ++loads;
         return Result::Success();
     }
     [[nodiscard]] Expected<float> QueryLoadProgress() const override { return 1.0f; }
@@ -93,6 +97,9 @@ public:
     Result ExecuteConsoleCommand(std::string_view) override { return Result::Success(); }
 
     engine::MatchSettings applied;
+    std::string           loaded_scenario;
+    std::uint32_t         loaded_seed{0};
+    int                   loads{0};
 };
 
 /// A lobby backend with no platform behind it.
@@ -635,6 +642,71 @@ void FaultCountdown() {
     Check(JudgeFault(0, 0).recover_now, "a zero linger recovers at once");
 }
 
+
+void EverybodyLaunchesTogether() {
+    std::printf("a match starting for both players\n");
+
+    Pair pair;
+    (void)pair.host.HostSession(DefaultHost());
+    pair.host_backend.RaiseCreated(77);
+    pair.Pump();
+    (void)pair.client.JoinSession(77);
+    pair.client_backend.RaiseEntered(77, false);
+    pair.host_transport.ConnectTo(pair.client_transport, static_cast<PeerHandle>(1),
+                                  static_cast<PeerHandle>(1));
+    pair.host_transport.AnnounceConnect();
+    pair.client_transport.AnnounceConnect();
+    pair.Pump(24);
+    Check(pair.client.Phase() == LobbyPhase::InLobby, "both players are in the lobby");
+
+    // A guest cannot start the match. Only the host decides.
+    Check(!pair.client.StartCountdown().ok(), "a guest cannot start the match");
+
+    Check(pair.host.StartCountdown().ok(), "the host starts the countdown");
+    Check(pair.host.Phase() == LobbyPhase::Countdown, "the host is counting down");
+    pair.Pump(8);
+    Check(pair.client.Phase() == LobbyPhase::Countdown,
+          "the guest is counting down too, from the host's broadcast");
+
+    // Run the countdown out. A whole second per tick so this finishes in a few passes
+    // rather than in real time.
+    for (int i = 0; i < 12; ++i) {
+        pair.host.Tick(1.0);
+        pair.client.Tick(1.0);
+    }
+
+    Check(pair.host_engine.loads == 1, "the host began the scenario exactly once");
+    Check(pair.client_engine.loads == 1, "the guest began the scenario exactly once");
+    Check(!pair.host_engine.loaded_scenario.empty(), "the host loaded a scenario");
+    Check(pair.client_engine.loaded_scenario == pair.host_engine.loaded_scenario,
+          "both loaded the same scenario");
+
+    // The seed is what keeps anything random identical on both machines. Two players in
+    // the same map with different seeds is a match that diverges from the first frame.
+    Check(pair.client_engine.loaded_seed == pair.host_engine.loaded_seed,
+          "both loaded with the same random seed");
+    Check(pair.host_engine.loaded_seed != 0, "and the seed is not zero");
+
+    // Nobody is released until everybody has arrived.
+    pair.Pump(40);
+    Check(pair.host.Phase() == LobbyPhase::InMatch, "the host reaches the match");
+    Check(pair.client.Phase() == LobbyPhase::InMatch, "and so does the guest");
+}
+
+void AloneCannotStart() {
+    std::printf("a host alone in a lobby\n");
+
+    Pair pair;
+    (void)pair.host.HostSession(DefaultHost());
+    pair.host_backend.RaiseCreated(77);
+    pair.Pump();
+
+    const Result started = pair.host.StartCountdown();
+    Check(!started.ok(), "starting alone is refused");
+    Check(!started.message().empty(), "and the refusal says why, for the player to read");
+    Check(pair.host.Phase() == LobbyPhase::Hosting, "the lobby is left as it was");
+}
+
 } // namespace
 
 int main() {
@@ -649,6 +721,8 @@ int main() {
     PingReachesTheGuest();
     PingBands();
     FaultCountdown();
+    EverybodyLaunchesTogether();
+    AloneCannotStart();
 
     std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;
