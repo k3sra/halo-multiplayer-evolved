@@ -2,6 +2,8 @@
 // MultiplayerEvolved: Lobby/Discovery.cpp
 #include "Lobby/Discovery.h"
 
+#include <cstdint>
+
 namespace mpe::lobby {
 
 std::string_view ToString(ListingVerdict verdict) noexcept {
@@ -72,6 +74,35 @@ int StepFriendPage(int page, int direction, std::size_t friend_count,
     // negative page and every row reads as empty.
     const int stepped = ((page + direction) % pages + pages) % pages;
     return stepped;
+}
+
+PingBand BandForPing(int ping_milliseconds) noexcept {
+    if (ping_milliseconds < 0) {
+        return PingBand::Unknown;
+    }
+    if (ping_milliseconds <= 100) {
+        return PingBand::Good;
+    }
+    if (ping_milliseconds <= 150) {
+        return PingBand::Fair;
+    }
+    return PingBand::Poor;
+}
+
+FaultRecovery JudgeFault(std::int64_t elapsed_milliseconds,
+                         std::int64_t linger_milliseconds) noexcept {
+    FaultRecovery recovery;
+    if (linger_milliseconds <= 0 || elapsed_milliseconds >= linger_milliseconds) {
+        recovery.recover_now = true;
+        return recovery;
+    }
+
+    // Rounded up, so a countdown starting at ten seconds shows ten rather than nine, and
+    // reaches one rather than zero before it acts. A visible zero that lingers reads as a
+    // countdown that has stalled.
+    const std::int64_t left = linger_milliseconds - elapsed_milliseconds;
+    recovery.seconds_remaining = static_cast<int>((left + 999) / 1000);
+    return recovery;
 }
 
 } // namespace mpe::lobby

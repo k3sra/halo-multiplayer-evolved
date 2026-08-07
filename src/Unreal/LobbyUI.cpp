@@ -6,6 +6,7 @@
 
 #include "Core/Log.h"
 #include "Unreal/GameThread.h"
+#include "Lobby/Discovery.h"
 #include "Unreal/ProcessMemory.h"
 
 // For MultiByteToWideChar: Steam hands back UTF-8 and the engine's text wants UTF-16.
@@ -166,16 +167,15 @@ std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0, 0};
 /// they were aimed. Shared with the server browser so a number means the same thing in
 /// both places.
 [[nodiscard]] LinearColour PingColour(int ping_ms) {
-    if (ping_ms < 0) {
-        return kTextDim;
+    // The thresholds live in Lobby/Discovery, with tests, so the panel and the browser
+    // cannot drift apart and the boundaries are not whichever of the two was edited last.
+    switch (lobby::BandForPing(ping_ms)) {
+        case lobby::PingBand::Good: return kGood;
+        case lobby::PingBand::Fair: return kWarn;
+        case lobby::PingBand::Poor: return kBad;
+        case lobby::PingBand::Unknown:
+        default:                    return kTextDim;
     }
-    if (ping_ms <= 100) {
-        return kGood;
-    }
-    if (ping_ms <= 150) {
-        return kWarn;
-    }
-    return kBad;
 }
 
 /// The overlay that carries the status and notice panels.
