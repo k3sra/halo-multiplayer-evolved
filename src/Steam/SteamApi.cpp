@@ -907,6 +907,14 @@ std::mutex                g_browse_mutex;
 std::vector<LobbyListing> g_browse_results;
 int                       g_browse_count = 0;
 
+/// Whether the last search returned this machine's own lobby.
+///
+/// Proof, from Steam itself, that the whole discovery chain works: the marker was
+/// published in a form Steam's own string filter matches, the search executed, and a lobby
+/// carrying it came back. Our own is the only lobby whose presence can be checked without
+/// a second person, and it travels the identical path a friend's does.
+bool g_browse_saw_own = false;
+
 /// The key and value that identify a lobby as this mod's, shared by the search filter and
 /// the listing check so the two cannot drift apart. They did once, and the browser
 /// returned nothing for it.
@@ -994,6 +1002,11 @@ void RequestLobbyList() {
     g_lobby_list_receiver.Await(call);
 }
 
+bool LastSearchSawOwnLobby() {
+    std::lock_guard lock(g_browse_mutex);
+    return g_browse_saw_own;
+}
+
 void SetBrowseMarker(std::string_view key, std::string_view value) {
     std::lock_guard lock(g_browse_mutex);
     g_browse_marker_key.assign(key);
@@ -1012,8 +1025,9 @@ std::vector<LobbyListing> BrowseLobbies() {
     // Counted so an empty browser can be explained rather than guessed at. "Nobody is
     // hosting" and "everything found was filtered out" look identical on screen, and the
     // second one has been a bug twice.
-    int skipped_own      = 0;
-    int skipped_unmarked = 0;
+    int  skipped_own      = 0;
+    int  skipped_unmarked = 0;
+    bool saw_own          = false;
 
     // Read here rather than at each row, and used both to look the value up and to compare
     // it, so a search and a listing can never disagree about what counts as ours.
@@ -1064,6 +1078,7 @@ std::vector<LobbyListing> BrowseLobbies() {
             lobby::JudgeListing(raw, CurrentLobby(), marker_value);
         if (verdict == lobby::ListingVerdict::OwnSession) {
             ++skipped_own;
+            saw_own = true;
             continue;
         }
         if (verdict != lobby::ListingVerdict::Listed) {
@@ -1072,6 +1087,10 @@ std::vector<LobbyListing> BrowseLobbies() {
         }
 
         g_browse_results.push_back(std::move(listing));
+    }
+
+    if (saw_own) {
+        g_browse_saw_own = true;
     }
 
     // Logged only when the answer changes, because the browser asks every few seconds.

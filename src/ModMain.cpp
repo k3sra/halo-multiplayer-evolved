@@ -202,6 +202,7 @@ void PublishSessionDetails();
 void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
+void CheckOwnSessionIsFindable();
 void RefreshLobbyAuthority();
 void PrepareLobby();
 void PrepareStatusOverlay();
@@ -767,6 +768,7 @@ void TickLoop() {
         }
 
         RefreshLobbyStatus();
+        CheckOwnSessionIsFindable();
 
         // Four times a second. It reads the session under the state lock and formats two
         // strings to compare against the last pair; sixty passes a second to notice a
@@ -1886,6 +1888,65 @@ void RefreshLobbyAuthority() {
         5000);
     MPE_LOG_INFO("lobby authority: {}, mode {}, map {}", is_host ? "host" : "guest", mode,
                 scenario);
+}
+
+/// Proves, against real Steam, that a hosted session can be found by a search.
+///
+/// This is the one part of discovery that can be checked without a second person. If a
+/// real search returns this machine's own lobby then the marker was published in a form
+/// Steam's string filter matches, the filter was applied, and a lobby carrying it came
+/// back; a friend's lobby travels the identical path with a different id. If it never
+/// comes back, the browser will be empty for everybody, and the answer is here rather than
+/// in a report from two people who could not find each other.
+///
+/// The result is logged once per session. Searching is what the browser does anyway.
+void CheckOwnSessionIsFindable() {
+    static bool s_asked     = false;
+    static bool s_reported  = false;
+    static auto s_asked_at  = std::chrono::steady_clock::time_point{};
+
+    lobby::LobbyId lobby = 0;
+    {
+        std::lock_guard lock(g_state_mutex);
+        lobby = HostedLobbyLocked();
+    }
+    if (lobby == 0) {
+        // Not hosting. Reset so the next session is checked in its own right.
+        s_asked    = false;
+        s_reported = false;
+        return;
+    }
+    if (s_reported) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_asked) {
+        s_asked    = true;
+        s_asked_at = now;
+        steam::RequestLobbyList();
+        return;
+    }
+
+    // Steam answers asynchronously. A few seconds is long enough for a search that is
+    // going to succeed, and short enough that a failure is reported while the player is
+    // still on the screen it matters for.
+    if (now - s_asked_at < std::chrono::seconds(6)) {
+        return;
+    }
+    s_reported = true;
+
+    // Reading the results is what records whether our own lobby was among them.
+    (void)steam::BrowseLobbies();
+    if (steam::LastSearchSawOwnLobby()) {
+        MPE_LOG_INFO("discovery self test: a Steam search returned this session, so the "
+                    "marker, the filter and the search all work; a friend's game will "
+                    "appear the same way");
+    } else {
+        MPE_LOG_WARN("discovery self test: a Steam search did not return this session. The "
+                    "server browser will be empty for everybody until that is fixed, and "
+                    "it is not a problem with the other player");
+    }
 }
 
 void RefreshLobbyStatus() {
