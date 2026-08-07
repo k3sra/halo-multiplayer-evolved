@@ -274,6 +274,39 @@ struct FriendRowWidgets {
 };
 FriendRowWidgets g_friend_row[kFriendRows];
 
+// --- The loading screen ------------------------------------------------------
+//
+// Its own viewport widget above everything else, because the waits it covers do not all
+// happen on the same screen: accepting an invitation starts from the main menu, starting a
+// match starts from the lobby, and loading a map takes both of them away.
+std::uintptr_t g_loading_host   = 0;
+std::uintptr_t g_loading_scaler = 0;
+std::uintptr_t g_loading_root   = 0;
+bool           g_loading_open   = false;
+
+std::uintptr_t g_loading_title   = 0;
+std::uintptr_t g_loading_percent = 0;
+std::uintptr_t g_loading_detail  = 0;
+std::uintptr_t g_loading_elapsed = 0;
+/// The bar. The fill's slot is what carries the value, and the sweep's slot is what carries
+/// the fact that there is no value to carry.
+std::uintptr_t g_loading_fill      = 0;
+std::uintptr_t g_loading_fill_slot = 0;
+std::uintptr_t g_loading_sweep      = 0;
+std::uintptr_t g_loading_sweep_slot = 0;
+/// One marker and one label per stage, so the four waits read as a route rather than as
+/// four unrelated screens that happen to look alike.
+constexpr std::size_t kLoadingStages = 4;
+std::uintptr_t g_loading_step_bar[kLoadingStages]   = {0, 0, 0, 0};
+std::uintptr_t g_loading_step_label[kLoadingStages] = {0, 0, 0, 0};
+std::uintptr_t g_loading_cancel = 0;
+
+/// The bar's geometry, shared by the track, the fill and the sweep.
+constexpr float kBarX = 474.0F;
+constexpr float kBarY = 512.0F;
+constexpr float kBarW = 972.0F;
+constexpr float kBarH = 14.0F;
+
 /// The invite list's own widgets. Built with the lobby and kept collapsed.
 std::uintptr_t g_invite_panel  = 0; ///< The canvas holding all of it.
 std::uintptr_t g_friend_empty  = 0; ///< Shown when there is nobody to list.
@@ -310,12 +343,17 @@ public:
         return parameters.return_value;
     }
 
-    /// Parents a widget to a canvas and places it.
+    /// Parents a widget to a canvas, places it, and hands back its slot.
     ///
     /// Anchors are left at the default top left, and the position and size are given in
     /// design space; the canvas scales the whole thing to the real viewport.
-    [[nodiscard]] bool Place(std::uintptr_t canvas, std::uintptr_t widget, float x, float y,
-                             float width, float height) const {
+    ///
+    /// The slot is returned because a progress bar is a panel whose width is the value it
+    /// reports, and the slot is where a canvas keeps that width. Everything else discards
+    /// it, since a widget that never moves has no use for it.
+    [[nodiscard]] std::uintptr_t PlaceReturningSlot(std::uintptr_t canvas,
+                                                    std::uintptr_t widget, float x, float y,
+                                                    float width, float height) const {
         struct AddParameters {
             std::uintptr_t content;
             std::uintptr_t return_value;
@@ -324,21 +362,54 @@ public:
         add.content = widget;
         if (!CallFunction(canvas, context_.add_to_canvas, &add).ok() ||
             add.return_value == 0) {
-            return false;
+            return 0;
         }
         const std::uintptr_t slot = add.return_value;
+        SetSlotPosition(slot, x, y);
+        SetSlotSize(slot, width, height);
+        return slot;
+    }
 
+    [[nodiscard]] bool Place(std::uintptr_t canvas, std::uintptr_t widget, float x, float y,
+                             float width, float height) const {
+        return PlaceReturningSlot(canvas, widget, x, y, width, height) != 0;
+    }
+
+    void SetSlotPosition(std::uintptr_t slot, float x, float y) const {
+        if (slot == 0 || context_.set_position == 0) {
+            return;
+        }
         struct VectorParameters {
             Vector2 value;
         };
         VectorParameters position{};
         position.value = {x, y};
         (void)CallFunction(slot, context_.set_position, &position);
+    }
 
+    void SetSlotSize(std::uintptr_t slot, float width, float height) const {
+        if (slot == 0 || context_.set_size == 0) {
+            return;
+        }
+        struct VectorParameters {
+            Vector2 value;
+        };
         VectorParameters size{};
         size.value = {width, height};
         (void)CallFunction(slot, context_.set_size, &size);
-        return true;
+    }
+
+    /// A filled rectangle whose slot is kept, so it can be moved or resized later.
+    [[nodiscard]] std::uintptr_t PanelSlotted(std::uintptr_t canvas, float x, float y,
+                                              float width, float height, LinearColour colour,
+                                              std::uintptr_t& out_slot) const {
+        const std::uintptr_t border = Spawn(context_.border_class);
+        if (border == 0) {
+            return 0;
+        }
+        SetBorderColour(border, colour);
+        out_slot = PlaceReturningSlot(canvas, border, x, y, width, height);
+        return out_slot == 0 ? 0 : border;
     }
 
     /// A filled rectangle, used for panels, bars and slots.
@@ -2528,6 +2599,231 @@ void ForgetStatusOverlay() {
 
 std::uint32_t LobbyBuildId() {
     return g_lobby_build_id;
+}
+
+// --- The loading screen ------------------------------------------------------
+
+bool LoadingOverlayIsBuilt() {
+    return g_loading_host != 0 && g_loading_root != 0;
+}
+
+std::uintptr_t LoadingOverlayWidget() {
+    return g_loading_host;
+}
+
+std::uintptr_t LoadingCancelButton() {
+    return g_loading_cancel;
+}
+
+bool LoadingOverlayIsOpen() {
+    return g_loading_open;
+}
+
+void ForgetLoadingOverlay() {
+    g_loading_host   = 0;
+    g_loading_scaler = 0;
+    g_loading_root   = 0;
+    g_loading_open   = false;
+
+    g_loading_title      = 0;
+    g_loading_percent    = 0;
+    g_loading_detail     = 0;
+    g_loading_elapsed    = 0;
+    g_loading_fill       = 0;
+    g_loading_fill_slot  = 0;
+    g_loading_sweep      = 0;
+    g_loading_sweep_slot = 0;
+    for (std::size_t step = 0; step < kLoadingStages; ++step) {
+        g_loading_step_bar[step]   = 0;
+        g_loading_step_label[step] = 0;
+    }
+}
+
+Result BuildLoadingOverlay(const LobbyUIContext& context) {
+    if (LoadingOverlayIsBuilt()) {
+        return Result::Success();
+    }
+    if (!context.Complete()) {
+        return Result::Fail(ErrorCode::InvalidState, "the lobby UI context is incomplete");
+    }
+
+    const Builder builder(context);
+
+    // Above both the lobby at 1000 and the status overlay at 1001.
+    //
+    // A loading screen that something can be drawn over is not a loading screen. The two
+    // things it has to cover are exactly the two that would otherwise be on top of it: the
+    // lobby it was started from, and the status panel that reports on a session which is in
+    // the middle of changing.
+    const std::uintptr_t root =
+        CreateHostedCanvasAt(context, 1002, g_loading_host, g_loading_scaler);
+    if (root == 0) {
+        return Result::Fail(ErrorCode::InvalidState, "could not host the loading overlay");
+    }
+
+    // Full bleed and nearly opaque. It also swallows every click, which is the point: while
+    // a session is being joined or a match is being started, the lobby underneath is
+    // describing a state that is already gone, and a press landing on it would act on it.
+    (void)builder.Panel(root, 0.0F, 0.0F, kDesignWidth, kDesignHeight, {0, 0, 0, 0.93F});
+
+    // The card. Wide and short, sitting on the horizon rather than filling the screen,
+    // because there is very little to say and a large box with a little in it reads as
+    // something having gone wrong.
+    constexpr float kCardX = 430.0F;
+    constexpr float kCardY = 356.0F;
+    constexpr float kCardW = 1060.0F;
+    constexpr float kCardH = 368.0F;
+    (void)builder.Backer(root, kCardX, kCardY, kCardW, kCardH, kPanel);
+    (void)builder.Panel(root, kCardX, kCardY, 4.0F, kCardH, kAccent);
+
+    // What is happening, and how far through it is. The number is the size it is because it
+    // is the thing a player looks at, and it sits on the same line as the title so the eye
+    // does not have to travel between the two.
+    g_loading_title = builder.Text(root, kBarX, kCardY + 36.0F, 700.0F, 52.0F, "", kAccent,
+                                   38.0F);
+    g_loading_percent =
+        builder.Text(root, 1256.0F, kCardY + 28.0F, 200.0F, 68.0F, "", kText, 54.0F);
+
+    // The running commentary. This is the line that makes the difference between a screen
+    // that is working and a screen that has hung, and it is why every wait below reports
+    // what it is actually doing rather than a stage name repeated.
+    g_loading_detail =
+        builder.Text(root, kBarX, kCardY + 104.0F, 900.0F, 30.0F, "", kTextDim, 20.0F);
+
+    // The bar: a track, a fill whose width is the value, and a sweep that only appears when
+    // there is no value. Three separate widgets rather than one that changes meaning,
+    // because a bar that sometimes reports a fraction and sometimes reports motion has to be
+    // able to be both without either looking like the other.
+    (void)builder.Panel(root, kBarX, kBarY, kBarW, kBarH, {1.0F, 1.0F, 1.0F, 0.08F});
+    g_loading_fill =
+        builder.PanelSlotted(root, kBarX, kBarY, 0.0F, kBarH, kAccent, g_loading_fill_slot);
+    g_loading_sweep = builder.PanelSlotted(root, kBarX, kBarY, 180.0F, kBarH,
+                                           {0.294F, 0.780F, 0.886F, 0.55F},
+                                           g_loading_sweep_slot);
+    builder.SetVisibilityOf(g_loading_sweep, kCollapsedValue);
+
+    // The four waits, as a route. Somebody watching this wants to know not only what is
+    // happening but how much of it there is left, and four labelled steps answer that
+    // without a sentence.
+    static constexpr const char* kStepNames[kLoadingStages] = {
+        "JOINING LOBBY", "STARTING SESSION", "LOADING MAP", "WAITING FOR PLAYERS"};
+    for (std::size_t step = 0; step < kLoadingStages; ++step) {
+        const float x = kBarX + static_cast<float>(step) * 246.0F;
+        g_loading_step_bar[step] = builder.Panel(root, x, kBarY + 38.0F, 226.0F, 3.0F,
+                                                 {1.0F, 1.0F, 1.0F, 0.10F});
+        g_loading_step_label[step] =
+            builder.Text(root, x, kBarY + 48.0F, 226.0F, 22.0F, kStepNames[step], kTextDim,
+                         14.0F);
+        builder.SetVisibilityOf(g_loading_step_label[step], kHitTestInvisible);
+    }
+
+    // The one number that is always true, whatever else the screen can or cannot measure.
+    g_loading_elapsed =
+        builder.Text(root, 1256.0F, kCardY + 268.0F, 200.0F, 30.0F, "", kTextDim, 22.0F);
+
+    for (const std::uintptr_t block :
+         {g_loading_title, g_loading_percent, g_loading_detail, g_loading_elapsed}) {
+        builder.SetVisibilityOf(block, kHitTestInvisible);
+    }
+
+    // A way out. Waiting on a machine that is never going to answer is the failure this
+    // whole screen exists to make visible, and a visible failure with no exit is worse than
+    // no screen at all.
+    g_loading_cancel = builder.Button(root, kBarX, kCardY + 258.0F, 300.0F, 64.0F, "CANCEL");
+
+    g_loading_root = root;
+    SetWidgetVisibility(context, g_loading_host, kCollapsedValue);
+    g_loading_open = false;
+    MPE_LOG_INFO("loading overlay built at 0x{:X}", root);
+    return Result::Success();
+}
+
+void ShowLoadingOverlay(const LobbyUIContext& context, bool visible) {
+    if (g_loading_host == 0) {
+        return;
+    }
+    // Visible rather than SelfHitTestInvisible, unlike every other overlay here: this one
+    // is meant to swallow clicks. The screen behind it describes a session that is in the
+    // middle of becoming something else, and a press landing on it would act on the old one.
+    SetWidgetVisibility(context, g_loading_host, visible ? kVisible : kCollapsedValue);
+    g_loading_open = visible;
+}
+
+void SetLoadingView(const LobbyUIContext& context, const LoadingView& view) {
+    if (!LoadingOverlayIsBuilt()) {
+        return;
+    }
+    const Builder builder(context);
+
+    static constexpr const char* kTitles[] = {"", "JOINING LOBBY", "STARTING SESSION",
+                                              "LOADING MAP", "WAITING FOR PLAYERS"};
+    const auto stage_index = static_cast<std::size_t>(view.stage);
+
+    // Three dots that cycle, on the title.
+    //
+    // The cheapest possible proof that the mod is still running. Everything else on this
+    // screen can legitimately stand still for a long time, and a screen where nothing at all
+    // moves is one a player is right to think has hung.
+    const int    dots = static_cast<int>((view.frame / 4) % 4);
+    std::string  title(kTitles[stage_index < std::size(kTitles) ? stage_index : 0]);
+    title.append(static_cast<std::size_t>(dots), '.');
+    builder.SetTextLive(g_loading_title, title);
+
+    const int clamped = view.percent < 0 ? 0 : (view.percent > 100 ? 100 : view.percent);
+    const std::string clock = std::format("{:02}:{:02}", view.elapsed_seconds / 60,
+                                          view.elapsed_seconds % 60);
+
+    // The large readout is whichever number is actually true right now.
+    //
+    // While there is a fraction to report it is the percentage, because that is what
+    // somebody waiting wants. While there is not, it is the elapsed time, because a
+    // percentage that has not moved for two minutes is the exact thing this screen exists to
+    // avoid, and a made up one is worse: a player reads it as a promise. The clock always
+    // moves and is never wrong.
+    builder.SetTextLive(g_loading_percent,
+                        view.indeterminate ? clock : std::format("{}%", clamped));
+    builder.SetTextLive(g_loading_detail, view.detail);
+    builder.SetTextLive(g_loading_elapsed, view.indeterminate ? std::string{} : clock);
+
+    builder.SetSlotSize(g_loading_fill_slot,
+                        kBarW * static_cast<float>(clamped) / 100.0F, kBarH);
+
+    // The sweep runs only while there is nothing to measure, and it starts off the left
+    // edge and ends off the right so it enters and leaves rather than appearing and
+    // vanishing at the ends of the track.
+    if (view.indeterminate) {
+        constexpr float kSweepW = 180.0F;
+        const float     span    = kBarW + kSweepW;
+        const float     offset  = static_cast<float>((view.frame * 14U) % static_cast<unsigned>(span));
+        const float     left    = kBarX - kSweepW + offset;
+        const float     visible_left  = left < kBarX ? kBarX : left;
+        const float     visible_right = (left + kSweepW) > (kBarX + kBarW) ? kBarX + kBarW
+                                                                           : left + kSweepW;
+        builder.SetVisibilityOf(g_loading_sweep, kHitTestInvisible);
+        builder.SetSlotPosition(g_loading_sweep_slot, visible_left, kBarY);
+        builder.SetSlotSize(g_loading_sweep_slot,
+                            visible_right > visible_left ? visible_right - visible_left : 0.0F,
+                            kBarH);
+    } else {
+        builder.SetVisibilityOf(g_loading_sweep, kCollapsedValue);
+    }
+
+    // Done, doing, and still to come. Three states rather than two, because "which one am I
+    // on" and "how many are left" are different questions and a player waiting asks both.
+    for (std::size_t step = 0; step < kLoadingStages; ++step) {
+        const std::size_t number = step + 1; // Stage None is zero.
+        const bool        done   = stage_index > number;
+        const bool        active = stage_index == number;
+        builder.SetBorderColour(g_loading_step_bar[step],
+                                active ? kAccent
+                                : done ? kAccentDim
+                                       : LinearColour{1.0F, 1.0F, 1.0F, 0.10F});
+        builder.SetColourLive(g_loading_step_label[step],
+                              active ? kText : (done ? kTextDim : LinearColour{0.35F, 0.39F,
+                                                                                0.41F, 1.0F}));
+    }
+
+    builder.SetControlEnabled(g_loading_cancel, view.cancellable);
 }
 
 Result BuildStatusOverlay(const LobbyUIContext& context) {

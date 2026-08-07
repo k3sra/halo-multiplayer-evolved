@@ -211,6 +211,10 @@ void CheckOwnSessionIsFindable();
 void RefreshLobbyAuthority();
 void PrepareLobby();
 void PrepareStatusOverlay();
+void PrepareLoadingOverlay();
+void RegisterLoadingCancel();
+void RefreshLoadingScreen();
+void OnCancelLoading();
 void InviteFriendAt(int row);
 void CloseInviteList();
 void PageFriendList(int direction);
@@ -824,6 +828,21 @@ void TickLoop() {
         // they share a virtual table with exists, and that is established last.
         PrepareStatusOverlay();
         PrepareLobby();
+        PrepareLoadingOverlay();
+        RegisterLoadingCancel();
+
+        // Twelve and a half times a second, which is enough for the dots to read as a cycle
+        // and the sweep as motion. Sixty would be smoother and would cost sixty game thread
+        // round trips a second to animate three widgets, which is not a trade worth making
+        // while the machine is loading a level.
+        {
+            static auto s_last_frame = std::chrono::steady_clock::time_point{};
+            const auto  now          = std::chrono::steady_clock::now();
+            if (now - s_last_frame >= std::chrono::milliseconds(80)) {
+                s_last_frame = now;
+                RefreshLoadingScreen();
+            }
+        }
 
         // Kept current while a session is up: the name, mode and map a player picks have to
         // reach the lobby's metadata or nobody browsing can tell one game from another.
@@ -1059,6 +1078,9 @@ void TickLoop() {
                     break;
                 case unreal::LobbyAction::FriendsNext:
                     PageFriendList(1);
+                    break;
+                case unreal::LobbyAction::CancelLoading:
+                    OnCancelLoading();
                     break;
             }
         }
@@ -3366,6 +3388,250 @@ void MaintainMainMenuButton() {
             }
         }
     }
+}
+
+// --- The loading screen ------------------------------------------------------
+//
+// WHAT THE PERCENTAGE MEANS
+//
+// Every number this reports is measured. Nothing on this screen is a curve chosen to look
+// like progress, because a player reads a percentage as a promise and a made up one is
+// worse than none at all.
+//
+// The wait is divided into bands, and each band is filled from something real:
+//
+//   JOINING LOBBY       0..30   which of three connection steps has completed
+//   STARTING SESSION   30..55   how much of the countdown has elapsed
+//   LOADING MAP        55..75   nothing; the engine reports no fraction, so this one is
+//                               honestly indeterminate and says so
+//   WAITING FOR PLAYERS 75..100 how many peers have reported their load finished
+//
+// The bands are what keep the bar moving forward rather than restarting at every stage, and
+// they are why the screen can be truthful about the one step it cannot measure without the
+// whole thing looking broken.
+//
+// The step nobody can measure is the engine's own load. Its campaign entry point commits to
+// the load and returns, reporting nothing further; there is no fraction to read. That is
+// exactly the case an indeterminate bar exists for, so the bar sweeps, the large readout
+// becomes the elapsed time, and the line underneath says what the game is doing. The screen
+// is never silent and never claims to know something it does not.
+
+/// When the current wait started, for the elapsed clock.
+std::chrono::steady_clock::time_point g_loading_since{};
+unreal::LoadingStage                  g_loading_stage = unreal::LoadingStage::None;
+std::uint32_t                         g_loading_frame = 0;
+
+/// Builds the loading screen once, and again if its menu was collected under it.
+void PrepareLoadingOverlay() {
+    if (!g_lobby_ui_ready || g_live_menu == 0) {
+        return;
+    }
+    if (unreal::LoadingOverlayIsBuilt()) {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->objects.has_value()) {
+            return;
+        }
+        if (g_state->objects->ClassOf(unreal::LoadingOverlayWidget()) != 0) {
+            return; // Still there.
+        }
+        MPE_LOG_INFO("the loading overlay was collected with its menu; building it again");
+        unreal::ForgetLoadingOverlay();
+    }
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    Result outcome = Result::Success();
+    (void)unreal::RunOnGameThread([&]() { outcome = unreal::BuildLoadingOverlay(ui); }, 10000);
+    if (!outcome.ok()) {
+        static bool s_complained = false;
+        if (!s_complained) {
+            s_complained = true;
+            MPE_LOG_WARN("the loading overlay could not be built: {}", outcome.message());
+        }
+    }
+}
+
+/// Makes the loading screen's CANCEL answer the mouse.
+///
+/// Separate from the lobby's own controls because the two are rebuilt on different
+/// schedules: forgetting the watched widgets before a lobby rebuild drops this one too, so
+/// it is put back rather than registered once and assumed.
+void RegisterLoadingCancel() {
+    const std::uintptr_t cancel = unreal::LoadingCancelButton();
+    if (cancel == 0) {
+        return;
+    }
+    for (const unreal::LobbyControl& control : g_lobby_controls) {
+        if (control.widget == cancel) {
+            return;
+        }
+    }
+    if (!unreal::AlsoWatchWidget(cancel).ok()) {
+        return;
+    }
+    g_lobby_controls.push_back({cancel, unreal::LobbyAction::CancelLoading, 0});
+}
+
+/// Works out what the loading screen should say, from the session and nothing else.
+[[nodiscard]] bool DescribeLoading(unreal::LoadingView& out_view) {
+    lobby::LobbyPhase phase = lobby::LobbyPhase::Idle;
+    std::uint8_t      countdown = 0;
+    std::size_t       loaded = 0;
+    std::size_t       total = 0;
+    std::string       still_loading;
+    std::uint8_t      countdown_total = 5;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            return false;
+        }
+        const lobby::LobbySnapshot& snapshot = g_state->manager->Snapshot();
+        phase     = snapshot.phase;
+        countdown = snapshot.countdown_seconds;
+        total     = snapshot.players.size();
+        for (const lobby::PlayerSlot& player : snapshot.players) {
+            if (player.load_progress >= 1.0F) {
+                ++loaded;
+            } else if (still_loading.empty()) {
+                still_loading = player.display_name;
+            }
+        }
+    }
+
+    // Joining is three connection steps, in order, and each one is a thing that either has
+    // happened or has not. That is a real fraction over three, not a guess.
+    const auto joining = [&out_view](int step, std::string_view detail) {
+        out_view.stage   = unreal::LoadingStage::JoiningLobby;
+        out_view.percent = lobby::LoadingPercent(lobby::LoadingStep::JoiningLobby, step, 3);
+        out_view.detail  = detail;
+    };
+
+    switch (phase) {
+        case lobby::LobbyPhase::Joining:
+            joining(1, "Entering the Steam lobby.");
+            break;
+        case lobby::LobbyPhase::Connecting:
+            joining(2, "Opening a relay connection to the host. No ports are involved; "
+                       "Steam routes this.");
+            break;
+        case lobby::LobbyPhase::Handshaking:
+            joining(3, "Waiting for the host to accept and send the roster.");
+            break;
+
+        case lobby::LobbyPhase::Countdown: {
+            // A real fraction: the countdown is a timer this machine can see running.
+            const int remaining = countdown;
+            const int elapsed   = countdown_total > remaining ? countdown_total - remaining : 0;
+            out_view.stage      = unreal::LoadingStage::StartingSession;
+            out_view.percent    = lobby::LoadingPercent(lobby::LoadingStep::StartingSession,
+                                                        elapsed, countdown_total);
+            out_view.detail     = remaining > 0
+                                      ? std::format("Everyone starts together in {}.", remaining)
+                                      : std::string("Telling every player to load.");
+            break;
+        }
+
+        case lobby::LobbyPhase::Loading:
+            if (total > 0 && loaded < total) {
+                // Also a real fraction, and the one that actually decides when the match
+                // begins: nobody is released until every machine has reported.
+                out_view.stage   = unreal::LoadingStage::WaitingForPlayers;
+                out_view.percent = lobby::LoadingPercent(lobby::LoadingStep::WaitingForPlayers,
+                                                         static_cast<int>(loaded),
+                                                         static_cast<int>(total));
+                out_view.detail =
+                    still_loading.empty()
+                        ? std::format("{} of {} players have finished loading.", loaded, total)
+                        : std::format("{} of {} players have finished loading. Waiting on {}.",
+                                      loaded, total,
+                                      text::CleanDisplayName(still_loading, 24));
+            } else {
+                // The one step with no fraction to report. Said plainly rather than
+                // decorated with a number nobody can stand behind.
+                out_view.stage         = unreal::LoadingStage::LoadingMap;
+                out_view.percent = lobby::LoadingPercent(lobby::LoadingStep::LoadingMap, 0, 0);
+                out_view.indeterminate = true;
+                out_view.detail        = "Building shaders and streaming the level. The first "
+                                         "run on a map is the slowest one.";
+            }
+            // Cancelling here would leave the engine loading a map with no session behind
+            // it, which is a worse place to be than waiting.
+            out_view.cancellable = false;
+            break;
+
+        default:
+            return false; // Nothing worth covering the screen for.
+    }
+    return true;
+}
+
+/// Drives the loading screen. Called from the tick at the animation rate.
+void RefreshLoadingScreen() {
+    if (!g_lobby_ui_ready || !unreal::LoadingOverlayIsBuilt()) {
+        return;
+    }
+
+    unreal::LoadingView view;
+    const bool          wanted = DescribeLoading(view);
+    const auto          now    = std::chrono::steady_clock::now();
+
+    if (!wanted) {
+        if (unreal::LoadingOverlayIsOpen()) {
+            unreal::LobbyUIContext ui = g_lobby_ui;
+            if (unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+                (void)unreal::RunOnGameThread(
+                    [&]() { unreal::ShowLoadingOverlay(ui, false); }, 5000);
+            }
+            MPE_LOG_INFO("loading screen closed after {}s",
+                        std::chrono::duration_cast<std::chrono::seconds>(now - g_loading_since)
+                            .count());
+        }
+        g_loading_stage = unreal::LoadingStage::None;
+        return;
+    }
+
+    // The clock restarts when the stage does, because a player watching WAITING FOR PLAYERS
+    // wants to know how long that has been going, not how long ago they pressed a button.
+    const bool opening = !unreal::LoadingOverlayIsOpen();
+    if (opening || view.stage != g_loading_stage) {
+        g_loading_since = now;
+        g_loading_stage = view.stage;
+    }
+    view.elapsed_seconds = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - g_loading_since).count());
+    view.frame = ++g_loading_frame;
+
+    unreal::LobbyUIContext ui = g_lobby_ui;
+    if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
+        return;
+    }
+    (void)unreal::RunOnGameThread(
+        [&]() {
+            unreal::SetLoadingView(ui, view);
+            if (opening) {
+                unreal::ShowLoadingOverlay(ui, true);
+            }
+        },
+        5000);
+    if (opening) {
+        MPE_LOG_INFO("loading screen open: stage {}, {}%", static_cast<int>(view.stage),
+                    view.percent);
+    }
+}
+
+/// Abandons whatever the loading screen is waiting for.
+void OnCancelLoading() {
+    MPE_LOG_INFO("the player cancelled the wait");
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (g_state && g_state->manager) {
+            g_state->manager->LeaveSession();
+        }
+    }
+    ShowSessionNotice("CANCELLED", "You left before it finished. Nothing was started.");
+    EnsureSessionHosted();
 }
 
 /// Polls every watched field and logs transitions.

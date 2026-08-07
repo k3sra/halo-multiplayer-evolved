@@ -118,6 +118,54 @@ enum class LobbyAction {
     /// Pages the invite list, for a friends list longer than one screen.
     FriendsPrevious,
     FriendsNext,
+    /// Abandons whatever the loading screen is waiting for.
+    CancelLoading,
+};
+
+/// Which of the four waits the player is in.
+///
+/// Named after what is actually happening rather than after a phase, because the phase is
+/// the mod's word for it and these are the player's: joining somebody, starting a match,
+/// loading the map, waiting for the others to finish loading theirs.
+enum class LoadingStage : std::uint8_t {
+    None = 0,
+    JoiningLobby,
+    StartingSession,
+    LoadingMap,
+    WaitingForPlayers,
+};
+
+/// Everything the loading screen shows.
+struct LoadingView {
+    LoadingStage stage{LoadingStage::None};
+
+    /// Zero to a hundred, across the whole wait rather than within one step.
+    ///
+    /// Each stage owns a band of the bar and fills its own band from a real measurement:
+    /// how many of the three connection steps are done, how much of the countdown is left,
+    /// how many peers have finished loading. The bands are what keep it moving forward
+    /// instead of restarting at every stage.
+    int percent{0};
+
+    /// True while the length of the current step genuinely cannot be known.
+    ///
+    /// Loading the map is the case. The engine's campaign entry point commits to the load
+    /// and returns; it reports no fraction, and inventing a curve for it would be a number
+    /// the player could read as a promise. An indeterminate bar is the honest signal for
+    /// working with no end in sight, and it is what every other program uses for it.
+    bool indeterminate{false};
+
+    /// The live line under the bar, saying what is happening at this moment.
+    std::string detail;
+
+    /// How long this wait has been going, which is the one number that is always true.
+    int elapsed_seconds{0};
+
+    /// Advances once per animation tick, so the screen animates without keeping a clock.
+    std::uint32_t frame{0};
+
+    /// False once cancelling would leave the session in a worse state than waiting.
+    bool cancellable{true};
 };
 
 /// One row in the invite list.
@@ -447,6 +495,37 @@ struct LobbyStatus {
 
 /// Rewrites the status panel in place. Must run on the game thread.
 void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status);
+
+/// Builds the loading screen. Safe to call repeatedly; it builds once.
+///
+/// Its own viewport widget above the lobby's and the status overlay's, because it has to
+/// cover whatever is behind it: joining somebody happens from the main menu as often as
+/// from the lobby. Must run on the game thread.
+[[nodiscard]] Result BuildLoadingOverlay(const LobbyUIContext& context);
+
+/// True once the loading screen exists and can simply be shown.
+[[nodiscard]] bool LoadingOverlayIsBuilt();
+
+/// The widget the viewport holds it in, so a caller can check it still exists.
+[[nodiscard]] std::uintptr_t LoadingOverlayWidget();
+
+/// Drops every handle without touching them, for when the objects have been collected.
+void ForgetLoadingOverlay();
+
+/// Puts the loading screen up or takes it down. Must run on the game thread.
+void ShowLoadingOverlay(const LobbyUIContext& context, bool visible);
+
+/// True while it is up.
+[[nodiscard]] bool LoadingOverlayIsOpen();
+
+/// Rewrites it in place. Must run on the game thread.
+void SetLoadingView(const LobbyUIContext& context, const LoadingView& view);
+
+/// The CANCEL button, so the caller can make it live and map a press to an action.
+///
+/// It is not part of the lobby's control list because the loading screen outlives the lobby
+/// and is rebuilt on its own schedule, so the caller registers it separately.
+[[nodiscard]] std::uintptr_t LoadingCancelButton();
 
 /// Builds the status overlay, which is separate from the lobby and outlives it.
 ///
