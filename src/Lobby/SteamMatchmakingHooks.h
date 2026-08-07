@@ -167,6 +167,23 @@ private:
     /// stuck on Joining with nothing to time it out.
     LobbyId requested_lobby_{0};
 
+    /// True once entry into current_lobby_ has been reported to the observer.
+    ///
+    /// Entry is both observed directly and delivered by Steam's own callback, so it is
+    /// noticed twice by design: reading it is fast and being told is reliable. Reporting it
+    /// twice is not, because the observer runs the whole entry path again and connects a
+    /// transport that already has an attempt in flight, which fails and faults the session.
+    bool entry_delivered_{false};
+
+    /// How long a create or join may go unanswered before it is abandoned.
+    static constexpr int kOperationTimeoutSeconds = 20;
+
+    /// When the outstanding operation started, for that timeout.
+    std::chrono::steady_clock::time_point operation_started_{};
+
+    /// Releases an operation that never answered, so later ones are not refused.
+    void AbandonStalledOperation(ILobbyBackendObserver& observer);
+
     /// Detects a completed entry by reading the lobby's member list.
     ///
     /// Inside the game the host application owns the Steam callback pump, so waiting to be

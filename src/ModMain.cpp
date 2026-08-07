@@ -318,7 +318,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.1";
+constexpr const char* kModVersion = "0.2.2";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -866,6 +866,26 @@ void TickLoop() {
         // being created a beat after the panel opens, and this is what stops the line saying
         // the session is being prepared once it is not.
         RefreshInvitePanelState();
+
+        // Hosting is retried, not attempted once and given up on.
+        //
+        // EnsureSessionHosted ran only when the player did something: opening the screen,
+        // pressing a slot. If that one attempt failed, and it can, because Steam rate limits
+        // lobby creation and refuses one while another is outstanding, nothing ever tried
+        // again. The screen then said OFFLINE for the rest of the session, and going back to
+        // the menu and returning did not help, because that is the same single attempt
+        // happening once more against the same refusal.
+        //
+        // Every three seconds while the multiplayer screen is open and there is no session.
+        // Idempotent by construction: it returns immediately unless the phase is Idle.
+        if (unreal::OpenLobbyFrame() != 0 && unreal::LobbyIsBuilt()) {
+            static auto s_last_host_try = std::chrono::steady_clock::time_point{};
+            const auto  now             = std::chrono::steady_clock::now();
+            if (now - s_last_host_try >= std::chrono::seconds(3)) {
+                s_last_host_try = now;
+                EnsureSessionHosted();
+            }
+        }
 
         RefreshLobbyStatus();
         CheckOwnSessionIsFindable();
@@ -2110,13 +2130,18 @@ void RefreshLobbyAuthority() {
     }
 
     // The server name is lobby metadata rather than a match setting, because it names the
-    // session rather than the rules. A guest reads the host's out of the lobby it joined;
-    // a host is left alone, since the field is the one they are typing into.
+    // session rather than the rules. A guest reads the host's out of the lobby it joined.
+    //
+    // A host gets their own back. Not doing so left the last host's name sitting in the
+    // field after leaving their session, where this machine read it back as its own the
+    // next time it hosted and advertised somebody else's name to the whole browser.
     if (!is_host && lobby != 0) {
         if (const char* const advertised = steam::GetLobbyData(lobby, "name");
             advertised != nullptr) {
             settings.server_name = advertised;
         }
+    } else if (is_host) {
+        settings.server_name = g_lobby.server_name;
     }
 
     // Only when something changed, so this costs one comparison a tick while nobody is
