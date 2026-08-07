@@ -91,6 +91,7 @@ set SOURCES=^
  "%ROOT%src\Net\PacketProtocol.cpp"^
  "%ROOT%src\Net\SteamSocketsTransport.cpp"^
  "%ROOT%src\Lobby\SteamMatchmakingHooks.cpp"^
+ "%ROOT%src\Lobby\Discovery.cpp"^
  "%ROOT%src\Lobby\LobbyManager.cpp"^
  "%ROOT%src\Map\MapVariant.cpp"^
  "%ROOT%src\Map\MapVariantParser.cpp"^
