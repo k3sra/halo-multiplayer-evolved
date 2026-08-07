@@ -576,6 +576,66 @@ void InviteListPaging() {
     Check(StepFriendPage(0, -1, 0, rows) == 0, "an empty list does not move either");
 }
 
+
+void PingReachesTheGuest() {
+    std::printf("a round trip reaching the guest's panel\n");
+
+    Pair pair;
+    (void)pair.host.HostSession(DefaultHost());
+    pair.host_backend.RaiseCreated(77);
+    pair.Pump();
+    (void)pair.client.JoinSession(77);
+    pair.client_backend.RaiseEntered(77, false);
+    pair.host_transport.ConnectTo(pair.client_transport, static_cast<PeerHandle>(1),
+                                  static_cast<PeerHandle>(1));
+    pair.host_transport.AnnounceConnect();
+    pair.client_transport.AnnounceConnect();
+    pair.Pump(24);
+
+    // Only the host measures. The guest is told its own round trip by the roster, which is
+    // the same measurement seen from the other end, and that is what the status panel
+    // reports. Without this the panel would have nothing to show on the side that most
+    // wants to know.
+    pair.host_transport.SetPing(137);
+    pair.Pump(200); // The roster goes out once a second.
+
+    std::uint16_t guest_ping = 0;
+    for (const PlayerSlot& player : pair.client.Snapshot().players) {
+        if (!player.is_host) {
+            guest_ping = player.ping_milliseconds;
+        }
+    }
+    Check(guest_ping == 137, "the guest is told the round trip the host measured");
+}
+
+void PingBands() {
+    std::printf("how a round trip is coloured\n");
+
+    Check(BandForPing(-1) == PingBand::Unknown, "no connection has no colour");
+    Check(BandForPing(0) == PingBand::Good, "zero is good");
+    Check(BandForPing(99) == PingBand::Good, "ninety nine is good");
+    Check(BandForPing(100) == PingBand::Good, "a hundred is still good");
+    Check(BandForPing(101) == PingBand::Fair, "a hundred and one is fair");
+    Check(BandForPing(150) == PingBand::Fair, "a hundred and fifty is fair");
+    Check(BandForPing(151) == PingBand::Poor, "a hundred and fifty one is poor");
+    Check(BandForPing(9999) == PingBand::Poor, "and anything worse stays poor");
+}
+
+void FaultCountdown() {
+    std::printf("how long a failure stays on screen\n");
+
+    constexpr std::int64_t linger = 10000;
+
+    Check(JudgeFault(0, linger).seconds_remaining == 10, "it starts at ten, not nine");
+    Check(!JudgeFault(0, linger).recover_now, "and does not act immediately");
+    Check(JudgeFault(5000, linger).seconds_remaining == 5, "it counts down");
+    Check(JudgeFault(9001, linger).seconds_remaining == 1,
+          "it reaches one rather than showing a zero that sits there");
+    Check(JudgeFault(10000, linger).recover_now, "at the end it recovers");
+    Check(JudgeFault(20000, linger).recover_now, "and stays recovered past the end");
+    Check(JudgeFault(0, 0).recover_now, "a zero linger recovers at once");
+}
+
 } // namespace
 
 int main() {
@@ -587,6 +647,9 @@ int main() {
     HostLeavingFaultsTheGuest();
     BrowserDecisions();
     InviteListPaging();
+    PingReachesTheGuest();
+    PingBands();
+    FaultCountdown();
 
     std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASSED" : "FAILED", g_failures);
     return g_failures == 0 ? 0 : 1;
