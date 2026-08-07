@@ -7,7 +7,7 @@
 
 **The multiplayer Halo: Campaign Evolved should have shipped with.**
 
-[![Version](https://img.shields.io/badge/version-0.2.2-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.2.3-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Download](https://img.shields.io/badge/download-latest%20release-2ea44f?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Licence](https://img.shields.io/badge/licence-MIT-blue?style=for-the-badge)](LICENSE)
 
@@ -137,8 +137,23 @@ What works today, honestly. Anything not yet tested says so.
 
 **Not done yet**
 
+- **Seeing each other in the match.** Both players load the same scenario at the
+  same moment, on the same seed, and that part works. Nothing about the players
+  is sent between machines once they are in it, so you each play your own copy.
+  This is the next major piece of work and it is a large one
 - Slayer and CTF scoring
 - The original multiplayer maps
+
+### While this is being tested
+
+This build writes a detailed log on every machine, so a problem that needs two
+people can be diagnosed from what was recorded rather than from what anyone
+remembers. The file is  in the folder you installed
+into, and the previous run is kept beside it.
+
+Nothing is sent anywhere. The file stays on your machine and it is your choice
+whether to attach it to an issue. If you would rather it stayed brief, put an
+empty file named  in the  folder.
 
 ---
 
