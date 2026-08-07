@@ -89,8 +89,9 @@ imaginative than that.
 | | Goal | State |
 | --- | --- | --- |
 | 1 | Two players in one lobby | Done |
-| 2 | A match both players are in | Built |
-| 2a | Joining a game already in progress | Built |
+| 2 | A match both players are in, on the same map at the same moment | Done |
+| 2a | Seeing each other once you are in it | Next |
+| 2b | Joining a game already in progress | Built |
 | 3 | Slayer and Capture the Flag scoring exactly as they were | Planned |
 | 4 | The original maps: Blood Gulch, Sidewinder, Hang 'Em High, the rest | Planned |
 | 5 | Every original mode: King of the Hill, Oddball, Race, Juggernaut | Planned |
@@ -148,12 +149,12 @@ What works today, honestly. Anything not yet tested says so.
 
 This build writes a detailed log on every machine, so a problem that needs two
 people can be diagnosed from what was recorded rather than from what anyone
-remembers. The file is  in the folder you installed
-into, and the previous run is kept beside it.
+remembers. The file is `MultiplayerEvolved.log` in the folder you installed into,
+and the previous run is kept beside it as `MultiplayerEvolved.previous.log`.
 
 Nothing is sent anywhere. The file stays on your machine and it is your choice
 whether to attach it to an issue. If you would rather it stayed brief, put an
-empty file named  in the  folder.
+empty file named `quiet.on` in the `MultiplayerEvolved` folder.
 
 ---
 
