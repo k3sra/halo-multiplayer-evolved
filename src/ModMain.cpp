@@ -2055,15 +2055,20 @@ void RefreshLobbyStatus() {
         if (s_faulted_at == std::chrono::steady_clock::time_point{}) {
             s_faulted_at = now;
         }
-        const auto elapsed = now - s_faulted_at;
-        if (elapsed >= kFaultLinger) {
+        // The timing lives in Lobby/Discovery, with tests, because waiting ten seconds is
+        // an expensive way to find out that a countdown shows nine or reaches zero and
+        // sits there.
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now - s_faulted_at)
+                                 .count();
+        const lobby::FaultRecovery recovery = lobby::JudgeFault(
+            elapsed,
+            std::chrono::duration_cast<std::chrono::milliseconds>(kFaultLinger).count());
+        if (recovery.recover_now) {
             recover_now = true;
         } else {
-            const auto left = std::chrono::duration_cast<std::chrono::seconds>(
-                                  kFaultLinger - elapsed)
-                                  .count() +
-                              1;
-            session_error += std::format("  Starting your own session in {}s.", left);
+            session_error += std::format("  Starting your own session in {}s.",
+                                         recovery.seconds_remaining);
         }
     } else {
         s_faulted_at = {};

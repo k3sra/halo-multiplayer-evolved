@@ -87,4 +87,37 @@ enum class ListingVerdict : std::uint8_t {
 [[nodiscard]] int StepFriendPage(int page, int direction, std::size_t friend_count,
                                  int rows_per_page) noexcept;
 
+/// How a round trip reads to a player.
+///
+/// The thresholds are what a player feels rather than anything measured: under a hundred
+/// plays like a local game, past a hundred and fifty the shots stop landing where they were
+/// aimed. Named here so the status panel and the server browser cannot drift apart, and so
+/// the boundaries are pinned by a test rather than by whichever of the two was edited last.
+enum class PingBand : std::uint8_t {
+    /// No connection to measure. A session of one has no round trip, and a number invented
+    /// for that case is one a player could act on wrongly.
+    Unknown = 0,
+    Good,      ///< Up to and including 100 ms.
+    Fair,      ///< 101 to 150 ms.
+    Poor,      ///< Above 150 ms.
+};
+
+[[nodiscard]] PingBand BandForPing(int ping_milliseconds) noexcept;
+
+/// What the lobby should do about a session that has failed.
+struct FaultRecovery {
+    /// Whole seconds still to show before recovering. Zero once it is time.
+    int  seconds_remaining{0};
+    /// True when the session should be left and a new one hosted.
+    bool recover_now{false};
+};
+
+/// Decides how long a failure stays on screen and when to replace the session.
+///
+/// The reason is worth reading, so it lingers rather than being cleared instantly, and the
+/// player watches it count down rather than having the screen change under them. Expressed
+/// in milliseconds so it can be checked without waiting.
+[[nodiscard]] FaultRecovery JudgeFault(std::int64_t elapsed_milliseconds,
+                                       std::int64_t linger_milliseconds) noexcept;
+
 } // namespace mpe::lobby
