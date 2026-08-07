@@ -5,6 +5,7 @@
 #include "Steam/SteamApi.h"
 
 #include "Core/Log.h"
+#include "Lobby/Discovery.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -1014,23 +1015,17 @@ std::vector<LobbyListing> BrowseLobbies() {
     int skipped_own      = 0;
     int skipped_unmarked = 0;
 
+    // Read here rather than at each row, and used both to look the value up and to compare
+    // it, so a search and a listing can never disagree about what counts as ours.
+    const std::string marker_key   = g_browse_marker_key;
+    const std::string marker_value = g_browse_marker_value;
+
     // Steam keeps the last result set addressable by index. Reading past the end returns an
     // invalid id, which is the natural place to stop.
     for (int index = 0; index < g_browse_count; ++index) {
         const SteamId lobby = g_binding.mm_GetLobbyByIndex(g_binding.matchmaking, index);
         if (lobby == 0) {
             break;
-        }
-
-        // Never the lobby this player is hosting.
-        //
-        // A host joining their own session would ask Steam to enter a lobby it is already
-        // the owner of, tear down the transport it is listening on, and leave the roster
-        // referring to a player who is both host and client. Simply not listing it is the
-        // only sane answer: there is nothing useful the host could do with the row.
-        if (lobby == CurrentLobby()) {
-            ++skipped_own;
-            continue;
         }
 
         LobbyListing listing;
@@ -1049,26 +1044,32 @@ std::vector<LobbyListing> BrowseLobbies() {
             listing.capacity = g_binding.mm_GetLobbyMemberLimit(g_binding.matchmaking, lobby);
         }
 
-        // Only lobbies this mod advertised are shown. Without a marker the list would
-        // include every unrelated lobby the app has open, the game's own fireteam first
-        // among them.
-        //
-        // The marker is fe.host, which the backend writes to every lobby it creates,
-        // before anyone is told the lobby exists. It used to be a key named
-        // forge_evolved, which nothing has ever written: the project was renamed and the
-        // reader kept the old name while no writer was left to match it. Every lobby
-        // therefore failed this test, and the server browser could not return a row under
-        // any circumstances. It was reported as refreshing many times and never finding a
-        // game, which is exactly what it would do.
         listing.host_id = read("fe.host");
-        if (listing.host_id.empty()) {
-            ++skipped_unmarked;
-            continue;
-        }
-
         // The phase decides whether a row is joinable, not whether it is listed. A game
         // in progress is worth seeing.
         listing.phase = read("fe.phase");
+
+        // The decision itself lives in Lobby/Discovery, with no Steam underneath it, and
+        // is covered by tools/session_check. It used to be written inline here, which made
+        // it untestable for a bad reason: not because it depends on Steam, but because it
+        // was standing next to something that does. It was also wrong, discarding every
+        // lobby on a key that nothing had ever written, and the browser could not return a
+        // row under any circumstance.
+        lobby::RawListing raw;
+        raw.id      = lobby;
+        raw.host_id = listing.host_id;
+        raw.marker  = read(marker_key.empty() ? "mpe.v" : marker_key.c_str());
+
+        const lobby::ListingVerdict verdict =
+            lobby::JudgeListing(raw, CurrentLobby(), marker_value);
+        if (verdict == lobby::ListingVerdict::OwnSession) {
+            ++skipped_own;
+            continue;
+        }
+        if (verdict != lobby::ListingVerdict::Listed) {
+            ++skipped_unmarked;
+            continue;
+        }
 
         g_browse_results.push_back(std::move(listing));
     }

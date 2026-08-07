@@ -40,6 +40,7 @@
 #include "Unreal/LobbyUI.h"
 #include "Update/UpdateCheck.h"
 #include "Engine/InertEngineControl.h"
+#include "Lobby/Discovery.h"
 #include "Lobby/LobbyManager.h"
 #include "Lobby/SteamMatchmakingHooks.h"
 #include "Net/SteamSocketsTransport.h"
@@ -372,15 +373,9 @@ constexpr const char* kDefaultCampaignAsset = "DA_FirstPlayableCampaign";
         entry.capacity = listing.capacity > 0 ? listing.capacity : 10;
         entry.ping     = listing.ping_milliseconds;
 
-        // What the host says it is doing, turned into the two answers a player is choosing
-        // between. Anything the host has not published yet reads as a lobby, because a
-        // session that has just been created is one.
-        if (listing.phase == "in_match" || listing.phase == "loading" ||
-            listing.phase == "countdown") {
-            entry.status = "IN GAME";
-        } else {
-            entry.status = "LOBBY";
-        }
+        // Shared with everything else that has to answer this, and tested, rather than
+        // written out again here.
+        entry.status = lobby::SessionStatusFromPhase(listing.phase);
 
         servers.push_back(std::move(entry));
     }
@@ -1592,23 +1587,22 @@ void CloseInviteList() {
 }
 
 void PageFriendList(int direction) {
-    const int pages = (static_cast<int>(g_friend_list.size()) + unreal::kFriendRows - 1) /
-                      unreal::kFriendRows;
-    if (pages <= 1) {
+    // The arithmetic is in Lobby/Discovery, with tests, because a paging bug has no
+    // visible symptom: it silently invites somebody other than the person pressed.
+    const int stepped = lobby::StepFriendPage(g_friend_page, direction, g_friend_list.size(),
+                                              unreal::kFriendRows);
+    if (stepped == g_friend_page) {
         return;
     }
-    // Wraps rather than stopping at the ends, so paging never leaves a button that looks
-    // pressable and does nothing.
-    g_friend_page = (g_friend_page + direction + pages) % pages;
+    g_friend_page = stepped;
     ShowInviteList(true);
 }
 
 /// Invites the person on one row of the list, and nobody else.
 void InviteFriendAt(int row) {
-    const std::size_t index =
-        static_cast<std::size_t>(g_friend_page) * unreal::kFriendRows +
-        static_cast<std::size_t>(row);
-    if (index >= g_friend_ids.size()) {
+    const std::size_t index = lobby::FriendIndexFor(g_friend_page, row, g_friend_ids.size(),
+                                                    unreal::kFriendRows);
+    if (index == static_cast<std::size_t>(-1)) {
         return;
     }
 
