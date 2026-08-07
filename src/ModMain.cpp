@@ -204,6 +204,8 @@ void CaptureServerName();
 void OpenSessionInvite();
 void RefreshLobbyStatus();
 void ShowSessionNotice(std::string title, std::string detail);
+void ReportLaunchFailure(std::string_view reason);
+void HandleLaunchFailureLocked();
 void CheckOwnSessionIsFindable();
 void RefreshLobbyAuthority();
 void PrepareLobby();
@@ -469,6 +471,56 @@ std::unique_ptr<ModState> g_state;               ///< Guarded by g_state_mutex.
 std::atomic<bool>        g_running{false};
 std::atomic<bool>        g_ready{false};         ///< True once the lobby manager exists.
 
+// --- The engine view, reachable without the state lock -----------------------
+//
+// A second copy of the object array and the reflection, behind a lock of their own.
+//
+// This exists because of exactly one deadlock, and it is worth naming precisely so it is
+// not reintroduced. The tick loop holds g_state_mutex while it calls LobbyManager::Tick.
+// Beginning a match happens inside that tick, and it needs the object array, which lived
+// only inside g_state. Reaching for it therefore meant taking g_state_mutex again: from the
+// same thread if done directly, and from the game thread if done through a dispatched job.
+// The second is what shipped. The game thread blocked on a lock the tick was holding, the
+// tick blocked waiting for the game thread, and the pair sat there for the whole sixty
+// second timeout before the wait gave up and left a job running against a stack frame that
+// had already returned.
+//
+// Both are cheap value types: an address, a couple of counts and a pointer to the name pool,
+// which outlives everything. Copying them is a handful of bytes, and having them behind a
+// lock that is never held across a tick means anything, on any thread, can read them without
+// ordering itself against the lobby.
+std::mutex                         g_engine_view_mutex;
+std::optional<unreal::ObjectArray> g_engine_objects;
+std::optional<unreal::Reflection>  g_engine_reflection;
+
+/// Publishes the object array for anything that needs it without the state lock.
+void PublishEngineObjects(const unreal::ObjectArray& objects) {
+    std::lock_guard lock(g_engine_view_mutex);
+    g_engine_objects = objects;
+}
+
+/// The same for reflection.
+void PublishEngineReflection(const unreal::Reflection& reflection) {
+    std::lock_guard lock(g_engine_view_mutex);
+    g_engine_reflection = reflection;
+}
+
+/// Takes a copy of both, or reports that they are not ready.
+///
+/// Optionals rather than references, because neither type is default constructible: a
+/// Reflection is only meaningful against a name pool, and there is no such thing as one
+/// without.
+[[nodiscard]] bool TakeEngineView(std::optional<unreal::ObjectArray>& out_objects,
+                                  std::optional<unreal::Reflection>&  out_reflection) {
+    std::lock_guard lock(g_engine_view_mutex);
+    if (!g_engine_objects.has_value() || !g_engine_reflection.has_value()) {
+        return false;
+    }
+    out_objects    = g_engine_objects;
+    out_reflection = g_engine_reflection;
+    return true;
+}
+
 /// True from load until teardown begins.
 ///
 /// The adaptive waits use this as their only abort condition: they wait as long as the
@@ -718,6 +770,10 @@ void TickLoop() {
                 // the loading screen blocked. Clamped so timers do not jump and
                 // cancel a countdown that was fine.
                 g_state->manager->Tick(delta > 1.0 ? 1.0 : delta);
+
+                // A launch that failed on the game thread is unwound here, on the thread
+                // that owns the lobby.
+                HandleLaunchFailureLocked();
             } else {
                 last_tick = std::chrono::steady_clock::now();
             }
@@ -1218,6 +1274,9 @@ int LogObjectsMatching(std::string_view fragment, std::size_t limit) {
     // wrong for the rest of the session. Anything this early therefore uses fixed offsets
     // rather than reflected ones.
     g_state->reflection.emplace(*g_state->names);
+
+    PublishEngineObjects(*g_state->objects);
+    PublishEngineReflection(*g_state->reflection);
     return true;
 }
 
@@ -1973,6 +2032,49 @@ void ShowSessionNotice(std::string title, std::string detail) {
     g_notice.title  = std::move(title);
     g_notice.detail = std::move(detail);
     g_notice.until  = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+}
+
+/// Says that a launch this machine had already committed to did not happen.
+///
+/// The campaign call is posted rather than waited on, so its failure arrives after the
+/// lobby has moved on and there is no Result left to return it through. Left unreported it
+/// would be the worst possible outcome: a screen that says the match is loading and a game
+/// that is doing nothing.
+///
+/// Recorded rather than acted on, and this is not fastidiousness. It runs on the game
+/// thread, and LobbyManager is single threaded by construction: the tick thread is very
+/// likely inside Tick on the same object at this moment. Touching the session from here
+/// would be a data race on the state machine that owns the whole session, to report that a
+/// match did not start. The tick picks it up on its next pass, which is within sixteen
+/// milliseconds, on the thread that owns the lobby.
+std::atomic<bool> g_launch_failed{false};
+std::mutex        g_launch_failure_mutex;
+std::string       g_launch_failure_reason;
+
+void ReportLaunchFailure(std::string_view reason) {
+    {
+        std::lock_guard lock(g_launch_failure_mutex);
+        g_launch_failure_reason = std::string(reason);
+    }
+    g_launch_failed.store(true, std::memory_order_release);
+}
+
+/// Acts on a failed launch, on the tick thread. Caller must hold g_state_mutex.
+void HandleLaunchFailureLocked() {
+    if (!g_launch_failed.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::string reason;
+    {
+        std::lock_guard lock(g_launch_failure_mutex);
+        reason = g_launch_failure_reason;
+    }
+    ShowSessionNotice("MATCH DID NOT START", reason);
+    if (g_state && g_state->manager) {
+        // A clean departure, so the next attempt starts from a lobby rather than from
+        // whatever half-launched state this left behind.
+        g_state->manager->LeaveSession();
+    }
 }
 
 void RefreshLobbyStatus() {
@@ -3362,10 +3464,13 @@ void DetectPropertyLayout() {
         return;
     }
 
-    std::lock_guard lock(g_state_mutex);
-    if (g_state) {
-        g_state->reflection = reflection;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (g_state) {
+            g_state->reflection = reflection;
+        }
     }
+    PublishEngineReflection(reflection);
 }
 
 void ResolveUnrealObjects() {
@@ -3452,6 +3557,7 @@ void ResolveUnrealObjects() {
         }
         g_state->objects = objects;
     }
+    PublishEngineObjects(objects);
 
     // Proof, in the log: the first objects in a UE process are always engine
     // intrinsics, so their names and classes are recognizable at a glance.
@@ -3919,28 +4025,44 @@ void Initialize() {
     // The reflection stays on the Unreal side. This hands the engine control a callable
     // and nothing else, so Engine/ still knows nothing about object arrays or the game
     // thread.
+    // Posted, and taking nothing that the tick holds.
+    //
+    // This runs from inside LobbyManager::Tick, which the tick loop calls while holding
+    // g_state_mutex, so the two things this must not do are take that lock and wait.
+    //
+    // It did both. The job reached back for g_state_mutex on the game thread while the tick
+    // loop held it, so the game thread blocked on the lobby and the lobby blocked on the
+    // game thread: sixty seconds of frozen game, and then a wait that gave up and returned
+    // while the job was still holding references into the frame it had just left. The job
+    // wrote its result into those bytes once the lock finally came free, which is the
+    // unhandled exception both machines died with.
+    //
+    // The object array and the reflection now come from the engine view, which has its own
+    // lock and is never held across a tick, and the campaign call is posted rather than
+    // waited on. Beginning a match is a load: nothing useful can be reported back from it
+    // synchronously, and blocking the lobby for the duration stops the keepalives and every
+    // screen update at precisely the moment the other machines are watching for them.
     state->engine = std::make_unique<engine::CampaignEngineControl>(
         [](std::string_view scenario, bool friendly_fire) -> Result {
+            std::optional<unreal::ObjectArray> objects_copy;
+            std::optional<unreal::Reflection>  reflection_copy;
+            if (!TakeEngineView(objects_copy, reflection_copy)) {
+                return Result::Fail(ErrorCode::InvalidState, "UE reflection is not ready yet");
+            }
+
+            // Everything the job needs is copied into it. Nothing is captured by reference,
+            // because nobody is waiting and there is no frame left to refer to.
             const std::string wanted(scenario);
-            Result            outcome = Result::Success();
-            const Result      ran     = unreal::RunOnGameThread(
-                [&]() {
-                    // The lock is taken inside the job rather than around it: the caller
-                    // is the lobby manager, which is already holding nothing, and the game
-                    // thread is where the reflection may be read.
-                    std::lock_guard lock(g_state_mutex);
-                    if (!g_state || !g_state->objects.has_value() ||
-                        !g_state->reflection.has_value()) {
-                        outcome = Result::Fail(ErrorCode::InvalidState,
-                                               "UE reflection is not ready yet");
-                        return;
+            return unreal::PostToGameThread(
+                [objects_copy, reflection_copy, wanted, friendly_fire]() {
+                    const Result began =
+                        unreal::BeginCampaign(*objects_copy, *reflection_copy, wanted,
+                                              kDefaultCampaignAsset, friendly_fire);
+                    if (!began.ok()) {
+                        MPE_LOG_ERROR("beginning the campaign failed: {}", began.message());
+                        ReportLaunchFailure(began.message());
                     }
-                    outcome = unreal::BeginCampaign(*g_state->objects, *g_state->reflection,
-                                                    wanted, kDefaultCampaignAsset,
-                                                    friendly_fire);
-                },
-                60000);
-            return ran.ok() ? outcome : ran;
+                });
         });
 
     // The lobby manager needs both a backend and a transport. Without them the mod
@@ -4076,6 +4198,15 @@ void Initialize() {
 void Shutdown() {
     g_running_or_starting.store(false, std::memory_order_release);
     g_running.store(false, std::memory_order_release);
+
+    // Before the join, not after.
+    //
+    // The tick thread can be sitting in a game thread dispatch, and a job whose deadline has
+    // passed while it is already running is waited on rather than abandoned, because
+    // abandoning it hands a running job a stack frame that has gone. During teardown the
+    // game may never run another frame, so that wait would never end and the join would
+    // never return. Cancelling the queue first releases the waiter.
+    unreal::ShutdownGameThreadDispatch();
     if (g_tick_thread.joinable()) {
         g_tick_thread.join();
     }
