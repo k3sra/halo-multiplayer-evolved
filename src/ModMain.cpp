@@ -317,7 +317,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.1.9";
+constexpr const char* kModVersion = "0.2.0";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -3556,8 +3556,11 @@ void RegisterLoadingCancel() {
                 out_view.detail        = "Building shaders and streaming the level. The first "
                                          "run on a map is the slowest one.";
             }
-            // Cancelling here would leave the engine loading a map with no session behind
-            // it, which is a worse place to be than waiting.
+            // Cancelling is withheld here rather than offered, for a while. The engine has
+            // already been told to load, so leaving now ends the session while the map
+            // carries on arriving, which is a worse place to be than waiting a few more
+            // seconds. RefreshLoadingScreen gives it back once waiting has stopped being
+            // the likely explanation.
             out_view.cancellable = false;
             break;
 
@@ -3602,6 +3605,16 @@ void RefreshLoadingScreen() {
     view.elapsed_seconds = static_cast<int>(
         std::chrono::duration_cast<std::chrono::seconds>(now - g_loading_since).count());
     view.frame = ++g_loading_frame;
+
+    // A modal with no exit is a trap, and this one covers the whole screen and takes every
+    // click. Loading withholds cancelling because leaving mid load is genuinely worse than
+    // waiting, but only while waiting is still the likely explanation. Past half a minute it
+    // is not, and being stuck behind a screen that cannot be dismissed is the worse of the
+    // two outcomes by a wide margin.
+    constexpr int kCancelUnlocksAfterSeconds = 30;
+    if (!view.cancellable && view.elapsed_seconds >= kCancelUnlocksAfterSeconds) {
+        view.cancellable = true;
+    }
 
     unreal::LobbyUIContext ui = g_lobby_ui;
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
