@@ -15,7 +15,11 @@
 namespace mpe::log {
 namespace {
 
-std::mutex        g_mutex;
+std::mutex g_mutex;
+
+/// Notified for every record at or above its threshold. See Log.h for why.
+RecordHook g_record_hook{nullptr};
+Level      g_record_hook_threshold{Level::Error};
 std::FILE*        g_file = nullptr;
 std::atomic<Level> g_min_level{Level::Info};
 std::atomic<bool>  g_initialized{false};
@@ -143,6 +147,12 @@ Level MinLevel() noexcept {
     return g_min_level.load(std::memory_order_acquire);
 }
 
+void SetRecordHook(RecordHook hook, Level threshold) noexcept {
+    std::lock_guard lock(g_mutex);
+    g_record_hook           = hook;
+    g_record_hook_threshold = threshold;
+}
+
 void Write(Level level, std::string_view category, std::string_view message) {
     if (level < MinLevel()) {
         return;
@@ -151,15 +161,27 @@ void Write(Level level, std::string_view category, std::string_view message) {
     const std::string line = std::format("[{}] [{}] [{}] {}\n", Timestamp(),
                                          ToString(level), category, message);
 
-    std::lock_guard lock(g_mutex);
-    if (g_file != nullptr) {
-        std::fwrite(line.data(), 1, line.size(), g_file);
-        // Flushed per line: a crash during engine bring up must not lose the
-        // last entry, which is usually the one that explains the crash.
-        std::fflush(g_file);
+    RecordHook hook = nullptr;
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_file != nullptr) {
+            std::fwrite(line.data(), 1, line.size(), g_file);
+            // Flushed per line: a crash during engine bring up must not lose the
+            // last entry, which is usually the one that explains the crash.
+            std::fflush(g_file);
+        }
+        if (::IsDebuggerPresent() != FALSE) {
+            ::OutputDebugStringA(line.c_str());
+        }
+        if (g_record_hook != nullptr && level >= g_record_hook_threshold) {
+            hook = g_record_hook;
+        }
     }
-    if (::IsDebuggerPresent() != FALSE) {
-        ::OutputDebugStringA(line.c_str());
+
+    // Called with the lock released, so a hook is free to log without deadlocking against
+    // the write that invoked it.
+    if (hook != nullptr) {
+        hook(level, category, message);
     }
 }
 
