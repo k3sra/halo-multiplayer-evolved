@@ -918,12 +918,16 @@ void TickLoop() {
         //
         // Every three seconds while the multiplayer screen is open and there is no session.
         // Idempotent by construction: it returns immediately unless the phase is Idle.
-        if (unreal::OpenLobbyFrame() != 0 && unreal::LobbyIsBuilt()) {
+        {
             static auto s_last_host_try = std::chrono::steady_clock::time_point{};
             const auto  now             = std::chrono::steady_clock::now();
             if (now - s_last_host_try >= std::chrono::seconds(3)) {
                 s_last_host_try = now;
-                EnsureSessionHosted();
+                if (unreal::LobbyIsVisible()) {
+                    EnsureSessionHosted();
+                } else {
+                    CloseIdleSessionAwayFromLobby();
+                }
             }
         }
 
