@@ -36,6 +36,7 @@
 #include "Core/Pacing.h"
 #include "Core/Text.h"
 #include "Debug/AccessTrap.h"
+#include "Debug/LogShare.h"
 #include "Unreal/FNameTrampoline.h"
 #include "Unreal/GameThread.h"
 #include "Unreal/LoadingLines.h"
@@ -1032,6 +1033,10 @@ void TickLoop() {
             }
             if (dump) {
                 CollectDiagnostics();
+                // Sent from the same moments it is collected at, so a report arrives while
+                // the thing it describes is still happening rather than after somebody has
+                // thought to ask for it.
+                debugshare::Queue(std::format("phase {}", lobby::ToString(s_phase)));
             }
         }
 
@@ -2791,6 +2796,15 @@ void RefreshLobbyStatus() {
         status.version = std::format("v{}  UPDATE {} FOUND", kModVersion, latest);
     } else {
         status.version = std::format("v{}  UP TO DATE", kModVersion);
+    }
+
+    // Said on the machine that is doing it.
+    //
+    // Somebody running this should not have to read its source to find out it is sending
+    // their log somewhere. It is on the panel whenever it is on, in the same place the
+    // build number is, for as long as this exists.
+    if (debugshare::SharingEnabled()) {
+        status.version += "  TEST BUILD: SHARING LOGS";
     }
 
     unreal::LobbyUIContext ui = g_lobby_ui;
@@ -4745,6 +4759,15 @@ void Initialize() {
     // two different ones.
     LogMachineIdentity();
 
+    // Log sharing, if this install was set up for it.
+    //
+    // Nothing is sent unless MultiplayerEvolved/report.url exists and holds an https
+    // address, so an install that was never set up for testing behaves exactly as if this
+    // code were not here. Started after the identity is written, so the very first report
+    // already says which machine it came from.
+    debugshare::Start(DataDirectory(),
+                      std::format("{} ({})", SteamPlayerName(), steam::GetLocalSteamId()));
+
     // The FName adapter is written in early, but never called here.
     //
     // Calling it at startup crashed the game, and the reason is visible in the routine it
@@ -4994,6 +5017,11 @@ void Shutdown() {
         }
         g_state.reset();
     }
+
+    // A last report on the way out, then the sender stops. A session that ended badly is
+    // one of the more useful things to have a record of, and the log is complete by now.
+    debugshare::Queue("shutdown");
+    debugshare::Stop();
 
     // Released after the objects that use it, so no callback can be dispatched
     // into freed memory.
