@@ -2484,9 +2484,16 @@ void SetLobbySettings(const LobbyUIContext& context, const LobbySettingsView& se
     // Written into the field rather than beside it, because the field is where a player
     // looks for the name. On a guest it is the host's name, and the field is dimmed and
     // unpressable by the authority pass, so it reads as a value rather than a prompt.
+    //
+    // Cleaned on the way in, for two separate reasons. It is somebody else's name, so it
+    // arrives with whatever they put in it and drew as a row of replacement boxes. And it
+    // is written into a field this machine reads back when it hosts, so an uncleaned one
+    // does not merely look wrong here, it becomes this player's own server name the next
+    // time they host anything.
     if (!settings.server_name.empty() && g_server_name_field != 0) {
         builder.SetTextLiveOn(g_server_name_field, context.set_editable_text,
-                              settings.server_name);
+                              text::CleanDisplayName(settings.server_name,
+                                                     kMaxServerNameLength));
     }
 }
 
