@@ -8,6 +8,7 @@
 #include "Net/PacketProtocol.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <format>
 
@@ -437,18 +438,35 @@ void SteamSocketsTransport::NoticeConnectionStates() {
     }
 
     for (const steam::HSteamNetConnection connection : waiting) {
-        steam::SteamNetConnectionInfo info{};
-        if (!steam::GetConnectionInfo(connection, &info)) {
+        // Room to spare, deliberately.
+        //
+        // SteamNetConnectionInfo_t is not one size. It has grown across Steamworks SDK
+        // versions, this game ships two SDKs side by side, and the struct declared here is
+        // pinned to one of them. Handing a closed binary a pointer and trusting it to write
+        // no more than the size this build happens to believe in is how a caller gets its
+        // own stack overwritten, and this runs on exactly one occasion: while a connection
+        // is still being made. Which is to say, while somebody is joining, which is when a
+        // player reported the crash.
+        //
+        // The fields wanted are near the front and at offsets the SDK has never moved, so a
+        // buffer several times the largest plausible size costs nothing and removes the
+        // whole question.
+        alignas(16) std::byte scratch[2048]{};
+        static_assert(sizeof(steam::SteamNetConnectionInfo) <= sizeof(scratch),
+                      "the scratch buffer must be able to hold the struct this build knows");
+        auto* const info = reinterpret_cast<steam::SteamNetConnectionInfo*>(scratch);
+
+        if (!steam::GetConnectionInfo(connection, info)) {
             continue;
         }
-        if (info.m_eState != steam::ESteamNetworkingConnectionState::Connected) {
+        if (info->m_eState != steam::ESteamNetworkingConnectionState::Connected) {
             continue;
         }
         PendingStatusChange change{};
         change.connection         = connection;
-        change.state              = info.m_eState;
+        change.state              = info->m_eState;
         change.inbound            = false;
-        change.remote_platform_id = info.m_identityRemote.m_steamID64;
+        change.remote_platform_id = info->m_identityRemote.m_steamID64;
         std::lock_guard lock(queue_mutex_);
         pending_.push_back(change);
     }
