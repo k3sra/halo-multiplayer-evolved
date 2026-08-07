@@ -17,3 +17,8 @@ build_clean.txt
 *.user
 Thumbs.db
 desktop.ini
+
+# The log collector address. Kept out of the repo on purpose: this repo is public,
+# and the address is both readable by anyone who finds it and floodable by anyone who
+# wants to push the testers own reports out of a free tier.
+testing/
