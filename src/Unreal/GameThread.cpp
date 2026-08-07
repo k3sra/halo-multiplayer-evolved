@@ -5,6 +5,7 @@
 #include "Unreal/GameThread.h"
 
 #include "Core/Log.h"
+#include "Core/Text.h"
 #include "Debug/AccessTrap.h"
 #include "Unreal/FNameTrampoline.h"
 #include "Unreal/ProcessMemory.h"
@@ -630,11 +631,7 @@ Result Travel(const ObjectArray& objects, std::string_view url, std::uint8_t tra
     static_assert(offsetof(Parameters, travel_type) == 0x10, "URL must occupy 0x00..0x0F");
     static_assert(offsetof(Parameters, map_package_guid) == 0x14, "guid must sit at 0x14");
 
-    std::wstring text;
-    text.reserve(url.size() + 1);
-    for (const char character : url) {
-        text.push_back(static_cast<wchar_t>(character));
-    }
+    std::wstring text = text::WidenUtf8(url);
 
     Parameters parameters{};
     parameters.url.data     = text.data();
@@ -1328,11 +1325,7 @@ namespace {
     const std::uintptr_t button = create_parameters.return_value;
 
     if (plan.convert_function != 0 && plan.text_library != 0) {
-        std::wstring wide;
-        wide.reserve(label.size() + 1);
-        for (const char character : label) {
-            wide.push_back(static_cast<wchar_t>(character));
-        }
+        std::wstring wide = text::WidenUtf8(label);
         struct ConvertParameters {
             FStringLayout input;
             std::uint8_t  result[kTextSize];
@@ -1399,11 +1392,7 @@ Result BuildMenuRows(const MenuButtonPlan& plan, const std::vector<MenuRow>& row
 
         if (!row.description.empty() && plan.convert_function != 0 &&
             plan.text_library != 0) {
-            std::wstring wide;
-            wide.reserve(row.description.size() + 1);
-            for (const char character : row.description) {
-                wide.push_back(static_cast<wchar_t>(character));
-            }
+            std::wstring wide = text::WidenUtf8(row.description);
             struct ConvertParameters {
                 FStringLayout input;
                 std::uint8_t  result[kTextSize];
@@ -1500,11 +1489,7 @@ Result ApplyMenuButtonPlan(const MenuButtonPlan& plan, std::string_view label,
     const std::uintptr_t button = create_parameters.return_value;
 
     if (plan.convert_function != 0 && plan.text_library != 0) {
-        std::wstring wide;
-        wide.reserve(label.size() + 1);
-        for (const char character : label) {
-            wide.push_back(static_cast<wchar_t>(character));
-        }
+        std::wstring wide = text::WidenUtf8(label);
         struct ConvertParameters {
             FStringLayout input;
             std::uint8_t  result[kTextSize];
@@ -1630,11 +1615,7 @@ Result AddMainMenuButton(const ObjectArray& objects, std::string_view label,
         });
 
         if (text_library != 0) {
-            std::wstring wide;
-            wide.reserve(label.size() + 1);
-            for (const char character : label) {
-                wide.push_back(static_cast<wchar_t>(character));
-            }
+            std::wstring wide = text::WidenUtf8(label);
 
             struct ConvertParameters {
                 FStringLayout input;          // +0x00
@@ -1821,11 +1802,7 @@ Result BeginCampaign(const ObjectArray& objects, const Reflection& reflection,
         return Result::Fail(ErrorCode::InvalidState, "SetAndBeginCampaign was not found");
     }
 
-    std::wstring wide;
-    wide.reserve(scenario.size() + 1);
-    for (const char character : scenario) {
-        wide.push_back(static_cast<wchar_t>(character));
-    }
+    std::wstring wide = text::WidenUtf8(scenario);
 
     std::uint64_t scenario_name = 0;
     if (const Result made = MakeFName(wide.c_str(), scenario_name); !made.ok()) {
@@ -1956,11 +1933,7 @@ Result ExecuteConsoleCommand(const ObjectArray& objects, std::string_view comman
         FStringLayout result;
     };
 
-    std::wstring text;
-    text.reserve(command.size() + 1);
-    for (const char character : command) {
-        text.push_back(static_cast<wchar_t>(character));
-    }
+    std::wstring text = text::WidenUtf8(command);
 
     Parameters parameters{};
     parameters.command.data     = text.data();

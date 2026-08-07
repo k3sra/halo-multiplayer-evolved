@@ -5,13 +5,10 @@
 #include "Unreal/LobbyUI.h"
 
 #include "Core/Log.h"
+#include "Core/Text.h"
 #include "Unreal/GameThread.h"
 #include "Lobby/Discovery.h"
 #include "Unreal/ProcessMemory.h"
-
-// For MultiByteToWideChar: Steam hands back UTF-8 and the engine's text wants UTF-16.
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
 
 #include <algorithm>
 #include <array>
@@ -125,6 +122,51 @@ struct ServerRowWidgets {
 constexpr std::size_t kServerRows = 8;
 ServerRowWidgets g_server_row[kServerRows];
 
+/// One column of the server table: where it is, how large its text is, and how much of it
+/// fits.
+///
+/// The limit is not decoration. A text block given more than it can draw does not wrap or
+/// clip, it keeps going over whatever is beside it, so a column's width only holds if the
+/// value written into it was cut to match. Keeping the two in one place is what stops a
+/// column being widened without its limit following, which is how CAPTURE THE FLAG came to
+/// be printed across the map.
+struct TableColumn {
+    const char* heading;
+    float       x;
+    float       width;
+    float       size;
+    /// In code points. At these sizes the frontend's face runs about half the point size
+    /// per character, so a column holds roughly twice its width divided by its size.
+    std::size_t limit;
+};
+constexpr float kTableX = 390.0F;
+constexpr float kTableW = 1000.0F;
+constexpr TableColumn kColumns[] = {
+    {"SERVER",  400.0F,  330.0F, 22.0F, 28},
+    {"MODE",    746.0F,  150.0F, 17.0F, 16},
+    {"MAP",     906.0F,  150.0F, 17.0F, 16},
+    {"PLAYERS", 1066.0F, 150.0F, 17.0F, 16},
+    {"PING",    1226.0F, 140.0F, 17.0F, 14},
+};
+
+/// How many characters a player's name may take on a team card.
+///
+/// The card is a hundred and thirty two wide and the name box is a hundred and sixteen of
+/// that, which at eighteen point is about thirteen characters. A Steam persona name is
+/// routinely longer, and the overflow printed across the card beside it.
+constexpr std::size_t kSlotNameLimit = 13;
+
+/// The mode, short enough for the table's column.
+///
+/// The browser's filter buttons already say CTF, so this is the name the screen uses for it
+/// rather than an abbreviation invented for one column.
+[[nodiscard]] std::string ShortMode(std::string_view mode) {
+    if (mode == "CAPTURE THE FLAG") {
+        return "CTF";
+    }
+    return mpe::text::Ellipsise(mode, kColumns[1].limit);
+}
+
 /// The details panel's five value lines, and the filter markers.
 std::uintptr_t g_detail_line[5]   = {0, 0, 0, 0, 0};
 std::uintptr_t g_filter_mode[3]   = {0, 0, 0};
@@ -143,34 +185,11 @@ std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0, 0};
 
 /// Turns UTF-8 into the wide string the engine's text conversion expects.
 ///
-/// Every one of these used to widen by casting each byte to a wchar_t. That is correct for
-/// ASCII and wrong for everything else: a Steam persona name is UTF-8, so a name with any
-/// character outside ASCII arrived as one garbage glyph per byte. A player called Nessie
-/// with decorated brackets around the name rendered as "£T? Nessie £T?" on the team card,
-/// which looks like the mod corrupting somebody's name, because it was.
-///
-/// Falls back to the old byte for byte widening only if the conversion fails outright,
-/// which keeps a name on screen rather than blanking the card.
-[[nodiscard]] std::wstring WidenUtf8(std::string_view text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int needed = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
-                                             static_cast<int>(text.size()), nullptr, 0);
-    if (needed > 0) {
-        std::wstring wide(static_cast<std::size_t>(needed), wchar_t{});
-        if (::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                                  wide.data(), needed) == needed) {
-            return wide;
-        }
-    }
-    std::wstring fallback;
-    fallback.reserve(text.size());
-    for (const char character : text) {
-        fallback.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
-    }
-    return fallback;
-}
+/// In Core/Text rather than here, because GameThread widens strings too and the two copies
+/// disagreed: this one decoded UTF-8 and that one still cast byte by byte, so the same name
+/// drew correctly on a team card and as garbage on a menu entry. One implementation, with
+/// tests, is the only way that stays fixed.
+using mpe::text::WidenUtf8;
 
 /// Green under a hundred, amber to a hundred and fifty, red past it.
 ///
@@ -831,10 +850,17 @@ void BuildPlayerCard(const Builder& builder, std::uintptr_t canvas, SlotWidgets&
     // The filled state: a team coloured strip so the side is readable at a glance rather
     // than only from the column heading, then the name and the role.
     out.strip = builder.Panel(canvas, x, y, kCardWidth, 4.0F, team);
-    out.name  = builder.Text(canvas, x + 8.0F, y + kCardHeight - 46.0F, kCardWidth - 16.0F,
-                             22.0F, "", kText);
+    // Eighteen point rather than twenty two, and the name given the card's full inner width.
+    //
+    // At twenty two a name of any ordinary length was wider than the hundred and sixteen
+    // points it had, and a text block that runs out of room keeps drawing rather than
+    // clipping, so the overflow printed across the card beside it. The size and the
+    // character limit in SetLobbyRoster are one decision: changing either alone brings the
+    // overlap back.
+    out.name  = builder.Text(canvas, x + 8.0F, y + kCardHeight - 48.0F, kCardWidth - 16.0F,
+                             24.0F, "", kText, 18.0F);
     out.role  = builder.Text(canvas, x + 8.0F, y + kCardHeight - 24.0F, kCardWidth - 16.0F,
-                             18.0F, "Player", kTextDim);
+                             18.0F, "Player", kTextDim, 15.0F);
     builder.SetVisibilityOf(out.strip, kCollapsedValue);
     builder.SetVisibilityOf(out.name, kCollapsedValue);
     builder.SetVisibilityOf(out.role, kCollapsedValue);
@@ -1012,54 +1038,65 @@ void DrawBrowseTab(const Builder& builder, std::uintptr_t canvas, const LobbyVie
     }
 
     // Middle: the table. Headings in the frontend's own art, then eight permanent rows.
-    const std::array<const char*, 5> headings = {"SERVER", "MODE", "MAP", "PLAYERS", "PING"};
-    // Spaced so the widest heading fits its own column. PLAYERS is the long one, so the
-    // gap after it is the one that matters; at thirty point it ran straight into PING.
-    const std::array<float, 5> columns = {400.0F, 800.0F, 980.0F, 1120.0F, 1290.0F};
-    const std::array<float, 5> widths  = {390.0F, 170.0F, 130.0F, 160.0F, 110.0F};
-
+    //
+    // HOW THE COLUMNS ARE SIZED, AND WHY THEY OVERFLOWED
+    //
+    // A text block given more than it can draw does not wrap or clip; it keeps going, over
+    // whatever is next to it. So a column's width is not a suggestion here, it is the only
+    // thing keeping one field out of another, and it has to be paired with a character
+    // limit rather than trusted on its own.
+    //
+    // Two collisions came out of not doing that. "CAPTURE THE FLAG" at twenty two point is
+    // about two hundred and twenty points wide and its column was a hundred and seventy, so
+    // it ran through the gap and printed over the map. And the LOBBY tag sat twenty four
+    // points below a twenty four point name in a twenty six point box, which is not below
+    // it at all.
+    //
+    // Every column now states its own font and its own limit, in one table the headings and
+    // the cells both read from, and kColumnLimit is derived from the width rather than
+    // guessed: at these sizes the frontend's face runs about half the point size per
+    // character, so a column fits roughly twice its width in points divided by the size.
     // Text, not the button art.
     //
     // A label is a button scaled to fit its box, and a column is under two hundred wide, so
     // whatever size is asked for it comes out at about a third of it. A heading is not a
     // button, so it is drawn as text in the game's own font, where the size is the size.
-    for (std::size_t index = 0; index < headings.size(); ++index) {
-        (void)builder.Text(canvas, columns[index], 206.0F, widths[index], 26.0F,
-                           headings[index], kAccent, 17.0F);
+    for (const TableColumn& column : kColumns) {
+        (void)builder.Text(canvas, column.x, 206.0F, column.width, 26.0F, column.heading,
+                           kAccent, 16.0F);
     }
-    (void)builder.Panel(canvas, 390.0F, 244.0F, 1000.0F, 2.0F, kAccentDim);
+    (void)builder.Panel(canvas, kTableX, 244.0F, kTableW, 2.0F, kAccentDim);
 
     float row_y = 258.0F;
     for (std::size_t index = 0; index < kServerRows; ++index) {
         ServerRowWidgets& row = g_server_row[index];
-        row.highlight = builder.Panel(canvas, 390.0F, row_y, 1000.0F, 62.0F, kAccentDim);
+        row.highlight = builder.Panel(canvas, kTableX, row_y, kTableW, 62.0F, kAccentDim);
 
         // The pressable area goes down before the text, so the text draws over it rather
         // than being hidden behind it, and the text is made non interactive so the click
         // still reaches the row underneath. The whole row is the target: a server is
         // chosen by clicking it, not by a separate control that would need explaining.
-        row.button = builder.Button(canvas, 390.0F, row_y, 1000.0F, 62.0F, " ",
+        row.button = builder.Button(canvas, kTableX, row_y, kTableW, 62.0F, " ",
                                     kStretchFill);
         controls.push_back({row.button, LobbyAction::SelectServer, static_cast<int>(index)});
 
-        row.name    = builder.Text(canvas, columns[0] + 10.0F, row_y + 18.0F, widths[0],
-                                   26.0F, "", kText, 24.0F);
-        row.mode    = builder.Text(canvas, columns[1], row_y + 18.0F, widths[1], 26.0F, "",
-                                   kTextDim, 22.0F);
-        row.map     = builder.Text(canvas, columns[2], row_y + 18.0F, widths[2], 26.0F, "",
-                                   kTextDim, 22.0F);
-        row.players = builder.Text(canvas, columns[3], row_y + 18.0F, widths[3], 26.0F, "",
-                                   kTextDim, 22.0F);
-        row.ping    = builder.Text(canvas, columns[4], row_y + 18.0F, widths[4], 26.0F, "",
-                                   kTextDim, 22.0F);
+        // The name sits high in the row and the tag sits under it, with the row's height
+        // split between them rather than both laying claim to the middle of it.
+        row.name    = builder.Text(canvas, kColumns[0].x, row_y + 8.0F, kColumns[0].width,
+                                   28.0F, "", kText, kColumns[0].size);
+        row.status  = builder.Text(canvas, kColumns[0].x, row_y + 38.0F, kColumns[0].width,
+                                   20.0F, "", kTextDim, 14.0F);
 
-        // Under the name rather than in a column of its own. The table is already as wide
-        // as the design allows, and this qualifies the server rather than being another
-        // field of it: a row that says IN GAME is the same server, differently joinable.
-        row.status  = builder.Text(canvas, columns[0] + 10.0F, row_y + 42.0F, widths[0],
-                                   20.0F, "", kTextDim, 15.0F);
+        // The other four are centred on the row, since none of them has a second line.
+        std::uintptr_t* const cells[4] = {&row.mode, &row.map, &row.players, &row.ping};
+        for (std::size_t cell = 0; cell < std::size(cells); ++cell) {
+            const TableColumn& column = kColumns[cell + 1];
+            *cells[cell] = builder.Text(canvas, column.x, row_y + 20.0F, column.width, 26.0F,
+                                        "", kTextDim, column.size);
+        }
+
         for (const std::uintptr_t block : {row.name, row.mode, row.map, row.players,
-                                           row.ping}) {
+                                           row.ping, row.status}) {
             builder.SetVisibilityOf(block, kHitTestInvisible);
         }
         row_y += 70.0F;
@@ -2255,7 +2292,9 @@ void SetLobbyFriends(const LobbyUIContext& context, const std::vector<LobbyFrien
                                 entry.invited ? kHitTestInvisible : kCollapsedValue);
         builder.SetBorderColour(row.stripe, tone);
 
-        builder.SetTextLive(row.name, entry.name);
+        // The row is 728 wide with 186 of it given to the status, so the name has about 520
+        // points at 23 point, which is around forty five characters.
+        builder.SetTextLive(row.name, text::CleanDisplayName(entry.name, 45));
         builder.SetTextLive(row.status, label);
         builder.SetColourLive(row.status, tone);
 
@@ -2310,8 +2349,12 @@ void SetLobbyRoster(const LobbyUIContext& context, const std::vector<std::string
             if (!occupied) {
                 continue;
             }
+            // Cleaned and cut to the card, which is a hundred and sixteen points of name
+            // box. The comparison against the host is made on the raw name, because two
+            // long names that differ past the cut would otherwise both come back as the
+            // owner.
             const std::string& name = players[static_cast<std::size_t>(slot)];
-            builder.SetTextLive(card.name, name);
+            builder.SetTextLive(card.name, text::CleanDisplayName(name, kSlotNameLimit));
             builder.SetTextLive(card.role, name == host_name ? "Owner" : "Player");
         }
         builder.SetTextLive(g_team_heading[side],
@@ -2413,9 +2456,14 @@ void SetLobbyServers(const LobbyUIContext& context, const std::vector<ServerEntr
         }
 
         const ServerEntry& entry = servers[index];
-        builder.SetTextLive(row.name, entry.name);
-        builder.SetTextLive(row.mode, entry.mode);
-        builder.SetTextLive(row.map, entry.map);
+
+        // Every value is cut to its column before it is written. The name is cleaned as well
+        // as cut, because a server name is typed by somebody else and arrives with whatever
+        // they felt like putting in it.
+        builder.SetTextLive(row.name,
+                            text::CleanDisplayName(entry.name, kColumns[0].limit));
+        builder.SetTextLive(row.mode, ShortMode(entry.mode));
+        builder.SetTextLive(row.map, text::Ellipsise(entry.map, kColumns[2].limit));
         builder.SetTextLive(row.players,
                             std::format("{}/{}", entry.players, entry.capacity));
 

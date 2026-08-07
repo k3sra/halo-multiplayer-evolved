@@ -34,6 +34,7 @@
 #include "Core/GameBuild.h"
 #include "Core/Log.h"
 #include "Core/Pacing.h"
+#include "Core/Text.h"
 #include "Debug/AccessTrap.h"
 #include "Unreal/FNameTrampoline.h"
 #include "Unreal/GameThread.h"
@@ -5561,11 +5562,7 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         // pool walk.
         std::wstring wanted = L"None";
         if (const std::size_t space = command.find(' '); space != std::string::npos) {
-            const std::string argument = command.substr(space + 1);
-            wanted.clear();
-            for (const char character : argument) {
-                wanted.push_back(static_cast<wchar_t>(character));
-            }
+            wanted = mpe::text::WidenUtf8(command.substr(space + 1));
         }
 
         std::uint32_t    index = 0;
