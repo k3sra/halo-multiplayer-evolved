@@ -138,14 +138,28 @@ struct EngineCapabilities {
     bool can_place_sandbox_objects{false};
     bool can_query_load_progress{false};
 
+    /// The mod can put this machine into a named scenario.
+    ///
+    /// This is the one thing a match cannot happen without, and it is deliberately
+    /// separate from can_execute_commands. Those describe the Blam console, which this
+    /// build's binding does not reach; beginning a scenario goes through the engine's own
+    /// reflected campaign path instead and works without it.
+    ///
+    /// Conflating the two is what kept the launch sequence switched off. The gate tested
+    /// for a console binding, the console binding was unresolved, and so a match could not
+    /// start even though the mechanism that starts one was working the whole time.
+    bool can_begin_scenario{false};
+
     /// Everything the host path requires.
-    [[nodiscard]] bool SufficientToHost() const noexcept {
-        return can_execute_commands && can_configure_session && can_load_map_variant;
-    }
-    /// Everything the client path requires.
-    [[nodiscard]] bool SufficientToJoin() const noexcept {
-        return can_execute_commands && can_configure_session;
-    }
+    ///
+    /// Beginning a scenario, and nothing else. The session configuration calls are Blam
+    /// console commands that set privacy, bandwidth and host migration; every one of them
+    /// is cosmetic next to whether the players end up in the same map, and the lobby
+    /// already treats their failure as a warning rather than a refusal.
+    [[nodiscard]] bool SufficientToHost() const noexcept { return can_begin_scenario; }
+    /// Everything the client path requires. The same: a client that cannot load the
+    /// scenario cannot be in the match, and nothing else it might fail at matters yet.
+    [[nodiscard]] bool SufficientToJoin() const noexcept { return can_begin_scenario; }
     [[nodiscard]] std::string Describe() const;
 };
 

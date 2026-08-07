@@ -116,11 +116,11 @@ Result MatchSettings::Validate() const {
 
 std::string EngineCapabilities::Describe() const {
     return std::format(
-        "commands={} session={} map_variant={} sandbox={} load_progress={} "
-        "(host={}, join={})",
-        can_execute_commands, can_configure_session, can_load_map_variant,
-        can_place_sandbox_objects, can_query_load_progress, SufficientToHost(),
-        SufficientToJoin());
+        "begin_scenario={} commands={} session={} map_variant={} sandbox={} "
+        "load_progress={} (host={}, join={})",
+        can_begin_scenario, can_execute_commands, can_configure_session,
+        can_load_map_variant, can_place_sandbox_objects, can_query_load_progress,
+        SufficientToHost(), SufficientToJoin());
 }
 
 } // namespace mpe::engine
