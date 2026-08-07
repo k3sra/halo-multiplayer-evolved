@@ -318,7 +318,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.1";
+constexpr const char* kModVersion = "0.2.2";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
