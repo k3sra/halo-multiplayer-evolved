@@ -524,6 +524,7 @@ LobbyState g_lobby;
 /// Reports the object's own name, its class, and its address, so a later pass can read
 /// properties off anything interesting the listing turns up.
 int LogObjectsMatching(std::string_view fragment, std::size_t limit);
+void LogLines(log::Level level, std::string_view text);
 
 std::mutex               g_state_mutex;
 std::unique_ptr<ModState> g_state;               ///< Guarded by g_state_mutex.
@@ -1420,6 +1421,27 @@ void RegisterWatch(std::string label, std::uintptr_t instance_address,
         field.last_value = (raw != 0);
     }
     return true;
+}
+
+/// Writes a multi line block one line at a time.
+///
+/// The log takes a message per call and a hex dump handed over whole arrives as its first
+/// line and nothing else, which looks exactly like a dump of an unreadable address. That
+/// cost a round trip through the game to notice.
+void LogLines(log::Level level, std::string_view text) {
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t end = text.find('\n', start);
+        const std::string_view line =
+            text.substr(start, end == std::string_view::npos ? text.size() - start : end - start);
+        if (!line.empty()) {
+            log::Write(level, "Mod", std::string{line});
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
 }
 
 int LogObjectsMatching(std::string_view fragment, std::size_t limit) {
@@ -4739,7 +4761,7 @@ void DetectPropertyLayout() {
         MPE_LOG_ERROR("  UE property layout could not be validated against any target struct");
         MPE_LOG_ERROR("  offsets will not be trusted; reflection reads are disabled");
         if (!candidates.empty()) {
-            MPE_LOG_INFO("{}", reflection.ProbeStructLayout(candidates.front()));
+            LogLines(log::Level::Info, reflection.ProbeStructLayout(candidates.front()));
         }
         return;
     }
@@ -6545,8 +6567,14 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
             return -static_cast<int>(mpe::ErrorCode::InvalidState);
         }
 
-        const std::vector<mpe::unreal::ObjectInfo> found =
-            mpe::g_state->objects->FindByName(wanted, 8);
+        // By class first, then by name. A subsystem's instance is called something like
+        // BlamOnlineSessionSubsystem_2147482542, which nobody can type, so requiring the
+        // exact object name made the whole command unusable for the types that matter.
+        std::vector<mpe::unreal::ObjectInfo> found =
+            mpe::g_state->objects->FindByClassName(wanted, 8);
+        if (found.empty()) {
+            found = mpe::g_state->objects->FindByName(wanted, 8);
+        }
         const mpe::unreal::ObjectInfo* instance = nullptr;
         for (const mpe::unreal::ObjectInfo& candidate : found) {
             // Class objects and defaults share a vtable with the class machinery rather
@@ -6761,6 +6789,99 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
             }
         }
         return written;
+    }
+    if (starts_with("field ")) {
+        // Hex dump of one FProperty object itself, rather than of the value it describes.
+        //
+        // Every offset inside FProperty was derived from a chain of reasoning about where
+        // the engine's own structures end. When one of those derivations is wrong the
+        // symptom is silence: a container property whose element type simply never
+        // resolves. This is how that gets settled by looking instead of by reasoning.
+        const std::string argument = command.substr(std::strlen("field "));
+        const std::size_t space    = argument.find(' ');
+        if (space == std::string::npos) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod", "usage: field <class> <property>");
+            return -static_cast<int>(mpe::ErrorCode::InvalidArgument);
+        }
+        const std::string class_name    = argument.substr(0, space);
+        const std::string property_name = argument.substr(space + 1);
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        std::uintptr_t class_object = 0;
+        for (const mpe::unreal::ObjectInfo& object :
+             mpe::g_state->objects->FindByName(class_name, 8)) {
+            if (object.class_name.find("Class") != std::string::npos) {
+                class_object = object.address;
+                break;
+            }
+        }
+        if (class_object == 0) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no class named '{}'", class_name));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+
+        const mpe::Expected<mpe::unreal::PropertyInfo> property =
+            mpe::g_state->reflection->FindProperty(class_object, property_name);
+        if (!property.ok()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod", property.message());
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        mpe::log::Write(mpe::log::Level::Info, "Mod",
+                       std::format("{}::{} FProperty at 0x{:X}, {}", class_name, property_name,
+                                   property.value().address,
+                                   mpe::g_state->reflection->DescribeProperty(property.value())));
+        mpe::LogLines(mpe::log::Level::Info,
+                      mpe::g_state->reflection->ProbeStructLayout(property.value().address, 0xA0));
+        return 1;
+    }
+    if (starts_with("raw ")) {
+        // An annotated hex dump of a live instance.
+        //
+        // The Blam session subsystems reflect nothing at all: no functions, no fields. A
+        // type the engine knows only natively still has to keep its state somewhere, and
+        // the only way to see it is to read the bytes and say what each of them could be.
+        std::string  wanted = command.substr(std::strlen("raw "));
+        std::size_t  bytes  = 0x100;
+        if (const std::size_t space = wanted.find(' '); space != std::string::npos) {
+            try {
+                bytes = static_cast<std::size_t>(std::stoul(wanted.substr(space + 1), nullptr, 16));
+            } catch (const std::exception&) {
+                bytes = 0x100;
+            }
+            wanted.resize(space);
+        }
+        bytes = std::clamp<std::size_t>(bytes, 0x40, 0x800);
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        std::vector<mpe::unreal::ObjectInfo> found =
+            mpe::g_state->objects->FindByClassName(wanted, 4);
+        if (found.empty()) {
+            found = mpe::g_state->objects->FindByName(wanted, 4);
+        }
+        if (found.empty()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("nothing named or classed '{}'", wanted));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        for (const mpe::unreal::ObjectInfo& object : found) {
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("--- {} ({}) at 0x{:X} ---", object.name,
+                                       object.class_name, object.address));
+            mpe::LogLines(mpe::log::Level::Info,
+                          mpe::g_state->reflection->ProbeStructLayout(object.address, bytes));
+        }
+        return static_cast<int>(found.size());
     }
     if (starts_with("netdrivers")) {
         // Answers the one question that decides whether the game's own replication can be
