@@ -242,6 +242,8 @@ void ForgetFrontendUI();
 void MaintainGameThreadPump();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
 void DumpClassSurface(const unreal::ObjectArray& objects, const unreal::Reflection& reflection);
+void DumpOneClass(const unreal::ObjectArray& objects, const unreal::Reflection& reflection,
+                  const std::string& name, std::uintptr_t class_object);
 void RegisterLoadingCancel();
 void RefreshLoadingScreen();
 void OnCancelLoading();
@@ -2073,43 +2075,96 @@ void DumpClassSurface(const unreal::ObjectArray& objects,
         "BlamCoopSpawningGlobalsDefinitionTagDataAsset",
     };
 
-    for (const std::string_view wanted : kClasses) {
-        std::uintptr_t class_object = 0;
-        objects.ForEach([&](const unreal::ObjectInfo& object) {
-            if (object.name != wanted || object.class_name.find("Class") == std::string::npos) {
-                return true;
+    // One pass over the array, not one per class. The previous shape rescanned fifty
+    // thousand objects for every name in the list and spent two seconds on each.
+    std::map<std::string, std::uintptr_t> found;
+    objects.ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.class_name.find("Class") == std::string::npos) {
+            return true;
+        }
+        for (const std::string_view wanted : kClasses) {
+            if (object.name == wanted) {
+                found.emplace(object.name, object.address);
             }
-            class_object = object.address;
-            return false;
-        });
-        if (class_object == 0) {
+        }
+        return found.size() < std::size(kClasses);
+    });
+
+    for (const std::string_view wanted : kClasses) {
+        const auto entry = found.find(std::string{wanted});
+        if (entry == found.end()) {
             MPE_LOG_INFO("  {}: not present in this build", wanted);
             continue;
         }
+        DumpOneClass(objects, reflection, std::string{wanted}, entry->second);
+    }
+}
 
-        MPE_LOG_INFO("--- {} (0x{:X}) ---", wanted, class_object);
+/// Writes one class out in full: what it inherits, what it can be told to do, and every
+/// field it carries, with the replicated ones called out.
+void DumpOneClass(const unreal::ObjectArray& objects, const unreal::Reflection& reflection,
+                  const std::string& name, std::uintptr_t class_object) {
+    const unreal::ReflectionLayout& layout = reflection.Layout();
 
-        // Functions are objects whose outer is the class, so they are found by walking the
-        // array rather than by asking the class, which has no reflected list of them.
-        std::vector<std::string> functions;
-        objects.ForEach([&](const unreal::ObjectInfo& object) {
-            if (object.class_name != "Function" || object.outer_address != class_object) {
-                return true;
+    // The inheritance chain, which is often the answer on its own: a component whose
+    // parent is ActorComponent replicates through the actor that owns it.
+    std::string ancestry;
+    {
+        std::uintptr_t current = class_object;
+        for (int depth = 0; depth < 12 && current != 0; ++depth) {
+            std::string step;
+            objects.ForEach([&](const unreal::ObjectInfo& object) {
+                if (object.address != current) {
+                    return true;
+                }
+                step = object.name;
+                return false;
+            });
+            if (step.empty()) {
+                break;
             }
-            functions.push_back(object.name);
-            return true;
-        });
-        std::sort(functions.begin(), functions.end());
-        for (const std::string& name : functions) {
-            MPE_LOG_INFO("    fn  {}", name);
+            ancestry += ancestry.empty() ? step : " <- " + step;
+            const auto super = unreal::memory::ReadPointer(current + layout.super_struct_offset);
+            if (!super.has_value() || !unreal::memory::IsPlausiblePointer(*super)) {
+                break;
+            }
+            current = *super;
         }
-        if (functions.empty()) {
-            MPE_LOG_INFO("    fn  (none reflected; native only)");
-        }
+    }
 
-        for (const unreal::PropertyInfo& property : reflection.ReadAllProperties(class_object)) {
-            MPE_LOG_INFO("    var {} : {} at +0x{:X}", property.name, property.type_name,
-                        property.offset);
+    MPE_LOG_INFO("--- {} (0x{:X}) ---", name, class_object);
+    if (!ancestry.empty()) {
+        MPE_LOG_INFO("    inherits {}", ancestry);
+    }
+
+    std::vector<std::string> functions = reflection.ReadFunctionNames(class_object);
+    std::sort(functions.begin(), functions.end());
+    for (const std::string& function : functions) {
+        MPE_LOG_INFO("    fn  {}", function);
+    }
+    if (functions.empty()) {
+        MPE_LOG_INFO("    fn  (none reflected; native only)");
+    }
+
+    const std::vector<unreal::PropertyInfo> own = reflection.ReadProperties(class_object);
+    for (const unreal::PropertyInfo& property : own) {
+        MPE_LOG_INFO("    var {}", reflection.DescribeProperty(property));
+    }
+    if (own.empty()) {
+        MPE_LOG_INFO("    var (no reflected fields of its own)");
+    }
+
+    const std::vector<unreal::PropertyInfo> all = reflection.ReadAllProperties(class_object);
+    std::size_t replicated = 0;
+    for (const unreal::PropertyInfo& property : all) {
+        if (property.IsReplicated()) {
+            ++replicated;
+        }
+    }
+    MPE_LOG_INFO("    {} field(s) including inherited, {} replicated", all.size(), replicated);
+    for (const unreal::PropertyInfo& property : all) {
+        if (property.IsReplicated()) {
+            MPE_LOG_INFO("    net {}", reflection.DescribeProperty(property));
         }
     }
 }
@@ -4628,10 +4683,44 @@ void DetectPropertyLayout() {
         candidates.push_back(object.address);
     }
 
-    const unreal::ReflectionLayout detected = reflection.DetectLayout(candidates);
+    // Pin the layout against classes whose size the engine fixes rather than inferring it.
+    //
+    // UObject is 0x28 bytes and UField is 0x30 on every 64 bit build, and both are
+    // ordinary UClass objects in the array, so the slot reading those two values is
+    // PropertiesSize and no argument about plausibility is needed. The previous run
+    // settled on a slot that was really the top half of the pointer next to it and
+    // reported struct sizes of 365 and 650 on consecutive launches.
+    unreal::LayoutAnchors anchors;
+    objects->ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.class_name != "Class") {
+            return true;
+        }
+        if (object.name == "Object") {
+            anchors.object_class = object.address;
+        } else if (object.name == "Field") {
+            anchors.field_class = object.address;
+        } else if (object.name == "Struct") {
+            anchors.struct_class = object.address;
+        } else if (object.name == "BlamCampaignFlowGameSubsystem") {
+            // Known from the object array to own nine reflected functions, which is what
+            // identifies UStruct::Children and the UField chain that hangs off it.
+            anchors.class_with_functions = object.address;
+        }
+        return anchors.object_class == 0 || anchors.field_class == 0 ||
+               anchors.struct_class == 0 || anchors.class_with_functions == 0;
+    });
+    MPE_LOG_INFO("  layout anchors: Object 0x{:X}, Field 0x{:X}, Struct 0x{:X}, functions 0x{:X}",
+                anchors.object_class, anchors.field_class, anchors.struct_class,
+                anchors.class_with_functions);
+
+    const unreal::ReflectionLayout detected = reflection.DetectLayout(candidates, anchors);
     if (detected.detected) {
         reflection.SetLayout(detected);
         MPE_LOG_INFO("  UE layout detected: {}", detected.Describe());
+        if (!detected.anchored) {
+            MPE_LOG_WARN("  PropertiesSize was inferred rather than measured; struct sizes "
+                        "are the least trustworthy number here");
+        }
     } else {
         MPE_LOG_WARN("  UE layout detection found no property chain; trying documented offsets");
     }
@@ -4858,8 +4947,13 @@ void ResolveLiveInstances(
 
     unreal::ReflectionLayout layout = reflection.Layout();
 
-    if (const std::size_t size_offset = reflection.DetectPropertiesSizeOffset(addresses);
-        size_offset != 0) {
+    // An anchored PropertiesSize was measured against UObject and UField, so nothing a
+    // sample of eight structs can say about it is an improvement.
+    if (layout.anchored) {
+        MPE_LOG_INFO("properties_size stays at +0x{:X}, measured against UObject and UField",
+                    layout.properties_size_offset);
+    } else if (const std::size_t size_offset = reflection.DetectPropertiesSizeOffset(addresses);
+               size_offset != 0) {
         MPE_LOG_INFO("properties_size refined to +0x{:X} using {} struct(s)", size_offset,
                     addresses.size());
         layout.properties_size_offset = size_offset;
@@ -4871,6 +4965,13 @@ void ResolveLiveInstances(
         inner != 0) {
         MPE_LOG_INFO("FStructProperty::Struct detected at +0x{:X}", inner);
         layout.struct_property_inner_offset   = inner;
+        layout.struct_property_inner_detected = true;
+    } else if (layout.struct_property_inner_offset != 0) {
+        // The sample had no StructProperty pointing at a struct we already knew, which
+        // says nothing about the offset itself: it follows from where FProperty ends, and
+        // that was established from the property chain rather than assumed.
+        MPE_LOG_INFO("FStructProperty::Struct taken as +0x{:X} from the FProperty layout",
+                    layout.struct_property_inner_offset);
         layout.struct_property_inner_detected = true;
     } else {
         MPE_LOG_WARN("FStructProperty::Struct offset not detected; embedded struct search "
@@ -6552,6 +6653,170 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
                 ++total;
             }
         }
+        return total;
+    }
+    if (starts_with("layout")) {
+        // Prints the detected UE layout and re-checks it against a struct.
+        //
+        // Every offset below was measured rather than assumed, and printing them is how a
+        // wrong one gets caught: a PropertiesSize that changes between launches is a heap
+        // pointer being read as an integer, which is exactly what happened before.
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->reflection.has_value() ||
+            !mpe::g_state->objects.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+        const mpe::unreal::ReflectionLayout& layout = mpe::g_state->reflection->Layout();
+        mpe::log::Write(mpe::log::Level::Info, "Mod", std::format("UE layout: {}",
+                                                                 layout.Describe()));
+
+        // UObject and UField have sizes the engine fixes, so reading them back is a pass
+        // or fail rather than an opinion.
+        for (const char* wanted : {"Object", "Field", "Struct", "Class"}) {
+            for (const mpe::unreal::ObjectInfo& object :
+                 mpe::g_state->objects->FindByName(wanted, 4)) {
+                if (object.class_name != "Class") {
+                    continue;
+                }
+                const auto size = mpe::unreal::memory::Read<std::int32_t>(
+                    object.address + layout.properties_size_offset);
+                mpe::log::Write(mpe::log::Level::Info, "Mod",
+                               std::format("  U{} PropertiesSize = {} (0x{:X})", wanted,
+                                           size.value_or(-1), size.value_or(0)));
+                break;
+            }
+        }
+        return layout.detected ? 1 : 0;
+    }
+    if (starts_with("dump ")) {
+        // Everything one class exposes: ancestry, functions, fields, and which of those
+        // fields the engine replicates on its own.
+        const std::string wanted = command.substr(std::strlen("dump "));
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        std::uintptr_t class_object = 0;
+        for (const mpe::unreal::ObjectInfo& object :
+             mpe::g_state->objects->FindByName(wanted, 8)) {
+            if (object.class_name.find("Class") != std::string::npos) {
+                class_object = object.address;
+                break;
+            }
+        }
+        if (class_object == 0) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no class named '{}'", wanted));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        mpe::DumpOneClass(*mpe::g_state->objects, *mpe::g_state->reflection, wanted,
+                          class_object);
+        return 1;
+    }
+    if (starts_with("values ")) {
+        // The live values of every field on an instance, not just its shape.
+        //
+        // A tag data asset's field list says a mode table exists. This says what is in it,
+        // which is the difference between knowing multiplayer data shipped and knowing
+        // which modes shipped with it.
+        const std::string wanted = command.substr(std::strlen("values "));
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        // Instances first, then the class default object, which still carries everything
+        // the cooker baked in even when nothing has been spawned yet.
+        std::vector<mpe::unreal::ObjectInfo> instances =
+            mpe::g_state->objects->FindByClassName(wanted, 8);
+        if (instances.empty()) {
+            for (const mpe::unreal::ObjectInfo& object :
+                 mpe::g_state->objects->FindByName("Default__" + wanted, 4)) {
+                instances.push_back(object);
+            }
+        }
+        if (instances.empty()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no live instance or default object of '{}'", wanted));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+
+        int written = 0;
+        for (const mpe::unreal::ObjectInfo& instance : instances) {
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("--- {} ({}) at 0x{:X} ---", instance.name,
+                                       instance.class_name, instance.address));
+            const std::uintptr_t klass = instance.class_address != 0
+                                             ? instance.class_address
+                                             : mpe::g_state->objects->ClassOf(instance.address);
+            for (const std::string& line :
+                 mpe::g_state->reflection->DumpInstance(klass, instance.address)) {
+                mpe::log::Write(mpe::log::Level::Info, "Mod", "  " + line);
+                ++written;
+            }
+        }
+        return written;
+    }
+    if (starts_with("netdrivers")) {
+        // Answers the one question that decides whether the game's own replication can be
+        // driven at all: which net driver class the engine is configured to build.
+        //
+        // UEngine::NetDriverDefinitions is an array of {DefName, DriverClassName,
+        // DriverClassNameFallback}. If GameNetDriver maps to a Steam driver then a listen
+        // server and a Steam URL are a supported path rather than an experiment. The
+        // saved config already proves a GameNetDriver has run here: Windows/Engine.ini
+        // carries a CachedClientID written by the stateless connect handshake.
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        // The live engine, found by class rather than by name, because the concrete type
+        // is a game specific subclass.
+        mpe::unreal::ObjectInfo engine;
+        mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
+            if (object.name.rfind("Default__", 0) == 0) {
+                return true;
+            }
+            if (object.class_name.find("Engine") == std::string::npos ||
+                object.class_name.find("GameEngine") == std::string::npos) {
+                return true;
+            }
+            engine = object;
+            return false;
+        });
+        if (!engine.IsValid()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod", "no live game engine object");
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        mpe::log::Write(mpe::log::Level::Info, "Mod",
+                       std::format("engine: {} ({}) at 0x{:X}", engine.name, engine.class_name,
+                                   engine.address));
+
+        const mpe::Expected<mpe::unreal::PropertyInfo> definitions =
+            mpe::g_state->reflection->FindProperty(engine.class_address, "NetDriverDefinitions");
+        if (!definitions.ok()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("NetDriverDefinitions not found: {}",
+                                       definitions.message()));
+        } else {
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("  NetDriverDefinitions = {}",
+                                       mpe::g_state->reflection->ReadValueText(
+                                           engine.address, definitions.value(), 3)));
+        }
+
+        // Whichever drivers exist as classes, and whichever are live right now.
+        int total = 0;
+        total += mpe::LogObjectsMatching("NetDriver", 32);
+        total += mpe::LogObjectsMatching("NetConnection", 32);
+        total += mpe::LogObjectsMatching("SocketSubsystem", 16);
         return total;
     }
     if (starts_with("pvp on")) {
