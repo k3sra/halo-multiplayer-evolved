@@ -46,7 +46,8 @@ The build succeeding proves nothing about what is on disk or in the game.
 3. Read `Meteorite/Binaries/Win64/MultiplayerEvolved/MultiplayerEvolved.log`. The previous
    run is kept beside it as `MultiplayerEvolved.previous.log`.
 
-Do not launch the game to test unless you were asked to. Say the build is ready instead.
+Launch the game to test whenever it would settle a question. Reading the engine, checking a
+widget, confirming a fix: run it, do not describe what running it would show.
 
 ## Releasing
 
@@ -60,9 +61,24 @@ for every player.
    players to copy three things when only two existed, and a fresh install got no symbol
    descriptor. The package step stages `data/`, checks the descriptor is in it, and lists
    the archive contents.
-3. `gh release create vX.Y.Z --target main` with the three assets.
+3. `gh release create vX.Y.Z --target main` with the three assets, **and with
+   `MultiplayerEvolved.dll` uploaded as an asset in its own right, not only inside the
+   zip.**
+
+   That is a contract, not a convenience. The updater looks for an asset named exactly
+   `MultiplayerEvolved.dll` and writes it straight to `MultiplayerEvolved.dll.pending`.
+   When releases moved to shipping a zip, every install began reporting an update it could
+   never fetch, silently, for every release: the check succeeded, the version compared
+   newer, and there was nothing named that to download.
+
+   The reason it has to be caught here rather than fixed later is that **a machine whose
+   updater cannot download is a machine that cannot receive the fix for its updater.** No
+   change to this repository reaches it. The only repair is a correctly named asset on a
+   release, which is the one thing those installs are still asking for.
+
 4. Download the published asset back and hash-match it against the installed file. Check
-   the zip's contents too, not just its size.
+   the zip's contents too, not just its size, and confirm `MultiplayerEvolved.dll` is in
+   the asset list.
 5. Only then merge the README and `kModVersion` bump.
 
 Bump `kProtocolVersion` in `src/Net/PacketProtocol.h` for any change to an existing message
