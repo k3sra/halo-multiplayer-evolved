@@ -222,6 +222,15 @@ void ForgetExtraWatchedWidgets();
 /// Declares which event counts as a click.
 void SetWidgetClickEvent(std::uintptr_t function);
 
+/// Drops the watch without writing anything back.
+///
+/// For a widget the engine has destroyed. Restoring would write the original table pointer
+/// into memory that has been freed and reused, replacing some unrelated object's virtual
+/// table with one belonging to a class it is not. The write itself succeeds; the game dies
+/// later, dispatching that object through the wrong class, somewhere with no visible
+/// connection to this mod.
+void ForgetWatchedWidget();
+
 /// Puts the widget's original virtual table back.
 void StopWatchingWidgetEvents();
 

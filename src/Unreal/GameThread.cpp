@@ -861,9 +861,38 @@ constexpr std::size_t kMaxVTableEntries = 4096;
     return reinterpret_cast<std::uintptr_t>(copy.data() + 1);
 }
 
+/// Every virtual table this mod has ever handed out, kept forever.
+///
+/// Deliberately never freed, and this is the whole point of it rather than an oversight.
+///
+/// Pointing an object at a copy means that object now depends on the copy's memory for as
+/// long as it lives, and there is no way to ask whether it still does. Re-using one buffer
+/// for the next host quietly rewrites the table an earlier host may still be reading, and
+/// the earlier host does not have to be dead for that to happen: the pump moves when it
+/// falls silent, and a widget that has gone quiet is very often still perfectly alive.
+///
+/// That was the fault behind a crash that survived being moved from a widget to a player
+/// controller to the game instance. Nothing was wrong with any of those hosts. What was
+/// wrong was that installing on a new one destroyed the table the old one was still using.
+///
+/// A few kilobytes per install, a handful of installs per session. Leaking them is the
+/// cheapest correct answer available.
+std::deque<std::vector<std::uintptr_t>> g_vtable_arena;
+
+/// Copies a table into memory that will outlive whatever is pointed at it.
+[[nodiscard]] std::vector<std::uintptr_t>* AdoptVTable(std::uintptr_t table) {
+    std::vector<std::uintptr_t> copy;
+    if (!CopyVTable(table, copy)) {
+        return nullptr;
+    }
+    g_vtable_arena.push_back(std::move(copy));
+    return &g_vtable_arena.back();
+}
+
 std::uintptr_t              g_watched_widget = 0;
 std::uintptr_t              g_original_vtable = 0;
-std::vector<std::uintptr_t> g_vtable_copy;
+/// The watch's table, owned by the arena so a rebuild never rewrites a live one.
+std::vector<std::uintptr_t>* g_vtable_copy = nullptr;
 std::atomic<bool>           g_widget_clicked{false};
 
 /// Every widget being watched for clicks, and which one was clicked last.
@@ -1001,18 +1030,35 @@ Result InstallGameThreadPump(std::uintptr_t widget) {
         return Result::Fail(ErrorCode::InvalidState, "could not read the pump vtable");
     }
 
-    if (!CopyVTable(table, g_pump_vtable_copy) ||
-        static_cast<std::size_t>(slot) >= g_pump_vtable_copy.size()) {
+    std::vector<std::uintptr_t>* const copy = AdoptVTable(table);
+    if (copy == nullptr) {
         return Result::Fail(ErrorCode::InvalidState,
                             "the pump host's virtual table could not be measured; a copy "
                             "shorter than the real one nulls every virtual past its end");
     }
 
-    g_pump_real_process_event = reinterpret_cast<ProcessEventSignature>(process_event);
-    g_pump_vtable_copy[static_cast<std::size_t>(slot)] =
-        reinterpret_cast<std::uintptr_t>(&PumpProcessEvent);
+    // Slot plus one, because the copy carries the RTTI pointer at index zero.
+    //
+    // Adding that slot without shifting the index put the hook one entry early, over an
+    // unrelated virtual, and pointed the object at the RTTI slot so every index was off by
+    // one. The game then called that virtual, arrived here, and this forwarded its arguments
+    // to ProcessEvent as though they were ProcessEvent's. That is the crash inside this
+    // function, and it is why it survived being moved from one host class to another: the
+    // fault was never in the host.
+    //
+    // Checked rather than assumed, too. The detected slot is UObject's, and a class that
+    // holds something else there must be refused instead of corrupted.
+    const std::size_t index = static_cast<std::size_t>(slot) + 1;
+    if (index >= copy->size() || (*copy)[index] != process_event) {
+        return Result::Fail(ErrorCode::InvalidState,
+                            "this class does not hold ProcessEvent in the detected slot, so "
+                            "hooking it would replace some other virtual");
+    }
 
-    const auto copy_address = reinterpret_cast<std::uintptr_t>(g_pump_vtable_copy.data());
+    g_pump_real_process_event = reinterpret_cast<ProcessEventSignature>(process_event);
+    (*copy)[index] = reinterpret_cast<std::uintptr_t>(&PumpProcessEvent);
+
+    const auto copy_address = VTableCopyAddress(*copy);
     if (!memory::GuardedWrite(widget, &copy_address, sizeof(copy_address))) {
         return Result::Fail(ErrorCode::InvalidState, "could not repoint the pump vtable");
     }
@@ -1079,17 +1125,23 @@ Result WatchWidgetEvents(std::uintptr_t widget) {
 
     // Copy the table so the original is never written to. Other widgets of the same class
     // continue to use it untouched.
-    if (!CopyVTable(table, g_vtable_copy) ||
-        static_cast<std::size_t>(slot) >= g_vtable_copy.size()) {
+    std::vector<std::uintptr_t>* const copy = AdoptVTable(table);
+    if (copy == nullptr) {
         return Result::Fail(ErrorCode::InvalidState,
                             "the widget's virtual table could not be measured in full");
     }
 
-    g_real_process_event  = reinterpret_cast<ProcessEventSignature>(process_event);
-    g_vtable_copy[static_cast<std::size_t>(slot)] =
-        reinterpret_cast<std::uintptr_t>(&WidgetProcessEvent);
+    const std::size_t index = static_cast<std::size_t>(slot) + 1;
+    if (index >= copy->size() || (*copy)[index] != process_event) {
+        return Result::Fail(ErrorCode::InvalidState,
+                            "this class does not hold ProcessEvent in the detected slot");
+    }
 
-    const auto copy_address = reinterpret_cast<std::uintptr_t>(g_vtable_copy.data());
+    g_real_process_event  = reinterpret_cast<ProcessEventSignature>(process_event);
+    (*copy)[index] = reinterpret_cast<std::uintptr_t>(&WidgetProcessEvent);
+    g_vtable_copy  = copy;
+
+    const auto copy_address = VTableCopyAddress(*copy);
     if (!memory::GuardedWrite(widget, &copy_address, sizeof(copy_address))) {
         return Result::Fail(ErrorCode::InvalidState, "could not repoint the widget vtable");
     }
@@ -1109,7 +1161,7 @@ Result AlsoWatchWidget(std::uintptr_t widget) {
     if (widget == 0) {
         return Result::Fail(ErrorCode::InvalidArgument, "no widget given");
     }
-    if (g_original_vtable == 0 || g_vtable_copy.empty()) {
+    if (g_original_vtable == 0 || g_vtable_copy == nullptr) {
         return Result::Fail(ErrorCode::InvalidState,
                             "no watch is established to share a vtable with");
     }
@@ -1121,7 +1173,7 @@ Result AlsoWatchWidget(std::uintptr_t widget) {
     if (!memory::GuardedRead(widget, &table, sizeof(table))) {
         return Result::Fail(ErrorCode::InvalidState, "could not read the widget vtable");
     }
-    const auto copy_address = reinterpret_cast<std::uintptr_t>(g_vtable_copy.data());
+    const auto copy_address = VTableCopyAddress(*g_vtable_copy);
     if (table != g_original_vtable && table != copy_address) {
         return Result::Fail(ErrorCode::InvalidState,
                             "the widget is not the class the watch was built for");
@@ -1179,6 +1231,27 @@ std::uintptr_t LastWidgetEvent() {
 
 void SetWidgetClickEvent(std::uintptr_t function) {
     g_click_event.store(function, std::memory_order_release);
+}
+
+void ForgetWatchedWidget() {
+    // Dropped, never written back.
+    //
+    // Restoring means writing the original table pointer into the widget, and a widget the
+    // engine has destroyed is memory that has been freed and very probably reused. That
+    // write does not fault, because it is guarded and the page is still mapped; it lands on
+    // whatever object now occupies the address and replaces its virtual table with one
+    // belonging to a class it is not. The game then dispatches that object through the wrong
+    // class and dies somewhere with no connection to this mod at all.
+    //
+    // A destroyed object has nothing to restore. The only correct action is to stop
+    // believing in the address.
+    g_watched_widget  = 0;
+    g_original_vtable = 0;
+    g_vtable_copy     = nullptr;
+    for (std::size_t slot = 0; slot < kMaxWatchedWidgets; ++slot) {
+        g_watched[slot].store(0, std::memory_order_release);
+    }
+    g_clicked_widget.store(0, std::memory_order_release);
 }
 
 void StopWatchingWidgetEvents() {

@@ -1847,8 +1847,10 @@ void ForgetFrontendUI() {
     unreal::ForgetLobbyUI();
     unreal::ForgetStatusOverlay();
     unreal::ForgetLoadingOverlay();
-    unreal::ForgetExtraWatchedWidgets();
-    unreal::StopWatchingWidgetEvents();
+    // Forgotten, not restored. Everything here has been destroyed, and writing a virtual
+    // table pointer back into freed and reused memory is how this crashed the game four
+    // times in a row from a stack that never mentioned the widget it had corrupted.
+    unreal::ForgetWatchedWidget();
 }
 
 /// Keeps a live route onto the game thread, whatever screen the game is on.
@@ -1908,34 +1910,34 @@ void MaintainGameThreadPump() {
         return;
     }
 
-    // A player controller, because there is always exactly one and it is never idle.
+    // The game instance, because it outlives every level the game will ever load.
     //
-    // The front end has one, a loaded scenario has one, and a controller is handed input,
-    // camera and gameplay events continuously in both. It is the one object in this process
-    // that is alive on every screen the game has, which is the property the pump needs and
-    // the one a widget cannot offer.
-    const std::uintptr_t previous = unreal::GameThreadPumpHost();
+    // The first attempt at this used a player controller, on the reasoning that there is
+    // always exactly one and it is never idle. Both halves are true and it crashed the game
+    // anyway, because a controller is destroyed and rebuilt on every level transition, and a
+    // transition is precisely when this code runs. Pointing an object's virtual table at a
+    // copy is only safe while that object lives; the crash landed inside this pump, called
+    // through a host that had already been freed.
+    //
+    // A UGameInstance is created once when the process starts and released when it exits. It
+    // is not rebuilt by travel, it has no world to belong to, and nothing collects it. That
+    // removes the dangling host as a category rather than narrowing the window in which it
+    // happens, which is the only kind of fix worth having for this.
+    const std::uintptr_t previous  = unreal::GameThreadPumpHost();
     std::uintptr_t       candidate = 0;
     objects->ForEach([&](const unreal::ObjectInfo& object) {
-        if (object.name.rfind("Default__", 0) == 0) {
-            return true;
-        }
-        if (object.class_name.find("PlayerController") == std::string::npos ||
-            object.class_name.find("Component") != std::string::npos ||
+        if (object.name.rfind("Default__", 0) == 0 ||
             object.name.find("_GEN_VARIABLE") != std::string::npos) {
             return true;
         }
-        // A gameplay controller wins over the frontend one, so a match takes the pump with
-        // it rather than leaving it on a menu that is on its way out.
-        if (object.class_name.find("Frontend") == std::string::npos &&
-            object.name.find("Frontend") == std::string::npos) {
-            candidate = object.address;
-            return false;
+        // The instance itself, not one of its subsystems. A subsystem is also permanent,
+        // but the instance is what the engine drives directly.
+        if (object.class_name.find("GameInstance") == std::string::npos ||
+            object.class_name.find("Subsystem") != std::string::npos) {
+            return true;
         }
-        if (candidate == 0) {
-            candidate = object.address;
-        }
-        return true;
+        candidate = object.address;
+        return false;
     });
 
     if (candidate == 0 || candidate == previous) {
@@ -1947,8 +1949,9 @@ void MaintainGameThreadPump() {
     // whatever now occupies that address.
     unreal::ForgetGameThreadPump();
     if (const Result installed = unreal::InstallGameThreadPump(candidate); installed.ok()) {
-        MPE_LOG_INFO("the game thread pump went silent and has been moved to player "
-                    "controller 0x{:X}; the mod can run work in this world again",
+        MPE_LOG_INFO("the game thread pump went silent and has been moved to the game "
+                    "instance at 0x{:X}, which outlives every level; the mod can run work "
+                    "in this world again",
                     candidate);
     } else if (now - s_last_complaint >= std::chrono::seconds(30)) {
         // Said once in a while rather than every attempt. A pump that cannot be replaced
