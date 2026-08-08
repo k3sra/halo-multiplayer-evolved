@@ -793,7 +793,73 @@ namespace {
 namespace {
 
 /// How many virtual table entries to copy. Comfortably past ProcessEvent's slot.
-constexpr std::size_t kVTableEntries = 200;
+/// Upper bound on how many virtual table entries are copied. Not the number copied.
+///
+/// A fixed count was used here and it was wrong in the one way that matters. Repointing an
+/// object at a copy replaces its entire virtual table, so a copy shorter than the real one
+/// does not merely lose the tail, it fills it with zeroes: every virtual past the end
+/// becomes a call through a null pointer. Two hundred was comfortably past a widget's own
+/// table and nowhere near a player controller's, and moving the pump onto a controller
+/// crashed the game instantly, inside the game's own code, reading address zero.
+///
+/// The real length is not recorded anywhere, so it is measured: entries are copied while
+/// they still look like code in a loaded module, and the first thing that does not is the
+/// end. That is the same test the rest of this file uses to tell a pointer from a value.
+constexpr std::size_t kMaxVTableEntries = 4096;
+
+/// A copy of an object's whole virtual table, including the slot in front of it.
+///
+/// Two things have to be right and only one of them is obvious.
+///
+/// The length. A copy shorter than the original does not lose its tail, it fills it with
+/// zeroes, so every virtual past the end becomes a call through null. The end is found by
+/// reading until the values stop being code.
+///
+/// The slot before index zero. A Microsoft virtual table is preceded by a pointer to the
+/// object's RTTI, at vtable[-1], and anything that does a dynamic_cast reads it. A copy that
+/// begins at index zero leaves whatever happens to sit in front of it standing in for that
+/// pointer. Widgets survive it because nothing casts them; a player controller does not,
+/// and repointing one crashed the game inside its own code on a null read.
+///
+/// So the copy holds the RTTI slot at index zero and the table proper from index one, and
+/// callers point the object at &copy[1].
+[[nodiscard]] bool CopyVTable(std::uintptr_t table, std::vector<std::uintptr_t>& out) {
+    constexpr std::size_t kMinimumPlausible = 32;
+
+    out.clear();
+    out.reserve(256);
+
+    // The RTTI pointer. Read without judgement: it is data, not code, so the executable
+    // test below would reject it, and a zero here is a legitimate answer for a class built
+    // without RTTI.
+    std::uintptr_t rtti = 0;
+    (void)memory::GuardedRead(table - sizeof(rtti), &rtti, sizeof(rtti));
+    out.push_back(rtti);
+
+    for (std::size_t entry = 0; entry < kMaxVTableEntries; ++entry) {
+        std::uintptr_t value = 0;
+        if (!memory::GuardedRead(table + entry * sizeof(value), &value, sizeof(value))) {
+            break;
+        }
+        // The table ends where the code pointers stop. What follows is whatever the linker
+        // put next, and copying it would be putting data into slots that get called.
+        if (value == 0 || !memory::IsExecutableAddress(value)) {
+            break;
+        }
+        out.push_back(value);
+    }
+
+    if (out.size() < kMinimumPlausible) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+/// Where an object should be pointed, given a copy made by CopyVTable.
+[[nodiscard]] std::uintptr_t VTableCopyAddress(const std::vector<std::uintptr_t>& copy) {
+    return reinterpret_cast<std::uintptr_t>(copy.data() + 1);
+}
 
 std::uintptr_t              g_watched_widget = 0;
 std::uintptr_t              g_original_vtable = 0;
@@ -834,11 +900,22 @@ std::uintptr_t              g_pump_original_vtable = 0;
 std::vector<std::uintptr_t> g_pump_vtable_copy;
 ProcessEventSignature       g_pump_real_process_event = nullptr;
 
+/// Events the pump has seen. A pump that is installed and silent is a dead pump.
+std::atomic<std::uint64_t> g_pump_events{0};
+
 void __fastcall PumpProcessEvent(void* self, void* function, void* parameters) {
     // The thread is recorded even when there is nothing to run, because knowing which thread
     // this is is what lets a job dispatched from inside an event run inline instead of
     // waiting on a frame it is itself blocking.
     g_game_thread_id.store(::GetCurrentThreadId(), std::memory_order_release);
+
+    // Counted so somebody can tell a pump that is working from one that is merely installed.
+    //
+    // The pump lives on one object's event path, and objects do not live forever. The front
+    // end is destroyed the moment a scenario loads, which is precisely when this mod stops
+    // being able to run anything on the game thread and has no way to notice.
+    g_pump_events.fetch_add(1, std::memory_order_relaxed);
+
     if (AnyJobQueued()) {
         RunPendingJobs();
     }
@@ -924,13 +1001,11 @@ Result InstallGameThreadPump(std::uintptr_t widget) {
         return Result::Fail(ErrorCode::InvalidState, "could not read the pump vtable");
     }
 
-    g_pump_vtable_copy.assign(kVTableEntries, 0);
-    for (std::size_t entry = 0; entry < kVTableEntries; ++entry) {
-        std::uintptr_t value = 0;
-        if (!memory::GuardedRead(table + entry * sizeof(value), &value, sizeof(value))) {
-            break;
-        }
-        g_pump_vtable_copy[entry] = value;
+    if (!CopyVTable(table, g_pump_vtable_copy) ||
+        static_cast<std::size_t>(slot) >= g_pump_vtable_copy.size()) {
+        return Result::Fail(ErrorCode::InvalidState,
+                            "the pump host's virtual table could not be measured; a copy "
+                            "shorter than the real one nulls every virtual past its end");
     }
 
     g_pump_real_process_event = reinterpret_cast<ProcessEventSignature>(process_event);
@@ -963,6 +1038,21 @@ bool GameThreadPumpActive() {
     return g_pump_widget != 0;
 }
 
+std::uint64_t PumpEventCount() {
+    return g_pump_events.load(std::memory_order_relaxed);
+}
+
+std::uintptr_t GameThreadPumpHost() {
+    return g_pump_widget;
+}
+
+void ForgetGameThreadPump() {
+    // The host is gone, not being removed. Writing the original vtable back would be a
+    // write through a pointer into whatever now occupies that address.
+    g_pump_widget          = 0;
+    g_pump_original_vtable = 0;
+}
+
 Result WatchWidgetEvents(std::uintptr_t widget) {
     if (widget == 0) {
         return Result::Fail(ErrorCode::InvalidArgument, "no widget given");
@@ -989,13 +1079,10 @@ Result WatchWidgetEvents(std::uintptr_t widget) {
 
     // Copy the table so the original is never written to. Other widgets of the same class
     // continue to use it untouched.
-    g_vtable_copy.assign(kVTableEntries, 0);
-    for (std::size_t entry = 0; entry < kVTableEntries; ++entry) {
-        std::uintptr_t value = 0;
-        if (!memory::GuardedRead(table + entry * sizeof(value), &value, sizeof(value))) {
-            break;
-        }
-        g_vtable_copy[entry] = value;
+    if (!CopyVTable(table, g_vtable_copy) ||
+        static_cast<std::size_t>(slot) >= g_vtable_copy.size()) {
+        return Result::Fail(ErrorCode::InvalidState,
+                            "the widget's virtual table could not be measured in full");
     }
 
     g_real_process_event  = reinterpret_cast<ProcessEventSignature>(process_event);

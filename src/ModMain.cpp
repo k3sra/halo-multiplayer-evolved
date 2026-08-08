@@ -237,6 +237,9 @@ void RefreshLobbyAuthority();
 void PrepareLobby();
 void PrepareStatusOverlay();
 void PrepareLoadingOverlay();
+[[nodiscard]] bool FrontendWasDestroyed();
+void ForgetFrontendUI();
+void MaintainGameThreadPump();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
 void DumpClassSurface(const unreal::ObjectArray& objects, const unreal::Reflection& reflection);
 void RegisterLoadingCancel();
@@ -904,6 +907,41 @@ void TickLoop() {
         // telling the host this machine has finished loading. The host waits, sees no
         // progress, and stays on its own loading screen long after the other player is in
         // the map.
+        // Before the early exit below, not after it.
+        //
+        // The case this exists for is exactly the case that exit skips. A scenario loading
+        // is what destroys the pump, so a watchdog that only runs while the front end is up
+        // would notice the pump was gone at the one moment it can no longer do anything
+        // about it, and would then be skipped for the entire life of the match.
+        MaintainGameThreadPump();
+
+        // Nothing may be drawn on a front end that no longer exists.
+        //
+        // A level load destroys the entire front end, and every handle this mod holds to a
+        // widget is then the address of something that has gone. Writing to one is a write
+        // into whatever now occupies it, and calling a UFunction on one is worse.
+        //
+        // This had been survivable only by accident: the pump lived on a frontend widget, so
+        // it died with the front end and every queued job quietly timed out instead of
+        // running. Giving the mod a pump that survives a level load turned all of those
+        // silently discarded jobs into real calls against freed objects, and the first one
+        // to arrive, a periodic read of the server name field, wrote through a dead pointer
+        // and took the game with it.
+        //
+        // Keyed on whether the widgets are still there rather than on the lobby's phase.
+        // The phase says what the session is doing; only the object array says what still
+        // exists, and a scenario can be loaded without the session being in a match at all.
+        if (FrontendWasDestroyed()) {
+            ForgetFrontendUI();
+            const auto now = std::chrono::steady_clock::now();
+            if (next_tick > now) {
+                std::this_thread::sleep_for(next_tick - now);
+            } else {
+                next_tick = now;
+            }
+            continue;
+        }
+
         if (InMatchOrLoadingLevel()) {
             const auto now = std::chrono::steady_clock::now();
             if (next_tick > now) {
@@ -1757,6 +1795,169 @@ void LogMachineIdentity() {
                     now.time_since_epoch())
                     .count());
     MPE_LOG_INFO("--- end machine ---");
+}
+
+/// True while the widgets this mod holds handles to still exist.
+///
+/// The menu it decorated is the anchor: everything else was created with that menu as its
+/// outer, so when the engine collects it the whole tree goes at once. Asking the object
+/// array is the only way to know, because a destroyed object cannot be asked anything and a
+/// handle to one is indistinguishable from a live handle by inspection.
+/// True when a front end this mod had decorated has since been destroyed.
+///
+/// Deliberately not "is the front end alive". Those are different questions and answering
+/// the wrong one cost the mod its menu entry entirely: before anything has been resolved
+/// there is no live front end either, so a liveness test is false during startup, and a tick
+/// that skips its work whenever the answer is false never gets as far as adding the button
+/// it is waiting to add.
+///
+/// This asks only about a front end that was there and has gone, which is the only case that
+/// requires anything to be dropped.
+[[nodiscard]] bool FrontendWasDestroyed() {
+    if (g_live_menu == 0) {
+        return false; // Nothing has been claimed yet, so nothing can have been lost.
+    }
+    std::lock_guard lock(g_state_mutex);
+    if (!g_state || !g_state->objects.has_value()) {
+        return false;
+    }
+    return g_state->objects->ClassOf(g_live_menu) == 0;
+}
+
+/// Drops every handle to the front end, without touching any of them.
+///
+/// Called when a level load has taken the front end away. Nothing here releases anything:
+/// the objects are gone, so the only correct action is to stop believing in their addresses
+/// and let the ordinary rebuild path notice a new menu when one appears.
+void ForgetFrontendUI() {
+    if (!g_lobby_ui_ready && g_live_menu == 0 && g_lobby_controls.empty()) {
+        return; // Already forgotten.
+    }
+    MPE_LOG_INFO("the front end was destroyed, most likely by a level load; dropping every "
+                "widget handle rather than writing to addresses that are no longer widgets");
+
+    g_lobby_ui_ready = false;
+    g_live_menu      = 0;
+    g_lobby_root     = 0;
+    g_multiplayer_button = 0;
+    g_lobby_controls.clear();
+    g_lobby_measure_at = {};
+    g_invite_state_shown.clear();
+
+    unreal::ForgetLobbyUI();
+    unreal::ForgetStatusOverlay();
+    unreal::ForgetLoadingOverlay();
+    unreal::ForgetExtraWatchedWidgets();
+    unreal::StopWatchingWidgetEvents();
+}
+
+/// Keeps a live route onto the game thread, whatever screen the game is on.
+///
+/// WHY THE MOD GOES DEAF THE MOMENT A MATCH STARTS
+///
+/// Queued work runs from one object's event path. That object has always been part of the
+/// front end, because the front end is where this mod does everything, and beginning a
+/// campaign destroys the front end. So from the instant a scenario loads there is no route
+/// onto the game thread at all: every job waits out its deadline and nothing runs.
+///
+/// It has never mattered before, because the mod had nothing to do inside a match. It is now
+/// the single thing standing in front of everything that happens in one, and no amount of
+/// work on sessions or players can be tested while the mod cannot execute a call in the
+/// world those players are standing in.
+///
+/// A count of events the pump has seen is what makes this noticeable. A destroyed object
+/// cannot report that it is gone; a counter that stops moving says the same thing.
+void MaintainGameThreadPump() {
+    static std::uint64_t                         s_last_count = 0;
+    static std::chrono::steady_clock::time_point s_last_moved{};
+    static std::chrono::steady_clock::time_point s_last_complaint{};
+
+    // Nothing to watch until there has been a pump.
+    //
+    // This ran from the first tick, which is minutes before the engine is far enough along
+    // for a pump to exist at all, so it spent the whole of startup announcing that a pump
+    // it had never seen had gone quiet. Every one of those warnings also asked for a log
+    // report, which turned a false alarm into a stream of them.
+    if (!unreal::GameThreadPumpActive()) {
+        return;
+    }
+
+    const auto          now   = std::chrono::steady_clock::now();
+    const std::uint64_t count = unreal::PumpEventCount();
+    if (count != s_last_count) {
+        s_last_count = count;
+        s_last_moved = now;
+        return;
+    }
+    if (s_last_moved == std::chrono::steady_clock::time_point{}) {
+        s_last_moved = now;
+        return;
+    }
+
+    // Two seconds of complete silence. A pump on anything the player can see reports events
+    // many times a second; one that has said nothing for two seconds is on something that no
+    // longer exists.
+    if (now - s_last_moved < std::chrono::seconds(2)) {
+        return;
+    }
+    s_last_moved = now;
+
+    std::optional<unreal::ObjectArray> objects;
+    std::optional<unreal::Reflection>  reflection;
+    if (!TakeEngineView(objects, reflection)) {
+        return;
+    }
+
+    // A player controller, because there is always exactly one and it is never idle.
+    //
+    // The front end has one, a loaded scenario has one, and a controller is handed input,
+    // camera and gameplay events continuously in both. It is the one object in this process
+    // that is alive on every screen the game has, which is the property the pump needs and
+    // the one a widget cannot offer.
+    const std::uintptr_t previous = unreal::GameThreadPumpHost();
+    std::uintptr_t       candidate = 0;
+    objects->ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.name.rfind("Default__", 0) == 0) {
+            return true;
+        }
+        if (object.class_name.find("PlayerController") == std::string::npos ||
+            object.class_name.find("Component") != std::string::npos ||
+            object.name.find("_GEN_VARIABLE") != std::string::npos) {
+            return true;
+        }
+        // A gameplay controller wins over the frontend one, so a match takes the pump with
+        // it rather than leaving it on a menu that is on its way out.
+        if (object.class_name.find("Frontend") == std::string::npos &&
+            object.name.find("Frontend") == std::string::npos) {
+            candidate = object.address;
+            return false;
+        }
+        if (candidate == 0) {
+            candidate = object.address;
+        }
+        return true;
+    });
+
+    if (candidate == 0 || candidate == previous) {
+        return;
+    }
+
+    // The old host is abandoned rather than restored. If it still existed the pump would
+    // still be reporting, so writing its original virtual table back would be a write into
+    // whatever now occupies that address.
+    unreal::ForgetGameThreadPump();
+    if (const Result installed = unreal::InstallGameThreadPump(candidate); installed.ok()) {
+        MPE_LOG_INFO("the game thread pump went silent and has been moved to player "
+                    "controller 0x{:X}; the mod can run work in this world again",
+                    candidate);
+    } else if (now - s_last_complaint >= std::chrono::seconds(30)) {
+        // Said once in a while rather than every attempt. A pump that cannot be replaced
+        // will fail to be replaced every two seconds for as long as the game runs, and a
+        // warning repeated that often is not a warning, it is the log.
+        s_last_complaint = now;
+        MPE_LOG_WARN("the game thread pump went silent and could not be re-established: {}",
+                    installed.message());
+    }
 }
 
 /// Writes down the game's own networking surface, once.

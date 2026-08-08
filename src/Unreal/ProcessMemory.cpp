@@ -140,6 +140,28 @@ bool GuardedWrite(std::uintptr_t address, const void* source, std::size_t size) 
     }
 }
 
+/// True when the address is inside a committed, executable page.
+///
+/// Used to find where a virtual table ends. The entries are function pointers, so the first
+/// value that is not code is the first value that is not an entry. Asking the operating
+/// system what a page is for is the only way to tell without knowing the class.
+bool IsExecutableAddress(std::uintptr_t address) noexcept {
+    if (!IsPlausiblePointer(address)) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (::VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) == 0) {
+        return false;
+    }
+    if (info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) != 0 ||
+        (info.Protect & PAGE_NOACCESS) != 0) {
+        return false;
+    }
+    constexpr DWORD kExecutable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                  PAGE_EXECUTE_WRITECOPY;
+    return (info.Protect & kExecutable) != 0;
+}
+
 bool IsReadable(std::uintptr_t address, std::size_t size) noexcept {
     return CheckRange(address, size, false);
 }

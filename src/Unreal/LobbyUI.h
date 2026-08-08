@@ -543,6 +543,13 @@ void SetLoadingView(const LobbyUIContext& context, const LoadingView& view);
 /// The widget the viewport holds the overlay in, so a caller can check it still exists.
 [[nodiscard]] std::uintptr_t StatusOverlayWidget();
 
+/// Drops every lobby handle without touching them.
+///
+/// For the case where the widgets have been destroyed rather than removed, which is what a
+/// level load does to the entire front end. Calling a function on one of those handles is a
+/// write into whatever now occupies the address.
+void ForgetLobbyUI();
+
 /// Drops every handle to the overlay without touching them.
 ///
 /// For the case where the objects have been collected rather than removed: the addresses
