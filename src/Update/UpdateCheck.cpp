@@ -109,7 +109,13 @@ Expected<ReleaseInfo> FetchLatestRelease(std::string_view repository) {
         return Error{ErrorCode::InvalidArgument, "no repository given"};
     }
 
-    const Handle session(WinHttpOpen(L"MultiplayerEvolved", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    // No proxy, not automatic proxy detection.
+    //
+    // AUTOMATIC_PROXY asks Windows to discover a proxy, and on a machine with none to
+    // discover that means waiting for WPAD to give up. The log sender had exactly this and
+    // every request on one of the two test machines failed with error 12002, a WinHTTP
+    // timeout. An updater that times out looks identical to one with nothing to fetch.
+    const Handle session(WinHttpOpen(L"MultiplayerEvolved", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         return Error{ErrorCode::InvalidState, "could not open an HTTP session"};
@@ -188,6 +194,20 @@ Expected<ReleaseInfo> FetchLatestRelease(std::string_view repository) {
     // the loader proxy, and picking that one would stage the loader as though it were the
     // mod. Whichever happened to be uploaded first would decide, which is not a thing worth
     // leaving to chance when the result gets loaded as code.
+    //
+    // WHY THE NAME IS A CONTRACT AND NOT A DETAIL
+    //
+    // Releases moved to shipping a zip, and this kept asking for MultiplayerEvolved.dll.
+    // Every install went on reporting an update it could never fetch, for every release,
+    // and the failure was silent by design: the check succeeded, the version compared
+    // newer, and there was simply nothing to download.
+    //
+    // Nothing on the client can repair that, and this is the part worth remembering. A
+    // machine whose updater cannot download is a machine that cannot receive the fix for
+    // its updater. The rescue had to be a raw DLL uploaded beside the zip, so the broken
+    // clients already out there find what they were always looking for. Every release from
+    // now on publishes both, and build.bat produces both, so the two cannot drift apart
+    // again.
     if (document.contains("assets") && document.at("assets").is_array()) {
         const json::Value& assets = document.at("assets");
         for (std::size_t index = 0; index < assets.size(); ++index) {
@@ -210,8 +230,18 @@ Expected<ReleaseInfo> FetchLatestRelease(std::string_view repository) {
         }
     }
 
-    MPE_LOG_INFO("newest release is {} ({})", release.version,
-                release.asset_name.empty() ? "no downloadable asset" : release.asset_name);
+    if (release.asset_name.empty()) {
+        // Loud, because this is the shape of a release that nobody can install. The
+        // previous wording said "no downloadable asset" at Info and read like a note about
+        // a release that had none on purpose.
+        MPE_LOG_ERROR("release {} publishes no MultiplayerEvolved.dll, so no install can "
+                     "update itself to it; the release is incomplete",
+                     release.version);
+        return release;
+    }
+
+    MPE_LOG_INFO("newest release is {} ({}, {} bytes)", release.version, release.asset_name,
+                release.asset_bytes);
     return release;
 }
 
@@ -246,7 +276,13 @@ Result DownloadRelease(const ReleaseInfo& release, const std::wstring& game_bina
         return Result::Fail(ErrorCode::InvalidArgument, "the download URL is not HTTPS");
     }
 
-    const Handle session(WinHttpOpen(L"MultiplayerEvolved", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    // No proxy, not automatic proxy detection.
+    //
+    // AUTOMATIC_PROXY asks Windows to discover a proxy, and on a machine with none to
+    // discover that means waiting for WPAD to give up. The log sender had exactly this and
+    // every request on one of the two test machines failed with error 12002, a WinHTTP
+    // timeout. An updater that times out looks identical to one with nothing to fetch.
+    const Handle session(WinHttpOpen(L"MultiplayerEvolved", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         return Result::Fail(ErrorCode::InvalidState, "could not open an HTTP session");
