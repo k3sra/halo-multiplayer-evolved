@@ -6892,45 +6892,53 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         // server and a Steam URL are a supported path rather than an experiment. The
         // saved config already proves a GameNetDriver has run here: Windows/Engine.ini
         // carries a CachedClientID written by the stateless connect handshake.
-        std::lock_guard lock(mpe::g_state_mutex);
-        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
-            !mpe::g_state->reflection.has_value()) {
-            return -static_cast<int>(mpe::ErrorCode::InvalidState);
-        }
-
-        // The live engine, found by class rather than by name, because the concrete type
-        // is a game specific subclass.
-        mpe::unreal::ObjectInfo engine;
-        mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
-            if (object.name.rfind("Default__", 0) == 0) {
-                return true;
+        // The lock is scoped and released before the sweep below.
+        //
+        // LogObjectsMatching takes g_state_mutex itself, and holding it across that call
+        // locks a std::mutex twice on one thread, which killed the game the first time
+        // this command ran. Anything that calls a helper needs to own the lock for no
+        // longer than it reads shared state.
+        {
+            std::lock_guard lock(mpe::g_state_mutex);
+            if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+                !mpe::g_state->reflection.has_value()) {
+                return -static_cast<int>(mpe::ErrorCode::InvalidState);
             }
-            if (object.class_name.find("Engine") == std::string::npos ||
-                object.class_name.find("GameEngine") == std::string::npos) {
-                return true;
-            }
-            engine = object;
-            return false;
-        });
-        if (!engine.IsValid()) {
-            mpe::log::Write(mpe::log::Level::Warn, "Mod", "no live game engine object");
-            return -static_cast<int>(mpe::ErrorCode::NotFound);
-        }
-        mpe::log::Write(mpe::log::Level::Info, "Mod",
-                       std::format("engine: {} ({}) at 0x{:X}", engine.name, engine.class_name,
-                                   engine.address));
 
-        const mpe::Expected<mpe::unreal::PropertyInfo> definitions =
-            mpe::g_state->reflection->FindProperty(engine.class_address, "NetDriverDefinitions");
-        if (!definitions.ok()) {
-            mpe::log::Write(mpe::log::Level::Warn, "Mod",
-                           std::format("NetDriverDefinitions not found: {}",
-                                       definitions.message()));
-        } else {
+            // The live engine, found by class rather than by name, because the concrete
+            // type is a game specific subclass.
+            mpe::unreal::ObjectInfo engine;
+            mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
+                if (object.name.rfind("Default__", 0) == 0) {
+                    return true;
+                }
+                if (object.class_name.find("GameEngine") == std::string::npos) {
+                    return true;
+                }
+                engine = object;
+                return false;
+            });
+            if (!engine.IsValid()) {
+                mpe::log::Write(mpe::log::Level::Warn, "Mod", "no live game engine object");
+                return -static_cast<int>(mpe::ErrorCode::NotFound);
+            }
             mpe::log::Write(mpe::log::Level::Info, "Mod",
-                           std::format("  NetDriverDefinitions = {}",
-                                       mpe::g_state->reflection->ReadValueText(
-                                           engine.address, definitions.value(), 3)));
+                           std::format("engine: {} ({}) at 0x{:X}", engine.name,
+                                       engine.class_name, engine.address));
+
+            const mpe::Expected<mpe::unreal::PropertyInfo> definitions =
+                mpe::g_state->reflection->FindProperty(engine.class_address,
+                                                       "NetDriverDefinitions");
+            if (!definitions.ok()) {
+                mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                               std::format("NetDriverDefinitions not found: {}",
+                                           definitions.message()));
+            } else {
+                mpe::log::Write(mpe::log::Level::Info, "Mod",
+                               std::format("  NetDriverDefinitions = {}",
+                                           mpe::g_state->reflection->ReadValueText(
+                                               engine.address, definitions.value(), 3)));
+            }
         }
 
         // Whichever drivers exist as classes, and whichever are live right now.
