@@ -350,6 +350,12 @@ ReflectionLayout Reflection::DetectLayout(const std::vector<std::uintptr_t>& can
         }
     }
 
+    // ArrayDim and PropertyFlags sit either side of ElementSize, so they follow from a
+    // measured ElementSize rather than from a second guess at where FField ends. That
+    // distinction matters: FField's flags word is padded out to a pointer boundary, and
+    // deriving both from Offset_Internal put each of them four bytes early.
+    const std::size_t element_slot = best.element_size_offset;
+
     // ArrayDim: almost every property is a single element, none is zero or absurd.
     const auto plausible_array_dim = [&](std::size_t slot) {
         std::size_t ones = 0;
@@ -364,47 +370,152 @@ ReflectionLayout Reflection::DetectLayout(const std::vector<std::uintptr_t>& can
         }
         return seen >= 3 && ones * 4 >= seen * 3;
     };
-    if (const std::size_t derived = derive(-0x18);
-        derived != 0 && plausible_array_dim(derived)) {
-        best.array_dim_offset = derived;
-    }
-
-    // PropertyFlags: a 64 bit mask. Real flag sets never reach the top sixteen bits, and
-    // a property with no flags at all is rare enough that requiring most to be non zero
-    // separates the mask from the padding beside it.
-    const auto plausible_flags = [&](std::size_t slot) {
-        if ((slot & 0x7u) != 0) {
-            return false;
-        }
-        std::size_t nonzero = 0;
-        std::size_t seen    = 0;
-        for (const std::uintptr_t node : sample) {
-            const auto value = memory::Read<std::uint64_t>(node + slot);
-            if (!value.has_value() || *value >= (1ull << 48)) {
-                return false;
-            }
-            ++seen;
-            nonzero += (*value != 0) ? 1 : 0;
-        }
-        return seen >= 3 && nonzero * 2 >= seen;
-    };
-    if (const std::size_t derived = derive(-0xC); derived != 0 && plausible_flags(derived)) {
-        best.property_flags_offset = derived;
+    if (element_slot >= 4 && plausible_array_dim(element_slot - 4)) {
+        best.array_dim_offset = element_slot - 4;
     } else {
-        for (std::size_t slot = derive(-0x20); slot != 0 && slot < offset_slot; slot += 8) {
-            if (plausible_flags(slot)) {
-                best.property_flags_offset = slot;
+        for (std::size_t slot = derive(-0x24); slot != 0 && slot < offset_slot; slot += 4) {
+            if (slot != element_slot && plausible_array_dim(slot)) {
+                best.array_dim_offset = slot;
                 break;
             }
         }
     }
 
-    best.rep_index_offset  = derive(-0x4);
-    best.rep_notify_offset = derive(0x4);
+    // PropertyFlags: a 64 bit mask, found by its signature rather than by its range.
+    //
+    // Two range tests failed here before this one. An upper bound of bit 48 rejected every
+    // real property, because the header tool sets one of the three native access specifier
+    // bits, and those live at bits 52 to 54. Raising it to bit 55 then caught
+    // CPF_SkipSerialization instead. Chasing the ceiling is the wrong idea: the enum grows
+    // upward with every engine release and a bound that is right today is wrong at the
+    // next one.
+    //
+    // The access specifier itself is the signature. Every property the header tool emits
+    // is public, protected or private and never two of those at once, so exactly one bit
+    // set inside that three bit window identifies the mask and nothing else in an FProperty
+    // imitates it.
+    constexpr std::uint64_t kAccessMask    = 0x0070000000000000ull;
+    constexpr std::uint64_t kAccessPublic  = 0x0010000000000000ull;
+    constexpr std::uint64_t kAccessProtect = 0x0020000000000000ull;
+    constexpr std::uint64_t kAccessPrivate = 0x0040000000000000ull;
 
-    // FStructProperty::Struct and its siblings begin where FProperty ends: RepNotifyFunc
-    // is an FName, then four in memory list pointers.
-    best.struct_property_inner_offset = derive(0x2C);
+    const auto score_flags = [&](std::size_t slot) -> std::size_t {
+        if ((slot & 0x7u) != 0) {
+            return 0;
+        }
+        std::size_t matching = 0;
+        std::size_t seen     = 0;
+        for (const std::uintptr_t node : sample) {
+            const auto value = memory::Read<std::uint64_t>(node + slot);
+            if (!value.has_value()) {
+                continue;
+            }
+            ++seen;
+            const std::uint64_t access = *value & kAccessMask;
+            if (access == kAccessPublic || access == kAccessProtect ||
+                access == kAccessPrivate) {
+                ++matching;
+            }
+        }
+        return (seen >= 3 && matching * 5 >= seen * 3) ? matching : 0;
+    };
+
+    std::size_t flags_score = 0;
+    if (element_slot != 0) {
+        flags_score = score_flags(element_slot + 4);
+        if (flags_score > 0) {
+            best.property_flags_offset = element_slot + 4;
+        }
+    }
+    if (flags_score == 0) {
+        // Aligned up, because the mask is eight byte aligned and stepping by eight from an
+        // unaligned start visits nothing that could hold it.
+        for (std::size_t slot = (derive(-0x20) + 7u) & ~std::size_t{7};
+             slot != 0 && slot < offset_slot; slot += 8) {
+            if (const std::size_t score = score_flags(slot); score > flags_score) {
+                flags_score                = score;
+                best.property_flags_offset = slot;
+            }
+        }
+    }
+
+    best.rep_index_offset = derive(-0x4);
+
+    // Where FProperty ends, measured by what the subclasses put there.
+    //
+    // Deriving this from Offset_Internal was wrong on this build. UE 5.5 puts RepNotifyFunc
+    // after the four in memory link pointers rather than before them, so the derived
+    // sizeof was 0x2C past Offset_Internal when the real answer is 0x2C plus another
+    // twenty bytes. The measurement needs no such assumption: an FStructProperty's first
+    // extra member points at a UScriptStruct and an FObjectProperty's at a UClass, and
+    // nothing else inside an FProperty does either.
+    const auto class_of_object = [&](std::uintptr_t object) -> std::string {
+        const auto klass = memory::ReadPointer(object + kObjectClassPrivateOffset);
+        if (!klass.has_value() || !memory::IsPlausiblePointer(*klass)) {
+            return {};
+        }
+        return ResolveNameAt(*klass + kObjectNamePrivateOffset);
+    };
+
+    std::size_t inner_hits = 0;
+    for (std::size_t slot = offset_slot + 8; slot <= offset_slot + 0x60; slot += 8) {
+        std::size_t hits = 0;
+        for (const std::uintptr_t node : sample) {
+            const auto klass = memory::ReadPointer(node + winner.field_class);
+            if (!klass.has_value() || !memory::IsPlausiblePointer(*klass)) {
+                continue;
+            }
+            const std::string type = ResolveNameAt(*klass);
+            const bool wants_struct = type == "StructProperty";
+            const bool wants_class  = type == "ObjectProperty" || type == "ClassProperty" ||
+                                     type == "ObjectPtrProperty";
+            if (!wants_struct && !wants_class) {
+                continue;
+            }
+            const auto target = memory::ReadPointer(node + slot);
+            if (!target.has_value() || !memory::IsPlausiblePointer(*target)) {
+                continue;
+            }
+            const std::string target_class = class_of_object(*target);
+            if ((wants_struct && target_class == "ScriptStruct") ||
+                (wants_class && target_class == "Class")) {
+                ++hits;
+            }
+        }
+        if (hits > inner_hits) {
+            inner_hits                        = hits;
+            best.struct_property_inner_offset = slot;
+        }
+    }
+    if (inner_hits == 0) {
+        best.struct_property_inner_offset = derive(0x2C);
+    }
+
+    // RepNotifyFunc is the last member of FProperty, so it sits one FName before the end.
+    // Checked rather than assumed: it must never look like a pointer, because the members
+    // around it are exactly that and confusing the two is how this went wrong before.
+    if (best.struct_property_inner_offset >= 8) {
+        const std::size_t slot = best.struct_property_inner_offset - 8;
+        bool              ok   = true;
+        for (const std::uintptr_t node : sample) {
+            const auto value = memory::ReadPointer(node + slot);
+            if (!value.has_value()) {
+                continue;
+            }
+            if (memory::IsPlausiblePointer(*value) && memory::IsReadable(*value, 0x30)) {
+                ok = false;
+                break;
+            }
+            const std::string name = ResolveNameAt(node + slot);
+            if (*value != 0 && name.empty()) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            best.rep_notify_offset = slot;
+        }
+    }
 
     // ---- Phase four: UStruct, pinned against classes of known size --------------------
     best.super_struct_offset = kStructSuperOffset;
@@ -846,39 +957,62 @@ Expected<PropertyInfo> Reflection::ReadProperty(std::uintptr_t property_address)
 
     // What the property points at. A wall of "ObjectProperty" says nothing; the same wall
     // annotated with BlamNetworkPlayerStateComponent is a map of the session.
+    //
+    // Searched over the first few members past FProperty rather than read from a fixed one.
+    // FStructProperty leads with its UScriptStruct, but FArrayProperty on this build puts
+    // its element flags first and the inner property after them, so a single offset that
+    // is right for one is a null read for the other.
     if (layout_.struct_property_inner_offset != 0) {
-        const auto inner = memory::ReadPointer(property_address +
-                                               layout_.struct_property_inner_offset);
-        if (inner.has_value() && memory::IsPlausiblePointer(*inner)) {
-            // FEnumProperty leads with its underlying integer property, not with the
-            // UEnum, so it belongs with the containers rather than with the object types.
-            const bool is_field = info.type_name == "ArrayProperty" ||
-                                  info.type_name == "SetProperty" ||
-                                  info.type_name == "OptionalProperty" ||
-                                  info.type_name == "EnumProperty";
-            const bool is_object = info.type_name == "StructProperty" ||
-                                   info.type_name == "ObjectProperty" ||
-                                   info.type_name == "ObjectPtrProperty" ||
-                                   info.type_name == "ClassProperty" ||
-                                   info.type_name == "ClassPtrProperty" ||
-                                   info.type_name == "WeakObjectProperty" ||
-                                   info.type_name == "SoftObjectProperty" ||
-                                   info.type_name == "InterfaceProperty" ||
-                                   info.type_name == "ByteProperty";
+        // FEnumProperty leads with its underlying integer property, not with the UEnum, so
+        // it belongs with the containers rather than with the object types.
+        const bool is_field = info.type_name == "ArrayProperty" ||
+                              info.type_name == "SetProperty" ||
+                              info.type_name == "OptionalProperty" ||
+                              info.type_name == "EnumProperty";
+        const bool is_object = info.type_name == "StructProperty" ||
+                               info.type_name == "ObjectProperty" ||
+                               info.type_name == "ObjectPtrProperty" ||
+                               info.type_name == "ClassProperty" ||
+                               info.type_name == "ClassPtrProperty" ||
+                               info.type_name == "WeakObjectProperty" ||
+                               info.type_name == "SoftObjectProperty" ||
+                               info.type_name == "InterfaceProperty" ||
+                               info.type_name == "ByteProperty";
+
+        for (std::size_t step = 0; step <= 0x10 && info.inner_address == 0; step += 8) {
+            const auto inner =
+                memory::ReadPointer(property_address + layout_.struct_property_inner_offset + step);
+            if (!inner.has_value() || !memory::IsPlausiblePointer(*inner)) {
+                continue;
+            }
+
             std::string resolved;
             if (is_field) {
-                // An inner FProperty, so its name is where a field's name lives.
-                resolved = ResolveNameAt(*inner + layout_.field_name_offset);
-                if (const auto klass = memory::ReadPointer(*inner + layout_.field_class_offset);
-                    klass.has_value() && memory::IsPlausiblePointer(*klass)) {
-                    const std::string element = ResolveNameAt(*klass);
-                    if (IsPropertyClassName(element)) {
-                        resolved = element;
-                    }
+                // An inner FProperty, accepted only when it says it is one.
+                const auto klass = memory::ReadPointer(*inner + layout_.field_class_offset);
+                if (!klass.has_value() || !memory::IsPlausiblePointer(*klass)) {
+                    continue;
                 }
+                const std::string element = ResolveNameAt(*klass);
+                if (!IsPropertyClassName(element)) {
+                    continue;
+                }
+                resolved = element;
             } else if (is_object) {
+                // A UObject, accepted only when its own class names a reflected type.
+                const auto klass = memory::ReadPointer(*inner + kObjectClassPrivateOffset);
+                if (!klass.has_value() || !memory::IsPlausiblePointer(*klass)) {
+                    continue;
+                }
+                const std::string kind = ResolveNameAt(*klass + kObjectNamePrivateOffset);
+                if (kind != "ScriptStruct" && kind != "Class" && kind != "Enum") {
+                    continue;
+                }
                 resolved = ResolveNameAt(*inner + kObjectNamePrivateOffset);
+            } else {
+                break;
             }
+
             if (IsPlausibleFieldName(resolved)) {
                 info.inner_address   = *inner;
                 info.inner_type_name = std::move(resolved);
