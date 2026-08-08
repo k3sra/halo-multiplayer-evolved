@@ -12,13 +12,16 @@
 
 #pragma comment(lib, "winhttp.lib")
 
+#include <algorithm>
 #include <atomic>
 #include <format>
 #include <functional>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -46,6 +49,22 @@ private:
 };
 
 std::string             g_endpoint;
+
+/// Which run of the game this is.
+///
+/// The label names a machine, and a machine restarts. Two sessions from one person are two
+/// separate stories and reading them interleaved is worse than reading neither, so every
+/// report carries an id minted once per process and never reused.
+std::string             g_session_id;
+
+/// How long to wait between unprompted reports, in seconds.
+///
+/// Set by the collector rather than compiled in. Sending everything from every machine is
+/// what makes a fault diagnosable, and it is also what runs a free collector out of its
+/// daily request budget, so the rate has to be adjustable after the fact. A header on the
+/// reply changes it for every machine at once, without anybody installing anything.
+std::atomic<int>        g_flush_seconds{20};
+
 /// Asked for each report rather than taken once.
 ///
 /// Sharing starts before Steam is up, so a label captured at that moment says PLAYER (0) on
@@ -233,8 +252,12 @@ void Post(const std::string& body) {
         return;
     }
 
-    static constexpr wchar_t kHeaders[] = L"Content-Type: text/plain; charset=utf-8\r\n";
-    if (WinHttpSendRequest(request.get(), kHeaders, static_cast<DWORD>(-1),
+    // Identity in the headers as well as the body, so a collector can file a report
+    // without parsing it. The body stays human readable for anyone reading it directly.
+    const std::wstring headers =
+        L"Content-Type: text/plain; charset=utf-8\r\nX-MPE-Session: " + Widen(g_session_id) +
+        L"\r\nX-MPE-Label: " + Widen(Label()) + L"\r\n";
+    if (WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(-1),
                            const_cast<char*>(body.data()),
                            static_cast<DWORD>(body.size()),
                            static_cast<DWORD>(body.size()), 0) == FALSE ||
@@ -248,27 +271,42 @@ void Post(const std::string& body) {
     (void)WinHttpQueryHeaders(request.get(),
                               WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr,
                               &status, &length, WINHTTP_NO_HEADER_INDEX);
-    MPE_LOG_INFO("log shared ({} bytes), collector answered {}", body.size(), status);
+    // The collector decides how often it wants to hear from us.
+    //
+    // Clamped, because a rate this machine did not choose is still a rate this machine
+    // has to live with: a collector answering zero would turn the sender into a busy
+    // loop, and one answering an hour would lose the session it was meant to record.
+    wchar_t interval[32]   = {};
+    DWORD   interval_size  = sizeof(interval);
+    if (WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_CUSTOM, L"X-Flush-Seconds",
+                            interval, &interval_size, WINHTTP_NO_HEADER_INDEX) != FALSE) {
+        if (const int wanted = ::_wtoi(interval); wanted > 0) {
+            g_flush_seconds.store(std::clamp(wanted, 5, 600), std::memory_order_release);
+        }
+    }
+
+    MPE_LOG_INFO("log shared ({} bytes), collector answered {}, next in {}s", body.size(),
+                status, g_flush_seconds.load(std::memory_order_acquire));
 }
 
 void Worker() {
-    // Waiting a few seconds after the first reason means a failure and everything it causes
+    // Waiting a moment after the first reason means a failure and everything it causes
     // immediately afterwards travel in one report, which is how they want to be read.
-    constexpr auto kCoalesce = std::chrono::seconds(6);
-
-    // Nothing is sent unprompted forever, but a session that is running normally still has
-    // to be recorded: the interesting question is often what a machine was doing in the
-    // minute before somebody noticed anything, and nothing about that minute is a failure.
-    constexpr auto kHeartbeat = std::chrono::seconds(45);
+    constexpr auto kCoalesce = std::chrono::seconds(2);
 
     // Each report carries what is new, so this is a cap on a burst rather than on the log.
     constexpr std::size_t kMaxDeltaBytes = 700u * 1024u;
 
     while (g_running.load(std::memory_order_acquire)) {
+        // Re-read every pass, so a rate the collector changed takes effect on the next
+        // report rather than the next launch.
+        const auto heartbeat =
+            std::chrono::seconds(g_flush_seconds.load(std::memory_order_acquire));
+
         std::string reason;
         {
             std::unique_lock lock(g_mutex);
-            g_wake.wait_for(lock, kHeartbeat, [] {
+            g_wake.wait_for(lock, heartbeat, [] {
                 return g_has_pending || !g_running.load(std::memory_order_acquire);
             });
             if (!g_running.load(std::memory_order_acquire)) {
@@ -295,6 +333,7 @@ void Worker() {
         std::ostringstream body;
         body << "==== MultiplayerEvolved report ====\n"
              << "from     : " << Label() << '\n'
+             << "session  : " << g_session_id << '\n'
              << "sequence : " << g_sequence << '\n'
              << "reason   : " << reason << '\n'
              << "bytes    : " << delta.size() << '\n'
@@ -368,6 +407,19 @@ void Start(const std::filesystem::path& data_directory, std::function<std::strin
     }
     g_log_path = data_directory / "MultiplayerEvolved.log";
     g_describe = std::move(describe);
+
+    // A fresh id for this run of the game.
+    //
+    // Random rather than derived from anything about the machine. Two people launching at
+    // the same second must not collide, and a machine that restarts must not continue its
+    // previous session's story: those are two separate runs and reading them interleaved is
+    // worse than reading neither.
+    {
+        std::random_device                            entropy;
+        std::uniform_int_distribution<std::uint32_t>  digits(0, 0xFFFFFFFFu);
+        g_session_id = std::format("{:08x}{:08x}", digits(entropy), digits(entropy));
+    }
+
     g_running.store(true, std::memory_order_release);
     g_worker = std::thread(&Worker);
 
@@ -418,6 +470,7 @@ void Stop() {
         std::ostringstream body;
         body << "==== MultiplayerEvolved report ====\n"
              << "from     : " << Label() << '\n'
+             << "session  : " << g_session_id << '\n'
              << "sequence : " << g_sequence << " (final)\n"
              << "reason   : shutdown\n"
              << "bytes    : " << delta.size() << "\n\n"
