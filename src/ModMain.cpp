@@ -6790,6 +6790,109 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         }
         return written;
     }
+    if (starts_with("sig ")) {
+        // The full signature of every reflected function whose name matches.
+        //
+        // Knowing that MeteoriteLobbyNotifier has AcceptInvite is not enough to call it.
+        // ProcessEvent is handed one buffer holding every parameter laid out exactly as
+        // the function expects, so what is needed is the parameter list, each one's offset
+        // and size, which of them are outputs, and the total buffer size. UFunction keeps
+        // all of that, and its parameters are simply its own child properties.
+        const std::string wanted = command.substr(std::strlen("sig "));
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        // sizeof(UStruct), read from the engine's own class for it rather than assumed.
+        // UFunction's own fields begin exactly there.
+        std::size_t function_body = 0;
+        for (const mpe::unreal::ObjectInfo& object :
+             mpe::g_state->objects->FindByName("Struct", 4)) {
+            if (object.class_name != "Class") {
+                continue;
+            }
+            const auto size = mpe::unreal::memory::Read<std::int32_t>(
+                object.address + mpe::g_state->reflection->Layout().properties_size_offset);
+            if (size.has_value() && *size > 0x40 && *size < 0x400) {
+                function_body = static_cast<std::size_t>(*size);
+            }
+            break;
+        }
+
+        struct FunctionFlag {
+            std::uint32_t    bit;
+            std::string_view name;
+        };
+        static constexpr FunctionFlag kFunctionFlags[] = {
+            {0x00000040u, "Net"},        {0x00000080u, "NetReliable"},
+            {0x00000100u, "NetRequest"}, {0x00000200u, "Exec"},
+            {0x00000400u, "Native"},     {0x00000800u, "Event"},
+            {0x00001000u, "NetResponse"},{0x00002000u, "Static"},
+            {0x00004000u, "NetMulticast"},{0x00200000u, "NetServer"},
+            {0x01000000u, "NetClient"},  {0x04000000u, "BlueprintCallable"},
+        };
+
+        int matched = 0;
+        mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
+            if (object.class_name.find("Function") == std::string::npos ||
+                object.name.find(wanted) == std::string::npos) {
+                return true;
+            }
+            ++matched;
+
+            std::string flags_text;
+            std::string counts;
+            if (function_body != 0) {
+                if (const auto flags = mpe::unreal::memory::Read<std::uint32_t>(
+                        object.address + function_body);
+                    flags.has_value()) {
+                    for (const FunctionFlag& flag : kFunctionFlags) {
+                        if ((*flags & flag.bit) != 0) {
+                            flags_text += flags_text.empty() ? "" : "|";
+                            flags_text += flag.name;
+                        }
+                    }
+                }
+                const auto parms = mpe::unreal::memory::Read<std::uint8_t>(
+                    object.address + function_body + 4);
+                const auto size = mpe::unreal::memory::Read<std::uint16_t>(
+                    object.address + function_body + 6);
+                counts = std::format(", {} parm(s), {} byte frame", parms.value_or(0),
+                                     size.value_or(0));
+            }
+
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("{} [{}]{}", mpe::g_state->objects->BuildPath(object),
+                                       flags_text.empty() ? "no flags" : flags_text, counts));
+
+            for (const mpe::unreal::PropertyInfo& parameter :
+                 mpe::g_state->reflection->ReadProperties(object.address)) {
+                // CPF_Parm, CPF_OutParm and CPF_ReturnParm are what separate an argument
+                // from a local, and an input from an output.
+                std::string role = "local";
+                if ((parameter.flags & 0x0000000000000400ull) != 0) {
+                    role = "return";
+                } else if ((parameter.flags & 0x0000000000000100ull) != 0) {
+                    role = "out";
+                } else if ((parameter.flags & 0x0000000000000080ull) != 0) {
+                    role = "in";
+                }
+                mpe::log::Write(mpe::log::Level::Info, "Mod",
+                               std::format("    {:<6} {}", role,
+                                           mpe::g_state->reflection->DescribeProperty(parameter)));
+            }
+            return matched < 24;
+        });
+
+        if (matched == 0) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no reflected function matching '{}'", wanted));
+        }
+        return matched;
+    }
     if (starts_with("field ")) {
         // Hex dump of one FProperty object itself, rather than of the value it describes.
         //
