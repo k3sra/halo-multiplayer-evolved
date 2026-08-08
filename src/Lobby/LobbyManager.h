@@ -166,6 +166,14 @@ struct LobbyTimings {
     double load_timeout_seconds{180.0};
     double keepalive_interval_seconds{2.0};
     double roster_broadcast_interval_seconds{1.0};
+
+    /// How long a client waits without hearing from the host before giving up on it.
+    ///
+    /// The host rebroadcasts the roster every second while a lobby is open, so silence for
+    /// twelve of those is twelve missed messages and not a slow frame. Short enough that a
+    /// player is not left staring at a lobby nobody is running, long enough that a stall
+    /// does not throw them out of one that is.
+    double host_silence_seconds{12.0};
     std::uint8_t countdown_seconds{5};
 };
 
@@ -355,6 +363,8 @@ private:
     /// whole handshake timeout and then a failure. Repeating it turns that into a pause.
     double handshake_resend_elapsed_{0.0};
     double roster_broadcast_elapsed_{0.0};
+    /// Time since a client last heard anything at all from the host.
+    double host_silence_elapsed_{0.0};
     double countdown_remaining_{0.0};
     /// Wall clock instant the countdown ends, in epoch milliseconds.
     ///
