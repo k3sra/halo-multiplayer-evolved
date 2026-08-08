@@ -241,6 +241,10 @@ void PrepareLoadingOverlay();
 void ForgetFrontendUI();
 void MaintainGameThreadPump();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
+struct NetworkCensus;
+[[nodiscard]] NetworkCensus TakeNetworkCensus(const unreal::ObjectArray& objects);
+[[nodiscard]] Result CallCoopFunction(std::string_view class_name, std::string_view function_name,
+                                      std::uint8_t& out_return);
 void DumpClassSurface(const unreal::ObjectArray& objects, const unreal::Reflection& reflection);
 void DumpOneClass(const unreal::ObjectArray& objects, const unreal::Reflection& reflection,
                   const std::string& name, std::uintptr_t class_object);
@@ -349,7 +353,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.12";
+constexpr const char* kModVersion = "0.2.13";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -1895,8 +1899,11 @@ void ForgetFrontendUI() {
 /// cannot report that it is gone; a counter that stops moving says the same thing.
 void MaintainGameThreadPump() {
     static std::uint64_t                         s_last_count = 0;
-    static std::chrono::steady_clock::time_point s_last_moved{};
+    static std::chrono::steady_clock::time_point s_last_change{};
+    static std::chrono::steady_clock::time_point s_installed_at{};
     static std::chrono::steady_clock::time_point s_last_complaint{};
+    /// Hosts that were installed and then produced nothing. Never tried twice.
+    static std::set<std::uintptr_t> s_silent_hosts;
 
     // Nothing to watch until there has been a pump.
     //
@@ -1911,22 +1918,45 @@ void MaintainGameThreadPump() {
     const auto          now   = std::chrono::steady_clock::now();
     const std::uint64_t count = unreal::PumpEventCount();
     if (count != s_last_count) {
-        s_last_count = count;
-        s_last_moved = now;
+        s_last_count  = count;
+        s_last_change = now;
+        // A host that is delivering is a host worth keeping, and it clears the record of
+        // everything that was not: a widget that is silent in the front end may be the
+        // busiest object in a loaded world.
+        s_silent_hosts.clear();
         return;
     }
-    if (s_last_moved == std::chrono::steady_clock::time_point{}) {
-        s_last_moved = now;
+    if (s_last_change == std::chrono::steady_clock::time_point{}) {
+        s_last_change = now;
         return;
     }
 
-    // Two seconds of complete silence. A pump on anything the player can see reports events
-    // many times a second; one that has said nothing for two seconds is on something that no
-    // longer exists.
-    if (now - s_last_moved < std::chrono::seconds(2)) {
+    // Two seconds of complete silence. A pump on anything the game drives reports events
+    // many times a second; one that has said nothing for two seconds is on something the
+    // game is no longer driving.
+    if (now - s_last_change < std::chrono::seconds(2)) {
         return;
     }
-    s_last_moved = now;
+
+    // The host that has just proved itself silent is recorded before another is chosen.
+    //
+    // WHY THIS EXISTS AT ALL
+    //
+    // The previous version refused to move unless it found a different candidate, and it
+    // only ever looked for a game instance. So the first move put the pump on the game
+    // instance, and every move after that found the same object, compared it against the
+    // host already in place, and returned. The pump stayed dead for the rest of the
+    // session and the watchdog reported nothing, because from its point of view there was
+    // nothing to do.
+    //
+    // That is the real lesson here: a game instance is permanent, which makes it a safe
+    // host and a poor one. It receives ProcessEvent only when something calls a reflected
+    // function on it, and in a loaded world almost nothing does. Being certain to exist is
+    // not the same as being certain to be called, and only the second one makes a pump.
+    const std::uintptr_t previous = unreal::GameThreadPumpHost();
+    if (previous != 0 && now - s_installed_at >= std::chrono::seconds(3)) {
+        s_silent_hosts.insert(previous);
+    }
 
     std::optional<unreal::ObjectArray> objects;
     std::optional<unreal::Reflection>  reflection;
@@ -1934,57 +1964,256 @@ void MaintainGameThreadPump() {
         return;
     }
 
-    // The game instance, because it outlives every level the game will ever load.
+    // Candidates, best first.
     //
-    // The first attempt at this used a player controller, on the reasoning that there is
-    // always exactly one and it is never idle. Both halves are true and it crashed the game
-    // anyway, because a controller is destroyed and rebuilt on every level transition, and a
-    // transition is precisely when this code runs. Pointing an object's virtual table at a
-    // copy is only safe while that object lives; the crash landed inside this pump, called
-    // through a host that had already been freed.
-    //
-    // A UGameInstance is created once when the process starts and released when it exits. It
-    // is not rebuilt by travel, it has no world to belong to, and nothing collects it. That
-    // removes the dangling host as a category rather than narrowing the window in which it
-    // happens, which is the only kind of fix worth having for this.
-    const std::uintptr_t previous  = unreal::GameThreadPumpHost();
-    std::uintptr_t       candidate = 0;
+    // A Blueprint generated class runs its graphs through ProcessEvent, so anything the
+    // game ticks that was authored in Blueprint is called many times a second. Those are
+    // the hosts that actually work in a loaded world. The game instance stays on the list
+    // as the last resort, because it is the only one guaranteed to exist.
+    struct Candidate {
+        std::uintptr_t address{0};
+        int            rank{0};
+        std::string    label;
+    };
+    std::vector<Candidate> candidates;
+
     objects->ForEach([&](const unreal::ObjectInfo& object) {
         if (object.name.rfind("Default__", 0) == 0 ||
             object.name.find("_GEN_VARIABLE") != std::string::npos) {
             return true;
         }
-        // The instance itself, not one of its subsystems. A subsystem is also permanent,
-        // but the instance is what the engine drives directly.
-        if (object.class_name.find("GameInstance") == std::string::npos ||
-            object.class_name.find("Subsystem") != std::string::npos) {
+        if (s_silent_hosts.contains(object.address)) {
             return true;
         }
-        candidate = object.address;
-        return false;
+
+        const std::string& type = object.class_name;
+        const bool blueprint =
+            type.size() > 2 && type.compare(type.size() - 2, 2, "_C") == 0;
+
+        // Existing is not the same as being driven, and most widgets in this process are
+        // pooled: created once, never shown, never ticked. Rotating through them blindly
+        // found a hundred silent hosts in a row, each costing two seconds to rule out.
+        //
+        // What the game calls every frame during play is the head up display. Those
+        // widgets are recomputed continuously from the player's own state, so they run
+        // their Blueprint graphs constantly, which is exactly what a pump needs. The menu
+        // families are ranked below them because they are the pooled ones, and they only
+        // run at all while the front end is up.
+        static constexpr std::string_view kInWorld[] = {
+            "HUD",        "Reticle",     "MotionTracker", "ShieldHealth", "WeaponCradle",
+            "Navpoint",   "Crosshair",   "GrenadeCradle", "AmmoPickup",   "DamageIndicator",
+            "Objectives", "PlayerRespawn",
+        };
+        static constexpr std::string_view kFrontEndOnly[] = {
+            "MetUI", "Meteorite", "Squad", "Tooltip", "Toast", "TitleMenu", "PauseMenu",
+        };
+
+        const auto mentions = [&type](const auto& list) {
+            for (const std::string_view fragment : list) {
+                if (type.find(fragment) != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        int rank = 0;
+        if (blueprint && mentions(kInWorld)) {
+            rank = 6; // Redrawn every frame while somebody is playing.
+        } else if (blueprint && type.rfind("WBP_", 0) == 0 && !mentions(kFrontEndOnly)) {
+            rank = 5;
+        } else if (blueprint && !mentions(kFrontEndOnly)) {
+            rank = 4;
+        } else if (blueprint) {
+            rank = 3;
+        } else if (type.find("GameInstance") != std::string::npos &&
+                   type.find("Subsystem") == std::string::npos) {
+            rank = 1; // Permanent, safe, and usually silent. The last resort, not the first.
+        } else {
+            return true;
+        }
+        candidates.push_back({object.address, rank, object.class_name});
+        return candidates.size() < 4096;
     });
 
-    if (candidate == 0 || candidate == previous) {
+    if (candidates.empty()) {
+        if (now - s_last_complaint >= std::chrono::seconds(30)) {
+            s_last_complaint = now;
+            MPE_LOG_WARN("the game thread pump is silent and every candidate host has "
+                        "already been tried and found silent too");
+        }
         return;
     }
 
-    // The old host is abandoned rather than restored. If it still existed the pump would
-    // still be reporting, so writing its original virtual table back would be a write into
-    // whatever now occupies that address.
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& a, const Candidate& b) { return a.rank > b.rank; });
+
+    const Candidate& chosen = candidates.front();
+
+    // The old host is abandoned rather than restored. If it still existed and were being
+    // driven the pump would still be reporting, so writing its original virtual table back
+    // would be a write into whatever now occupies that address.
     unreal::ForgetGameThreadPump();
-    if (const Result installed = unreal::InstallGameThreadPump(candidate); installed.ok()) {
-        MPE_LOG_INFO("the game thread pump went silent and has been moved to the game "
-                    "instance at 0x{:X}, which outlives every level; the mod can run work "
-                    "in this world again",
-                    candidate);
+    if (const Result installed = unreal::InstallGameThreadPump(chosen.address); installed.ok()) {
+        s_installed_at = now;
+        s_last_change  = now;
+        MPE_LOG_INFO("the game thread pump went silent; moved it to {} at 0x{:X} (rank {}, "
+                    "{} candidate(s) available, {} already known silent)",
+                    chosen.label, chosen.address, chosen.rank, candidates.size(),
+                    s_silent_hosts.size());
     } else if (now - s_last_complaint >= std::chrono::seconds(30)) {
         // Said once in a while rather than every attempt. A pump that cannot be replaced
         // will fail to be replaced every two seconds for as long as the game runs, and a
         // warning repeated that often is not a warning, it is the log.
         s_last_complaint = now;
-        MPE_LOG_WARN("the game thread pump went silent and could not be re-established: {}",
-                    installed.message());
+        s_silent_hosts.insert(chosen.address);
+        MPE_LOG_WARN("the game thread pump went silent and could not be re-established on "
+                    "{}: {}",
+                    chosen.label, installed.message());
     }
+}
+
+/// Counts the networking objects that only exist while a session is up.
+///
+/// WHY A COUNT AND NOT A LIST
+///
+/// The question being asked of the co-op entry points is not "did the call return true", it
+/// is "did anything happen". A net driver, a connection, a player state and a Blam endpoint
+/// component all come into existence when the engine genuinely opens a session and none of
+/// them exists in the front end. Counting them before a call and after it turns an opaque
+/// native function into an experiment with a result.
+struct NetworkCensus {
+    std::size_t net_drivers{0};
+    std::size_t net_connections{0};
+    std::size_t player_states{0};
+    std::size_t player_controllers{0};
+    std::size_t blam_endpoint_components{0};
+    std::size_t playfab_objects{0};
+    std::size_t online_sessions{0};
+
+    [[nodiscard]] std::string Describe() const {
+        return std::format("drivers {}, connections {}, player states {}, controllers {}, "
+                           "blam endpoint components {}, playfab {}, online sessions {}",
+                           net_drivers, net_connections, player_states, player_controllers,
+                           blam_endpoint_components, playfab_objects, online_sessions);
+    }
+    [[nodiscard]] bool operator==(const NetworkCensus&) const = default;
+};
+
+[[nodiscard]] NetworkCensus TakeNetworkCensus(const unreal::ObjectArray& objects) {
+    NetworkCensus census;
+    objects.ForEach([&](const unreal::ObjectInfo& object) {
+        // Class default objects are templates that nothing plays from. Counting them would
+        // report a driver for every build of the game, session or not.
+        if (object.name.rfind("Default__", 0) == 0) {
+            return true;
+        }
+        const std::string& type = object.class_name;
+        if (type.find("NetDriver") != std::string::npos) {
+            ++census.net_drivers;
+        } else if (type.find("NetConnection") != std::string::npos) {
+            ++census.net_connections;
+        } else if (type.find("PlayerState") != std::string::npos) {
+            ++census.player_states;
+        } else if (type.find("PlayerController") != std::string::npos) {
+            ++census.player_controllers;
+        } else if (type == "BlamNetworkPlayerStateComponent" ||
+                   type == "BlamNetworkGameStateComponent" ||
+                   type == "BlamNetworkPlayerControllerComponent") {
+            ++census.blam_endpoint_components;
+        } else if (type.find("PlayFab") != std::string::npos) {
+            ++census.playfab_objects;
+        } else if (type.find("OnlineSession") != std::string::npos) {
+            ++census.online_sessions;
+        }
+        return true;
+    });
+    return census;
+}
+
+/// Calls a reflected function with no arguments on a live instance of a class.
+///
+/// This is how the game's own co-op is reached. BeginAllowInvites, JoinFriend and the rest
+/// are native and BlueprintCallable, which means the engine describes them completely and
+/// ProcessEvent will run them; nothing has to be patched or reimplemented. What is not
+/// known is what they do, so the census either side of the call is the point.
+///
+/// out_return receives the first byte of the parameter frame, which is where a function
+/// returning a bool or a small enum puts its answer.
+[[nodiscard]] Result CallCoopFunction(std::string_view class_name, std::string_view function_name,
+                                      std::uint8_t& out_return) {
+    out_return = 0;
+
+    std::optional<unreal::ObjectArray> objects;
+    std::optional<unreal::Reflection>  reflection;
+    if (!TakeEngineView(objects, reflection) || !objects.has_value()) {
+        return Result::Fail(ErrorCode::InvalidState, "the object array is not available");
+    }
+
+    // A live instance, not the template. The template's fields are whatever the cooker
+    // baked in and calling a session function on one would act on nothing.
+    std::uintptr_t instance = 0;
+    for (const unreal::ObjectInfo& candidate : objects->FindByClassName(class_name, 16)) {
+        if (candidate.name.rfind("Default__", 0) != 0) {
+            instance = candidate.address;
+            break;
+        }
+    }
+    if (instance == 0) {
+        return Result::Fail(ErrorCode::NotFound,
+                            std::format("no live instance of {}", class_name));
+    }
+
+    const std::uintptr_t function = unreal::FindFunction(*objects, function_name, class_name);
+    if (function == 0) {
+        return Result::Fail(ErrorCode::NotFound,
+                            std::format("{} has no reflected function {}", class_name,
+                                        function_name));
+    }
+
+    const NetworkCensus before = TakeNetworkCensus(*objects);
+    MPE_LOG_INFO("coop: before {}::{}  {}", class_name, function_name, before.Describe());
+
+    // Sized well past any frame these functions declare, and zeroed, because Unreal writes
+    // return values back into the same block a caller passes in.
+    struct Frame {
+        alignas(16) std::byte bytes[256];
+    };
+    Frame frame{};
+
+    std::uint8_t returned = 0;
+    Result       called   = Result::Fail(ErrorCode::InvalidState, "the job did not run");
+    const Result posted   = unreal::RunOnGameThread(
+        [&]() {
+            called = unreal::CallFunction(instance, function, frame.bytes);
+            returned = static_cast<std::uint8_t>(frame.bytes[0]);
+        },
+        10000u);
+    if (!posted.ok()) {
+        return posted;
+    }
+    if (!called.ok()) {
+        return called;
+    }
+    out_return = returned;
+
+    MPE_LOG_INFO("coop: {}::{} returned, first frame byte {}", class_name, function_name,
+                returned);
+
+    // Read the world again. Anything the call started needs a moment to register, so this
+    // is asked twice rather than once.
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const NetworkCensus after = TakeNetworkCensus(*objects);
+        if (!(after == before)) {
+            MPE_LOG_INFO("coop: AFTER  {}  <- changed {} ms later", after.Describe(),
+                        (attempt + 1) * 500);
+            return Result::Success();
+        }
+    }
+    MPE_LOG_WARN("coop: three seconds later the networking object graph is unchanged; the "
+                "call did nothing observable");
+    return Result::Success();
 }
 
 /// Writes down the game's own networking surface, once.
@@ -6027,6 +6256,24 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         return command.rfind(prefix, 0) == 0;
     };
 
+    // "host listen" is rewritten before anything reads it.
+    //
+    // The dispatcher is a list of prefix tests in source order, so a short prefix hides
+    // every longer one below it. "host" is tested near the top and "host listen" far below,
+    // which meant the listen server command was unreachable: it went to the session host
+    // instead, which looked for a map, failed to find one, and returned FileNotFound.
+    //
+    // That produced the most expensive kind of wrong answer. The command appeared to run
+    // and to fail for a reason of its own, so the failure was written down as evidence
+    // about the engine, and it was evidence about nothing but the order of these tests.
+    // Rewriting it here is a fix at the point the ambiguity exists rather than a rule about
+    // where new commands may be added.
+    if (starts_with("host listen")) {
+        command = "travel /Game/Levels/Halo1/Solo/A30/A30?listen";
+        mpe::log::Write(mpe::log::Level::Info, "Mod",
+                       "'host listen' means: " + command);
+    }
+
     if (starts_with("ff status")) {
         return MPE_LogFriendlyFire();
     }
@@ -6689,6 +6936,64 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
             }
         }
         return total;
+    }
+    if (starts_with("coop ")) {
+        // Drives the game's own co-op session rather than a reimplementation of one.
+        //
+        // The game ships working networked play. Its entry points are reflected and
+        // BlueprintCallable, so they can be called directly: BeginAllowInvites opens the
+        // session to invites, JoinFriend joins one, AcceptInvite takes an invitation. What
+        // each of them actually does is the open question, and every verb here reports the
+        // networking object graph either side of the call so the answer is measured.
+        const std::string verb = command.substr(std::strlen("coop "));
+
+        struct Entry {
+            std::string_view verb;
+            std::string_view owner;
+            std::string_view function;
+        };
+        static constexpr Entry kEntries[] = {
+            {"invites on", "MeteoriteLobbyNotifier", "BeginAllowInvites"},
+            {"invites off", "MeteoriteLobbyNotifier", "EndAllowInvites"},
+            {"join", "MeteoriteProfileTrayWidgetBase", "JoinFriend"},
+            {"invite", "MeteoriteProfileTrayWidgetBase", "InviteFriend"},
+            {"canjoin", "MeteoriteProfileTrayWidgetBase", "CanShowJoinFriend"},
+            {"caninvite", "MeteoriteProfileTrayWidgetBase", "CanShowInviteFriend"},
+            {"refresh", "MeteoriteProfileTrayWidgetBase", "RequestUpdateForCanJoinFriend"},
+            {"ready", "BlamOnlineSessionSubsystem", "IsReadyToPlay"},
+        };
+
+        if (verb == "census") {
+            std::optional<mpe::unreal::ObjectArray> objects;
+            std::optional<mpe::unreal::Reflection>  reflection;
+            if (!mpe::TakeEngineView(objects, reflection) || !objects.has_value()) {
+                return -static_cast<int>(mpe::ErrorCode::InvalidState);
+            }
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("coop census: {}",
+                                       mpe::TakeNetworkCensus(*objects).Describe()));
+            return 1;
+        }
+
+        for (const Entry& entry : kEntries) {
+            if (verb != entry.verb) {
+                continue;
+            }
+            std::uint8_t   returned = 0;
+            const mpe::Result called =
+                mpe::CallCoopFunction(entry.owner, entry.function, returned);
+            if (!called.ok()) {
+                mpe::log::Write(mpe::log::Level::Error, "Mod",
+                               std::format("coop {}: {}", verb, called.message()));
+                return -static_cast<int>(mpe::ErrorCode::InvalidState);
+            }
+            return static_cast<int>(returned) + 1;
+        }
+
+        mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                       "usage: coop census | invites on | invites off | join | invite | "
+                       "canjoin | caninvite | refresh | ready");
+        return -static_cast<int>(mpe::ErrorCode::InvalidArgument);
     }
     if (starts_with("layout")) {
         // Prints the detected UE layout and re-checks it against a struct.
