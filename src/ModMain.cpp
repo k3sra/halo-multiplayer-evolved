@@ -5291,7 +5291,7 @@ void Initialize() {
     const log::Level level =
         DisableFlagPresent(L"quiet.on") ? log::Level::Info : log::Level::Trace;
     log::Initialize(DataDirectory() / "MultiplayerEvolved.log", level);
-    MPE_LOG_INFO("MultiplayerEvolved {} starting, logging at {}", MPE_VERSION_STRING,
+    MPE_LOG_INFO("MultiplayerEvolved {} starting, logging at {}", kModVersion,
                 log::ToString(level));
     MPE_LOG_INFO("game build: {}", GameBuildString());
     MPE_LOG_INFO("data directory: {}", DataDirectory().string());
@@ -5622,7 +5622,7 @@ __declspec(dllexport) int MPE_IsReady() {
 }
 
 __declspec(dllexport) const char* MPE_Version() {
-    return MPE_VERSION_STRING;
+    return mpe::kModVersion;
 }
 
 /// Hosts a session. mode is a canonical mode name such as "capture_the_flag".

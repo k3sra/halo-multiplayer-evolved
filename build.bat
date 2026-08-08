@@ -54,7 +54,7 @@ rem --- Flags ----------------------------------------------------------------
 rem /MT rather than /MD: static CRT means the mod has no Visual C++
 rem redistributable dependency, which removes the single most common install
 rem failure for a non technical user.
-set COMMON=/nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor /utf-8 /MT /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /DMPE_VERSION_STRING=\"0.1.0\" /I"%ROOT%src"
+set COMMON=/nologo /std:c++20 /EHsc /W4 /permissive- /Zc:__cplusplus /Zc:preprocessor /utf-8 /MT /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /I"%ROOT%src"
 
 if "%CONFIG%"=="debug" (
     set CFLAGS=%COMMON% /Od /Zi /D_DEBUG /Fd"%OUT%\MultiplayerEvolved.pdb"
