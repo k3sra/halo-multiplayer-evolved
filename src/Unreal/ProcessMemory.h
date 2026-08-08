@@ -128,6 +128,12 @@ template <typename T>
 /// well below 0x8000'0000'0000, and anything in the first 64 KB is the reserved null
 /// region. Rejecting those two cases discards the overwhelming majority of garbage
 /// candidates without a syscall.
+/// True when the address is inside a committed, executable page.
+///
+/// Used to find where a virtual table ends: its entries are function pointers, so the first
+/// value that is not code is the first value that is not an entry.
+[[nodiscard]] bool IsExecutableAddress(std::uintptr_t address) noexcept;
+
 [[nodiscard]] constexpr bool IsPlausiblePointer(std::uintptr_t address) noexcept {
     return address >= 0x10000u && address < 0x7FFFFFFFFFFFu && (address & 0x7u) == 0u;
 }

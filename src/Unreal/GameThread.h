@@ -163,6 +163,24 @@ void RemoveGameThreadPump();
 /// True while jobs can run without a breakpoint.
 [[nodiscard]] bool GameThreadPumpActive();
 
+/// How many events the pump has seen since the process started.
+///
+/// Installed is not the same as working. The pump lives on one object's event path and
+/// objects do not live forever: loading a scenario destroys the front end, which is exactly
+/// where the pump was, and from that moment nothing queued can run. A count that stops
+/// moving is the only way to notice, because a destroyed object cannot report anything.
+[[nodiscard]] std::uint64_t PumpEventCount();
+
+/// The object currently carrying the pump, or zero.
+[[nodiscard]] std::uintptr_t GameThreadPumpHost();
+
+/// Drops the pump handles without writing to them.
+///
+/// For a host that has been destroyed rather than released: its address is no longer the
+/// address of anything, so restoring the original virtual table would be a write into
+/// whatever now occupies it.
+void ForgetGameThreadPump();
+
 /// Starts reporting events on one widget.
 ///
 /// Clicks arrive through OnButtonBaseClicked, a multicast delegate, and the runtime
@@ -203,6 +221,15 @@ void ForgetExtraWatchedWidgets();
 
 /// Declares which event counts as a click.
 void SetWidgetClickEvent(std::uintptr_t function);
+
+/// Drops the watch without writing anything back.
+///
+/// For a widget the engine has destroyed. Restoring would write the original table pointer
+/// into memory that has been freed and reused, replacing some unrelated object's virtual
+/// table with one belonging to a class it is not. The write itself succeeds; the game dies
+/// later, dispatching that object through the wrong class, somewhere with no visible
+/// connection to this mod.
+void ForgetWatchedWidget();
 
 /// Puts the widget's original virtual table back.
 void StopWatchingWidgetEvents();

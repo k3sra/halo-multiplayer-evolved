@@ -2660,6 +2660,40 @@ bool LoadingOverlayIsOpen() {
     return g_loading_open;
 }
 
+void ForgetLobbyUI() {
+    // Every handle here names a widget that has been destroyed, so nothing may be written
+    // to and nothing may be called. They are dropped, not released: the addresses are no
+    // longer addresses of anything, and whatever now occupies them is not ours.
+    g_open_lobby_root   = 0;
+    g_open_lobby_widget = 0;
+    g_open_host_widget  = 0;
+    g_host_tab          = 0;
+    g_browse_tab        = 0;
+    g_invite_panel      = 0;
+    g_invite_open       = false;
+    g_server_name_field = 0;
+    g_friend_empty      = 0;
+    g_friend_hint       = 0;
+    g_friend_count      = 0;
+    g_friend_page       = 0;
+    g_invite_state      = 0;
+    g_empty_notice      = 0;
+    g_lobby_hidden_by_loading = false;
+    g_host_only.clear();
+    g_folded.clear();
+    for (std::uintptr_t& marker : g_mode_marker) { marker = 0; }
+    for (std::uintptr_t& marker : g_map_marker) { marker = 0; }
+    for (std::uintptr_t& value : g_setting_value) { value = 0; }
+    for (std::uintptr_t& line : g_detail_line) { line = 0; }
+    for (std::uintptr_t& line : g_filter_mode) { line = 0; }
+    for (std::uintptr_t& line : g_filter_slots) { line = 0; }
+    for (std::uintptr_t& line : g_filter_ping) { line = 0; }
+    for (ServerRowWidgets& row : g_server_row) { row = ServerRowWidgets{}; }
+    for (FriendRowWidgets& row : g_friend_row) { row = FriendRowWidgets{}; }
+    for (auto& side : g_slot) { for (SlotWidgets& card : side) { card = SlotWidgets{}; } }
+    for (std::uintptr_t& heading : g_team_heading) { heading = 0; }
+}
+
 void ForgetLoadingOverlay() {
     g_loading_host   = 0;
     g_loading_scaler = 0;
