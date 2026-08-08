@@ -175,6 +175,47 @@ parsing that blob out of a loaded instance, not walking reflection.
 
 ---
 
+## What a listen server actually does on this build
+
+Recorded because this question has been answered wrongly twice, both times from evidence
+that was really about something else.
+
+`host listen` never ran. The command dispatcher is a list of prefix tests in source order,
+`host` is tested near the top and `host listen` far below, so the shorter prefix hid it.
+Every attempt went to the session host instead, which looked for a map, failed, and
+returned `FileNotFound`. That result was written down as a fact about the engine. It was a
+fact about the order of two `if` statements.
+
+Run properly, through `travel /Game/Levels/Halo1/Solo/A30/A30?listen` from inside a loaded
+world:
+
+- `ClientTravel` **executes and returns**. It is reached, it is called correctly, and it
+  does not reject the URL.
+- The engine then **starts a GameNetDriver**. The proof is not a log line, it is that
+  `Windows/Engine.ini` gains one to its `CachedClientID`, which only the stateless connect
+  handshake writes. It went from 2 to 3 across this experiment.
+- The game then dies with `EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000000001c`,
+  a null dereference partway into a structure.
+
+So the listen path is not refused and is not unreachable. It comes up far enough to run a
+net driver and then faults inside the game's own glue, which is consistent with the Blam
+session expecting state that only the supported co-op path creates.
+
+Two things that are **not** the cause, both checked rather than assumed:
+
+- **Travelling from the front end.** The mod already refuses that, because no world is
+  loaded and there is only a `BP_FrontendPlayerController_C`.
+- **UE4SS.** It appears in the crash stack and is in a fatal error state on this build, its
+  AOB scan for `FName::FName` having failed outright. Removing it does not help: the game
+  will not start at all without `dwmapi.dll`, which is how it loads.
+
+Also worth knowing when testing unattended: every crash leaves a **Meteorite Crash
+Reporter** window, and while one is up the next launch never creates a game window. One
+crash otherwise turns into every later run failing for an unrelated reason.
+
+Reflected travel functions on this build are `ClientTravel`, `ClientTravelInternal` and
+`LocalTravel`. There is no reflected `ServerTravel`.
+
 ## Re-checking any of this
 
 Every table above comes from one of these, run against the live game:

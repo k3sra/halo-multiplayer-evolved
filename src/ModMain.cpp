@@ -6256,6 +6256,24 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         return command.rfind(prefix, 0) == 0;
     };
 
+    // "host listen" is rewritten before anything reads it.
+    //
+    // The dispatcher is a list of prefix tests in source order, so a short prefix hides
+    // every longer one below it. "host" is tested near the top and "host listen" far below,
+    // which meant the listen server command was unreachable: it went to the session host
+    // instead, which looked for a map, failed to find one, and returned FileNotFound.
+    //
+    // That produced the most expensive kind of wrong answer. The command appeared to run
+    // and to fail for a reason of its own, so the failure was written down as evidence
+    // about the engine, and it was evidence about nothing but the order of these tests.
+    // Rewriting it here is a fix at the point the ambiguity exists rather than a rule about
+    // where new commands may be added.
+    if (starts_with("host listen")) {
+        command = "travel /Game/Levels/Halo1/Solo/A30/A30?listen";
+        mpe::log::Write(mpe::log::Level::Info, "Mod",
+                       "'host listen' means: " + command);
+    }
+
     if (starts_with("ff status")) {
         return MPE_LogFriendlyFire();
     }
