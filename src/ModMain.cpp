@@ -240,6 +240,7 @@ void PrepareLoadingOverlay();
 [[nodiscard]] bool FrontendWasDestroyed();
 void ForgetFrontendUI();
 void MaintainGameThreadPump();
+void WatchForRealSession();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
 struct NetworkCensus;
 [[nodiscard]] NetworkCensus TakeNetworkCensus(const unreal::ObjectArray& objects);
@@ -353,7 +354,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.14";
+constexpr const char* kModVersion = "0.2.15";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -921,6 +922,10 @@ void TickLoop() {
         // would notice the pump was gone at the one moment it can no longer do anything
         // about it, and would then be skipped for the entire life of the match.
         MaintainGameThreadPump();
+        // Records the game's own co-op session if one ever comes up. Costs one
+        // pass over the object array every ten seconds and says nothing unless
+        // something changed.
+        WatchForRealSession();
 
         // Nothing may be drawn on a front end that no longer exists.
         //
@@ -2142,6 +2147,103 @@ struct NetworkCensus {
         return true;
     });
     return census;
+}
+
+/// Watches for a real session coming up, and writes down everything about it when one does.
+///
+/// WHY THIS EXISTS
+///
+/// Every attempt so far to make two machines share a world has been an attempt to force one
+/// open: travel to a listen URL, call an invite function, read the wreckage. The game ships
+/// working co-op, so there is a version of all of this that succeeds, and watching that
+/// happen is worth more than any number of experiments on a path that faults.
+///
+/// The mod does nothing during the game's own co-op, so its log would otherwise be silent
+/// through exactly the minutes that matter. This samples the networking object graph and
+/// says something only when it changes, then dumps the detail once a driver or a connection
+/// actually exists.
+///
+/// Sampling rather than hooking, deliberately. A hook would have to be placed on a guess
+/// about which native function matters, and being wrong is silent. A census cannot be wrong
+/// about what exists; it can only be late, and ten seconds is not late for something a
+/// person had to click through a menu to start.
+void WatchForRealSession() {
+    static NetworkCensus                         s_last;
+    static bool                                  s_have_last = false;
+    static std::chrono::steady_clock::time_point s_last_sample{};
+    static bool                                  s_dumped_detail = false;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (s_have_last && now - s_last_sample < std::chrono::seconds(10)) {
+        return;
+    }
+    s_last_sample = now;
+
+    std::optional<unreal::ObjectArray> objects;
+    std::optional<unreal::Reflection>  reflection;
+    if (!TakeEngineView(objects, reflection) || !objects.has_value()) {
+        return;
+    }
+
+    const NetworkCensus census = TakeNetworkCensus(*objects);
+    if (s_have_last && census == s_last) {
+        return;
+    }
+    s_have_last = true;
+    s_last      = census;
+    MPE_LOG_INFO("SESSION WATCH: {}", census.Describe());
+
+    // A driver or a connection means a real session exists. That is the moment worth
+    // recording in full, and it is recorded once rather than every ten seconds.
+    const bool session_is_up = census.net_drivers > 0 || census.net_connections > 0;
+    if (!session_is_up) {
+        s_dumped_detail = false;
+        return;
+    }
+    if (s_dumped_detail || !reflection.has_value()) {
+        return;
+    }
+    s_dumped_detail = true;
+
+    MPE_LOG_INFO("=== SESSION WATCH: a real session is up, recording it ===");
+
+    // The driver, its class, and the URL the world was opened with. The URL is the whole
+    // question: it says which map, which options, and whether this machine is listening.
+    static constexpr std::string_view kInteresting[] = {
+        "NetDriver", "NetConnection", "BlamNetworkPlayerStateComponent",
+        "BlamNetworkGameStateComponent", "PlayFab", "OnlineSession",
+    };
+    objects->ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.name.rfind("Default__", 0) == 0) {
+            return true;
+        }
+        bool wanted = false;
+        for (const std::string_view fragment : kInteresting) {
+            if (object.class_name.find(fragment) != std::string::npos) {
+                wanted = true;
+                break;
+            }
+        }
+        if (!wanted) {
+            return true;
+        }
+
+        MPE_LOG_INFO("--- {} ({}) at 0x{:X} ---", object.name, object.class_name,
+                    object.address);
+        const std::uintptr_t klass =
+            object.class_address != 0 ? object.class_address
+                                      : objects->ClassOf(object.address);
+        if (klass == 0) {
+            return true;
+        }
+        // Depth two, because the endpoint ids sit directly on the component and the
+        // player id is one struct in. Going deeper turns a readable record into a wall.
+        for (const std::string& line : reflection->DumpInstance(klass, object.address, 2)) {
+            MPE_LOG_INFO("    {}", line);
+        }
+        return true;
+    });
+    MPE_LOG_INFO("=== SESSION WATCH: end of record ===");
 }
 
 /// Calls a reflected function with no arguments on a live instance of a class.
