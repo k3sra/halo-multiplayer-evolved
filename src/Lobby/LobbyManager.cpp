@@ -347,6 +347,9 @@ void LobbyManager::LeaveSession() {
     is_host_               = false;
     local_has_map_         = false;
     roster_revision_       = 0;
+    // Cleared with everything else, so a fresh session does not inherit the silence that
+    // ended the last one and fault the moment it starts.
+    host_silence_elapsed_  = 0.0;
     countdown_remaining_   = 0.0;
     countdown_last_announced_ = 0;
     settings_              = engine::MatchSettings{};
@@ -729,6 +732,31 @@ void LobbyManager::TickClient(double delta_seconds) {
                 } else {
                     MPE_LOG_INFO("no answer yet; greeting the host again");
                 }
+            }
+            return;
+
+        case LobbyPhase::InLobby:
+        case LobbyPhase::Countdown:
+            // The host going away without the transport noticing.
+            //
+            // Losing the host is already handled, but only when the transport says so, and
+            // it does not always say so. A host that restarts its game is a process that
+            // vanishes rather than one that closes a connection, and the relay can hold a
+            // route open long after there is nothing at the other end of it. The client
+            // was left sitting in a lobby nobody was running, with no timeout of any kind:
+            // every other client phase was bounded and this one, the one a player spends
+            // the most time in, was not.
+            //
+            // Silence is the signal. The host rebroadcasts the roster once a second while
+            // a lobby is open, so hearing nothing for twelve of those is not a slow frame,
+            // it is nobody there. Deliberately limited to the phases where that broadcast
+            // is running: during a load the host is legitimately quiet, and throwing a
+            // player out of a match that is still coming up would be a worse fault than
+            // the one this fixes.
+            host_silence_elapsed_ += delta_seconds;
+            if (host_silence_elapsed_ > timings_.host_silence_seconds) {
+                Fault(Error{ErrorCode::Timeout,
+                            "the host stopped responding; they may have closed the game"});
             }
             return;
 
@@ -1210,6 +1238,13 @@ void LobbyManager::HandlePacket(PeerHandle peer, Channel channel,
         transport_.Disconnect(peer, DisconnectReason::ProtocolViolation,
                               "only the host may send lobby traffic");
         return;
+    }
+
+    // Anything from the host counts as the host being alive, whatever it says. The
+    // liveness check in TickClient measures silence, so it has to be fed here rather than
+    // by any one message type: a host that is talking is a host that is there.
+    if (!is_host_ && peer == host_peer_) {
+        host_silence_elapsed_ = 0.0;
     }
 
     ByteReader reader(packet.body);
