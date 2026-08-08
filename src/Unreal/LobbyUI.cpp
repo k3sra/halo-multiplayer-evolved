@@ -180,6 +180,27 @@ std::uintptr_t g_empty_notice     = 0;
 /// point in a box three hundred and ten points wide could not hold a sentence: a session
 /// line reading "CONNECTING TO HOST  STALLED" ran off the right of the screen, because a
 /// text block given more than it can draw simply keeps going.
+/// Where the status panel sits, and how much text one of its lines can hold.
+///
+/// At file scope because two functions have to agree about it. The panel is built in one
+/// place and written in another, and the line budget below is derived from the same width
+/// the text blocks are given. Kept apart, they drifted, and text drawn past the edge of a
+/// box it no longer matched is what ran off the screen.
+constexpr float kStatusPanelX = 1470.0F;
+constexpr float kStatusPanelY = 14.0F;
+constexpr float kStatusPanelW = 330.0F;
+constexpr float kStatusPanelH = 138.0F;
+constexpr float kStatusTextX  = 1482.0F;
+constexpr float kStatusTextW  = 306.0F;
+constexpr float kStatusLineY  = 46.0F;
+constexpr float kStatusLineH  = 16.0F;
+
+/// Pessimistic width of one character at the status face's size.
+///
+/// The face is proportional, so a limit derived from the average width fails on a line of
+/// capitals, which is most of them here.
+constexpr float kStatusPointsPerCharacter = 7.5F;
+
 constexpr std::size_t kStatusLines = 6;
 std::uintptr_t g_status_line[kStatusLines] = {0, 0, 0, 0, 0, 0};
 
@@ -2981,21 +3002,24 @@ Result BuildStatusOverlay(const LobbyUIContext& context) {
     // "CONNECTING TO HOST  STALLED" overran, running off the right of the screen. It
     // reaches further left now and the text is smaller, so a long line has somewhere to go
     // and the panel reads as an instrument rather than a headline.
-    // Thirty percent smaller than it was, and higher up.
+    // Smaller again, and further from the edge it kept falling off.
     //
-    // At full size it was the loudest thing on screen and it overlapped the lobby's own
-    // LOBBY SETTINGS heading, which is content the panel has no business covering. It
-    // reports on the mod; it should sit in the corner and be read when wanted rather than
-    // compete with the screen it is drawn over. Every number is scaled together so the
-    // proportions hold: box, margins, line spacing and both font sizes.
-    constexpr float kPanelX = 1541.0F;
-    constexpr float kPanelY = 14.0F;
-    constexpr float kPanelW = 339.0F;
-    constexpr float kPanelH = 147.0F;
-    constexpr float kTextX  = 1554.0F;
-    constexpr float kTextW  = 313.0F;
-    constexpr float kLineY  = 48.0F;
-    constexpr float kLineH  = 17.0F;
+    // The panel sat 40 points from the right of the 1920 design, so a line only slightly
+    // wider than the box had almost no screen left to spill into and simply ran off it.
+    // Pulling the whole thing left leaves 120 points of margin, which is enough that even a
+    // badly estimated line stays on screen while the fault is noticed.
+    //
+    // Moving it is not the fix, though. A box cannot stop text leaving it; only shorter
+    // text can, so the lines are cut to a budget in SetLobbyStatus and this geometry is
+    // what that budget is measured against. Both live at file scope so they cannot drift.
+    constexpr float kPanelX = kStatusPanelX;
+    constexpr float kPanelY = kStatusPanelY;
+    constexpr float kPanelW = kStatusPanelW;
+    constexpr float kPanelH = kStatusPanelH;
+    constexpr float kTextX  = kStatusTextX;
+    constexpr float kTextW  = kStatusTextW;
+    constexpr float kLineY  = kStatusLineY;
+    constexpr float kLineH  = kStatusLineH;
 
     const std::uintptr_t status_panel =
         builder.Panel(root, kPanelX, kPanelY, kPanelW, kPanelH, kStatusPanel);
@@ -3107,12 +3131,26 @@ void SetLobbyStatus(const LobbyUIContext& context, const LobbyStatus& status) {
     // the panel showed a blank band between the map and the version where the ping would
     // have been. Writing the lines that have something to say into consecutive slots is
     // what makes the panel as short as its content.
+    // Cut to what the panel can hold.
+    //
+    // This is the only thing that actually prevents the overflow. The panel had been made
+    // smaller and moved twice already and text still left the screen, because neither
+    // changes what a text block does when its string is wider than its slot: it draws it
+    // anyway, past its own edge and off the display.
+    //
+    // The budget is deliberately pessimistic. The status face is proportional, so the
+    // widest characters cost more than the average and a limit derived from the average
+    // fails on exactly the lines worth reading. Seven and a half points per character at
+    // this size leaves room for a line of nothing but capitals.
+    const std::size_t budget =
+        static_cast<std::size_t>(kStatusTextW / kStatusPointsPerCharacter);
+
     std::size_t slot = 0;
     for (const Line& line : lines) {
         if (line.text.empty()) {
             continue;
         }
-        builder.SetTextLive(g_status_line[slot], line.text);
+        builder.SetTextLive(g_status_line[slot], text::Ellipsise(line.text, budget));
         builder.SetColourLive(g_status_line[slot], line.colour);
         builder.SetVisibilityOf(g_status_line[slot], kHitTestInvisible);
         ++slot;

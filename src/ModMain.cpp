@@ -3287,14 +3287,21 @@ void RefreshLobbyStatus() {
         status.notice_detail = "Quit and relaunch the game to start using it.";
     }
 
+    // Short enough to fit the panel it is drawn in.
+    //
+    // "v0.2.8  UPDATE 0.2.9 FOUND  TEST BUILD: SHARING LOGS" is fifty two characters and
+    // ran off the right of the screen. Every word of it was already implied by two version
+    // numbers and an arrow: which build is running, which one is waiting, and which way it
+    // is going. The panel is an instrument, and an instrument that needs a sentence is
+    // badly drawn.
     if (staged) {
-        status.version = std::format("v{}  UPDATE {} INSTALLED", kModVersion, latest);
+        status.version = std::format("v{} -> {} READY", kModVersion, latest);
     } else if (progress >= 0) {
-        status.version = std::format("v{}  DOWNLOADING {}%", kModVersion, progress);
+        status.version = std::format("v{} -> {}  {}%", kModVersion, latest, progress);
     } else if (behind) {
-        status.version = std::format("v{}  UPDATE {} FOUND", kModVersion, latest);
+        status.version = std::format("v{} -> {}", kModVersion, latest);
     } else {
-        status.version = std::format("v{}  UP TO DATE", kModVersion);
+        status.version = std::format("v{}  CURRENT", kModVersion);
     }
 
     // Said on the machine that is doing it.
@@ -3303,7 +3310,7 @@ void RefreshLobbyStatus() {
     // their log somewhere. It is on the panel whenever it is on, in the same place the
     // build number is, for as long as this exists.
     if (debugshare::SharingEnabled()) {
-        status.version += "  TEST BUILD: SHARING LOGS";
+        status.version += "  LOGGING";
     }
 
     unreal::LobbyUIContext ui = g_lobby_ui;
