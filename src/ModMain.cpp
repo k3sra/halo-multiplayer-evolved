@@ -242,6 +242,8 @@ void ForgetFrontendUI();
 void MaintainGameThreadPump();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
 void DumpClassSurface(const unreal::ObjectArray& objects, const unreal::Reflection& reflection);
+void DumpOneClass(const unreal::ObjectArray& objects, const unreal::Reflection& reflection,
+                  const std::string& name, std::uintptr_t class_object);
 void RegisterLoadingCancel();
 void RefreshLoadingScreen();
 void OnCancelLoading();
@@ -522,6 +524,7 @@ LobbyState g_lobby;
 /// Reports the object's own name, its class, and its address, so a later pass can read
 /// properties off anything interesting the listing turns up.
 int LogObjectsMatching(std::string_view fragment, std::size_t limit);
+void LogLines(log::Level level, std::string_view text);
 
 std::mutex               g_state_mutex;
 std::unique_ptr<ModState> g_state;               ///< Guarded by g_state_mutex.
@@ -1420,6 +1423,27 @@ void RegisterWatch(std::string label, std::uintptr_t instance_address,
     return true;
 }
 
+/// Writes a multi line block one line at a time.
+///
+/// The log takes a message per call and a hex dump handed over whole arrives as its first
+/// line and nothing else, which looks exactly like a dump of an unreadable address. That
+/// cost a round trip through the game to notice.
+void LogLines(log::Level level, std::string_view text) {
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t end = text.find('\n', start);
+        const std::string_view line =
+            text.substr(start, end == std::string_view::npos ? text.size() - start : end - start);
+        if (!line.empty()) {
+            log::Write(level, "Mod", std::string{line});
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+}
+
 int LogObjectsMatching(std::string_view fragment, std::size_t limit) {
     std::lock_guard lock(g_state_mutex);
     if (!g_state || !g_state->objects.has_value()) {
@@ -2073,43 +2097,96 @@ void DumpClassSurface(const unreal::ObjectArray& objects,
         "BlamCoopSpawningGlobalsDefinitionTagDataAsset",
     };
 
-    for (const std::string_view wanted : kClasses) {
-        std::uintptr_t class_object = 0;
-        objects.ForEach([&](const unreal::ObjectInfo& object) {
-            if (object.name != wanted || object.class_name.find("Class") == std::string::npos) {
-                return true;
+    // One pass over the array, not one per class. The previous shape rescanned fifty
+    // thousand objects for every name in the list and spent two seconds on each.
+    std::map<std::string, std::uintptr_t> found;
+    objects.ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.class_name.find("Class") == std::string::npos) {
+            return true;
+        }
+        for (const std::string_view wanted : kClasses) {
+            if (object.name == wanted) {
+                found.emplace(object.name, object.address);
             }
-            class_object = object.address;
-            return false;
-        });
-        if (class_object == 0) {
+        }
+        return found.size() < std::size(kClasses);
+    });
+
+    for (const std::string_view wanted : kClasses) {
+        const auto entry = found.find(std::string{wanted});
+        if (entry == found.end()) {
             MPE_LOG_INFO("  {}: not present in this build", wanted);
             continue;
         }
+        DumpOneClass(objects, reflection, std::string{wanted}, entry->second);
+    }
+}
 
-        MPE_LOG_INFO("--- {} (0x{:X}) ---", wanted, class_object);
+/// Writes one class out in full: what it inherits, what it can be told to do, and every
+/// field it carries, with the replicated ones called out.
+void DumpOneClass(const unreal::ObjectArray& objects, const unreal::Reflection& reflection,
+                  const std::string& name, std::uintptr_t class_object) {
+    const unreal::ReflectionLayout& layout = reflection.Layout();
 
-        // Functions are objects whose outer is the class, so they are found by walking the
-        // array rather than by asking the class, which has no reflected list of them.
-        std::vector<std::string> functions;
-        objects.ForEach([&](const unreal::ObjectInfo& object) {
-            if (object.class_name != "Function" || object.outer_address != class_object) {
-                return true;
+    // The inheritance chain, which is often the answer on its own: a component whose
+    // parent is ActorComponent replicates through the actor that owns it.
+    std::string ancestry;
+    {
+        std::uintptr_t current = class_object;
+        for (int depth = 0; depth < 12 && current != 0; ++depth) {
+            std::string step;
+            objects.ForEach([&](const unreal::ObjectInfo& object) {
+                if (object.address != current) {
+                    return true;
+                }
+                step = object.name;
+                return false;
+            });
+            if (step.empty()) {
+                break;
             }
-            functions.push_back(object.name);
-            return true;
-        });
-        std::sort(functions.begin(), functions.end());
-        for (const std::string& name : functions) {
-            MPE_LOG_INFO("    fn  {}", name);
+            ancestry += ancestry.empty() ? step : " <- " + step;
+            const auto super = unreal::memory::ReadPointer(current + layout.super_struct_offset);
+            if (!super.has_value() || !unreal::memory::IsPlausiblePointer(*super)) {
+                break;
+            }
+            current = *super;
         }
-        if (functions.empty()) {
-            MPE_LOG_INFO("    fn  (none reflected; native only)");
-        }
+    }
 
-        for (const unreal::PropertyInfo& property : reflection.ReadAllProperties(class_object)) {
-            MPE_LOG_INFO("    var {} : {} at +0x{:X}", property.name, property.type_name,
-                        property.offset);
+    MPE_LOG_INFO("--- {} (0x{:X}) ---", name, class_object);
+    if (!ancestry.empty()) {
+        MPE_LOG_INFO("    inherits {}", ancestry);
+    }
+
+    std::vector<std::string> functions = reflection.ReadFunctionNames(class_object);
+    std::sort(functions.begin(), functions.end());
+    for (const std::string& function : functions) {
+        MPE_LOG_INFO("    fn  {}", function);
+    }
+    if (functions.empty()) {
+        MPE_LOG_INFO("    fn  (none reflected; native only)");
+    }
+
+    const std::vector<unreal::PropertyInfo> own = reflection.ReadProperties(class_object);
+    for (const unreal::PropertyInfo& property : own) {
+        MPE_LOG_INFO("    var {}", reflection.DescribeProperty(property));
+    }
+    if (own.empty()) {
+        MPE_LOG_INFO("    var (no reflected fields of its own)");
+    }
+
+    const std::vector<unreal::PropertyInfo> all = reflection.ReadAllProperties(class_object);
+    std::size_t replicated = 0;
+    for (const unreal::PropertyInfo& property : all) {
+        if (property.IsReplicated()) {
+            ++replicated;
+        }
+    }
+    MPE_LOG_INFO("    {} field(s) including inherited, {} replicated", all.size(), replicated);
+    for (const unreal::PropertyInfo& property : all) {
+        if (property.IsReplicated()) {
+            MPE_LOG_INFO("    net {}", reflection.DescribeProperty(property));
         }
     }
 }
@@ -4628,10 +4705,44 @@ void DetectPropertyLayout() {
         candidates.push_back(object.address);
     }
 
-    const unreal::ReflectionLayout detected = reflection.DetectLayout(candidates);
+    // Pin the layout against classes whose size the engine fixes rather than inferring it.
+    //
+    // UObject is 0x28 bytes and UField is 0x30 on every 64 bit build, and both are
+    // ordinary UClass objects in the array, so the slot reading those two values is
+    // PropertiesSize and no argument about plausibility is needed. The previous run
+    // settled on a slot that was really the top half of the pointer next to it and
+    // reported struct sizes of 365 and 650 on consecutive launches.
+    unreal::LayoutAnchors anchors;
+    objects->ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.class_name != "Class") {
+            return true;
+        }
+        if (object.name == "Object") {
+            anchors.object_class = object.address;
+        } else if (object.name == "Field") {
+            anchors.field_class = object.address;
+        } else if (object.name == "Struct") {
+            anchors.struct_class = object.address;
+        } else if (object.name == "BlamCampaignFlowGameSubsystem") {
+            // Known from the object array to own nine reflected functions, which is what
+            // identifies UStruct::Children and the UField chain that hangs off it.
+            anchors.class_with_functions = object.address;
+        }
+        return anchors.object_class == 0 || anchors.field_class == 0 ||
+               anchors.struct_class == 0 || anchors.class_with_functions == 0;
+    });
+    MPE_LOG_INFO("  layout anchors: Object 0x{:X}, Field 0x{:X}, Struct 0x{:X}, functions 0x{:X}",
+                anchors.object_class, anchors.field_class, anchors.struct_class,
+                anchors.class_with_functions);
+
+    const unreal::ReflectionLayout detected = reflection.DetectLayout(candidates, anchors);
     if (detected.detected) {
         reflection.SetLayout(detected);
         MPE_LOG_INFO("  UE layout detected: {}", detected.Describe());
+        if (!detected.anchored) {
+            MPE_LOG_WARN("  PropertiesSize was inferred rather than measured; struct sizes "
+                        "are the least trustworthy number here");
+        }
     } else {
         MPE_LOG_WARN("  UE layout detection found no property chain; trying documented offsets");
     }
@@ -4650,7 +4761,7 @@ void DetectPropertyLayout() {
         MPE_LOG_ERROR("  UE property layout could not be validated against any target struct");
         MPE_LOG_ERROR("  offsets will not be trusted; reflection reads are disabled");
         if (!candidates.empty()) {
-            MPE_LOG_INFO("{}", reflection.ProbeStructLayout(candidates.front()));
+            LogLines(log::Level::Info, reflection.ProbeStructLayout(candidates.front()));
         }
         return;
     }
@@ -4858,8 +4969,13 @@ void ResolveLiveInstances(
 
     unreal::ReflectionLayout layout = reflection.Layout();
 
-    if (const std::size_t size_offset = reflection.DetectPropertiesSizeOffset(addresses);
-        size_offset != 0) {
+    // An anchored PropertiesSize was measured against UObject and UField, so nothing a
+    // sample of eight structs can say about it is an improvement.
+    if (layout.anchored) {
+        MPE_LOG_INFO("properties_size stays at +0x{:X}, measured against UObject and UField",
+                    layout.properties_size_offset);
+    } else if (const std::size_t size_offset = reflection.DetectPropertiesSizeOffset(addresses);
+               size_offset != 0) {
         MPE_LOG_INFO("properties_size refined to +0x{:X} using {} struct(s)", size_offset,
                     addresses.size());
         layout.properties_size_offset = size_offset;
@@ -4871,6 +4987,13 @@ void ResolveLiveInstances(
         inner != 0) {
         MPE_LOG_INFO("FStructProperty::Struct detected at +0x{:X}", inner);
         layout.struct_property_inner_offset   = inner;
+        layout.struct_property_inner_detected = true;
+    } else if (layout.struct_property_inner_offset != 0) {
+        // The sample had no StructProperty pointing at a struct we already knew, which
+        // says nothing about the offset itself: it follows from where FProperty ends, and
+        // that was established from the property chain rather than assumed.
+        MPE_LOG_INFO("FStructProperty::Struct taken as +0x{:X} from the FProperty layout",
+                    layout.struct_property_inner_offset);
         layout.struct_property_inner_detected = true;
     } else {
         MPE_LOG_WARN("FStructProperty::Struct offset not detected; embedded struct search "
@@ -6444,8 +6567,14 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
             return -static_cast<int>(mpe::ErrorCode::InvalidState);
         }
 
-        const std::vector<mpe::unreal::ObjectInfo> found =
-            mpe::g_state->objects->FindByName(wanted, 8);
+        // By class first, then by name. A subsystem's instance is called something like
+        // BlamOnlineSessionSubsystem_2147482542, which nobody can type, so requiring the
+        // exact object name made the whole command unusable for the types that matter.
+        std::vector<mpe::unreal::ObjectInfo> found =
+            mpe::g_state->objects->FindByClassName(wanted, 8);
+        if (found.empty()) {
+            found = mpe::g_state->objects->FindByName(wanted, 8);
+        }
         const mpe::unreal::ObjectInfo* instance = nullptr;
         for (const mpe::unreal::ObjectInfo& candidate : found) {
             // Class objects and defaults share a vtable with the class machinery rather
@@ -6552,6 +6681,374 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
                 ++total;
             }
         }
+        return total;
+    }
+    if (starts_with("layout")) {
+        // Prints the detected UE layout and re-checks it against a struct.
+        //
+        // Every offset below was measured rather than assumed, and printing them is how a
+        // wrong one gets caught: a PropertiesSize that changes between launches is a heap
+        // pointer being read as an integer, which is exactly what happened before.
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->reflection.has_value() ||
+            !mpe::g_state->objects.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+        const mpe::unreal::ReflectionLayout& layout = mpe::g_state->reflection->Layout();
+        mpe::log::Write(mpe::log::Level::Info, "Mod", std::format("UE layout: {}",
+                                                                 layout.Describe()));
+
+        // UObject and UField have sizes the engine fixes, so reading them back is a pass
+        // or fail rather than an opinion.
+        for (const char* wanted : {"Object", "Field", "Struct", "Class"}) {
+            for (const mpe::unreal::ObjectInfo& object :
+                 mpe::g_state->objects->FindByName(wanted, 4)) {
+                if (object.class_name != "Class") {
+                    continue;
+                }
+                const auto size = mpe::unreal::memory::Read<std::int32_t>(
+                    object.address + layout.properties_size_offset);
+                mpe::log::Write(mpe::log::Level::Info, "Mod",
+                               std::format("  U{} PropertiesSize = {} (0x{:X})", wanted,
+                                           size.value_or(-1), size.value_or(0)));
+                break;
+            }
+        }
+        return layout.detected ? 1 : 0;
+    }
+    if (starts_with("dump ")) {
+        // Everything one class exposes: ancestry, functions, fields, and which of those
+        // fields the engine replicates on its own.
+        const std::string wanted = command.substr(std::strlen("dump "));
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        std::uintptr_t class_object = 0;
+        for (const mpe::unreal::ObjectInfo& object :
+             mpe::g_state->objects->FindByName(wanted, 8)) {
+            if (object.class_name.find("Class") != std::string::npos) {
+                class_object = object.address;
+                break;
+            }
+        }
+        if (class_object == 0) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no class named '{}'", wanted));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        mpe::DumpOneClass(*mpe::g_state->objects, *mpe::g_state->reflection, wanted,
+                          class_object);
+        return 1;
+    }
+    if (starts_with("values ")) {
+        // The live values of every field on an instance, not just its shape.
+        //
+        // A tag data asset's field list says a mode table exists. This says what is in it,
+        // which is the difference between knowing multiplayer data shipped and knowing
+        // which modes shipped with it.
+        const std::string wanted = command.substr(std::strlen("values "));
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        // Instances first, then the class default object, which still carries everything
+        // the cooker baked in even when nothing has been spawned yet.
+        std::vector<mpe::unreal::ObjectInfo> instances =
+            mpe::g_state->objects->FindByClassName(wanted, 8);
+        if (instances.empty()) {
+            for (const mpe::unreal::ObjectInfo& object :
+                 mpe::g_state->objects->FindByName("Default__" + wanted, 4)) {
+                instances.push_back(object);
+            }
+        }
+        if (instances.empty()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no live instance or default object of '{}'", wanted));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+
+        int written = 0;
+        for (const mpe::unreal::ObjectInfo& instance : instances) {
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("--- {} ({}) at 0x{:X} ---", instance.name,
+                                       instance.class_name, instance.address));
+            const std::uintptr_t klass = instance.class_address != 0
+                                             ? instance.class_address
+                                             : mpe::g_state->objects->ClassOf(instance.address);
+            for (const std::string& line :
+                 mpe::g_state->reflection->DumpInstance(klass, instance.address)) {
+                mpe::log::Write(mpe::log::Level::Info, "Mod", "  " + line);
+                ++written;
+            }
+        }
+        return written;
+    }
+    if (starts_with("sig ")) {
+        // The full signature of every reflected function whose name matches.
+        //
+        // Knowing that MeteoriteLobbyNotifier has AcceptInvite is not enough to call it.
+        // ProcessEvent is handed one buffer holding every parameter laid out exactly as
+        // the function expects, so what is needed is the parameter list, each one's offset
+        // and size, which of them are outputs, and the total buffer size. UFunction keeps
+        // all of that, and its parameters are simply its own child properties.
+        const std::string wanted = command.substr(std::strlen("sig "));
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        // sizeof(UStruct), read from the engine's own class for it rather than assumed.
+        // UFunction's own fields begin exactly there.
+        std::size_t function_body = 0;
+        for (const mpe::unreal::ObjectInfo& object :
+             mpe::g_state->objects->FindByName("Struct", 4)) {
+            if (object.class_name != "Class") {
+                continue;
+            }
+            const auto size = mpe::unreal::memory::Read<std::int32_t>(
+                object.address + mpe::g_state->reflection->Layout().properties_size_offset);
+            if (size.has_value() && *size > 0x40 && *size < 0x400) {
+                function_body = static_cast<std::size_t>(*size);
+            }
+            break;
+        }
+
+        struct FunctionFlag {
+            std::uint32_t    bit;
+            std::string_view name;
+        };
+        static constexpr FunctionFlag kFunctionFlags[] = {
+            {0x00000040u, "Net"},        {0x00000080u, "NetReliable"},
+            {0x00000100u, "NetRequest"}, {0x00000200u, "Exec"},
+            {0x00000400u, "Native"},     {0x00000800u, "Event"},
+            {0x00001000u, "NetResponse"},{0x00002000u, "Static"},
+            {0x00004000u, "NetMulticast"},{0x00200000u, "NetServer"},
+            {0x01000000u, "NetClient"},  {0x04000000u, "BlueprintCallable"},
+        };
+
+        int matched = 0;
+        mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
+            if (object.class_name.find("Function") == std::string::npos ||
+                object.name.find(wanted) == std::string::npos) {
+                return true;
+            }
+            ++matched;
+
+            std::string flags_text;
+            std::string counts;
+            if (function_body != 0) {
+                if (const auto flags = mpe::unreal::memory::Read<std::uint32_t>(
+                        object.address + function_body);
+                    flags.has_value()) {
+                    for (const FunctionFlag& flag : kFunctionFlags) {
+                        if ((*flags & flag.bit) != 0) {
+                            flags_text += flags_text.empty() ? "" : "|";
+                            flags_text += flag.name;
+                        }
+                    }
+                }
+                const auto parms = mpe::unreal::memory::Read<std::uint8_t>(
+                    object.address + function_body + 4);
+                const auto size = mpe::unreal::memory::Read<std::uint16_t>(
+                    object.address + function_body + 6);
+                counts = std::format(", {} parm(s), {} byte frame", parms.value_or(0),
+                                     size.value_or(0));
+            }
+
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("{} [{}]{}", mpe::g_state->objects->BuildPath(object),
+                                       flags_text.empty() ? "no flags" : flags_text, counts));
+
+            for (const mpe::unreal::PropertyInfo& parameter :
+                 mpe::g_state->reflection->ReadProperties(object.address)) {
+                // CPF_Parm, CPF_OutParm and CPF_ReturnParm are what separate an argument
+                // from a local, and an input from an output.
+                std::string role = "local";
+                if ((parameter.flags & 0x0000000000000400ull) != 0) {
+                    role = "return";
+                } else if ((parameter.flags & 0x0000000000000100ull) != 0) {
+                    role = "out";
+                } else if ((parameter.flags & 0x0000000000000080ull) != 0) {
+                    role = "in";
+                }
+                mpe::log::Write(mpe::log::Level::Info, "Mod",
+                               std::format("    {:<6} {}", role,
+                                           mpe::g_state->reflection->DescribeProperty(parameter)));
+            }
+            return matched < 24;
+        });
+
+        if (matched == 0) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no reflected function matching '{}'", wanted));
+        }
+        return matched;
+    }
+    if (starts_with("field ")) {
+        // Hex dump of one FProperty object itself, rather than of the value it describes.
+        //
+        // Every offset inside FProperty was derived from a chain of reasoning about where
+        // the engine's own structures end. When one of those derivations is wrong the
+        // symptom is silence: a container property whose element type simply never
+        // resolves. This is how that gets settled by looking instead of by reasoning.
+        const std::string argument = command.substr(std::strlen("field "));
+        const std::size_t space    = argument.find(' ');
+        if (space == std::string::npos) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod", "usage: field <class> <property>");
+            return -static_cast<int>(mpe::ErrorCode::InvalidArgument);
+        }
+        const std::string class_name    = argument.substr(0, space);
+        const std::string property_name = argument.substr(space + 1);
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        std::uintptr_t class_object = 0;
+        for (const mpe::unreal::ObjectInfo& object :
+             mpe::g_state->objects->FindByName(class_name, 8)) {
+            if (object.class_name.find("Class") != std::string::npos) {
+                class_object = object.address;
+                break;
+            }
+        }
+        if (class_object == 0) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("no class named '{}'", class_name));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+
+        const mpe::Expected<mpe::unreal::PropertyInfo> property =
+            mpe::g_state->reflection->FindProperty(class_object, property_name);
+        if (!property.ok()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod", property.message());
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        mpe::log::Write(mpe::log::Level::Info, "Mod",
+                       std::format("{}::{} FProperty at 0x{:X}, {}", class_name, property_name,
+                                   property.value().address,
+                                   mpe::g_state->reflection->DescribeProperty(property.value())));
+        mpe::LogLines(mpe::log::Level::Info,
+                      mpe::g_state->reflection->ProbeStructLayout(property.value().address, 0xA0));
+        return 1;
+    }
+    if (starts_with("raw ")) {
+        // An annotated hex dump of a live instance.
+        //
+        // The Blam session subsystems reflect nothing at all: no functions, no fields. A
+        // type the engine knows only natively still has to keep its state somewhere, and
+        // the only way to see it is to read the bytes and say what each of them could be.
+        std::string  wanted = command.substr(std::strlen("raw "));
+        std::size_t  bytes  = 0x100;
+        if (const std::size_t space = wanted.find(' '); space != std::string::npos) {
+            try {
+                bytes = static_cast<std::size_t>(std::stoul(wanted.substr(space + 1), nullptr, 16));
+            } catch (const std::exception&) {
+                bytes = 0x100;
+            }
+            wanted.resize(space);
+        }
+        bytes = std::clamp<std::size_t>(bytes, 0x40, 0x800);
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+
+        std::vector<mpe::unreal::ObjectInfo> found =
+            mpe::g_state->objects->FindByClassName(wanted, 4);
+        if (found.empty()) {
+            found = mpe::g_state->objects->FindByName(wanted, 4);
+        }
+        if (found.empty()) {
+            mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                           std::format("nothing named or classed '{}'", wanted));
+            return -static_cast<int>(mpe::ErrorCode::NotFound);
+        }
+        for (const mpe::unreal::ObjectInfo& object : found) {
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("--- {} ({}) at 0x{:X} ---", object.name,
+                                       object.class_name, object.address));
+            mpe::LogLines(mpe::log::Level::Info,
+                          mpe::g_state->reflection->ProbeStructLayout(object.address, bytes));
+        }
+        return static_cast<int>(found.size());
+    }
+    if (starts_with("netdrivers")) {
+        // Answers the one question that decides whether the game's own replication can be
+        // driven at all: which net driver class the engine is configured to build.
+        //
+        // UEngine::NetDriverDefinitions is an array of {DefName, DriverClassName,
+        // DriverClassNameFallback}. If GameNetDriver maps to a Steam driver then a listen
+        // server and a Steam URL are a supported path rather than an experiment. The
+        // saved config already proves a GameNetDriver has run here: Windows/Engine.ini
+        // carries a CachedClientID written by the stateless connect handshake.
+        // The lock is scoped and released before the sweep below.
+        //
+        // LogObjectsMatching takes g_state_mutex itself, and holding it across that call
+        // locks a std::mutex twice on one thread, which killed the game the first time
+        // this command ran. Anything that calls a helper needs to own the lock for no
+        // longer than it reads shared state.
+        {
+            std::lock_guard lock(mpe::g_state_mutex);
+            if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+                !mpe::g_state->reflection.has_value()) {
+                return -static_cast<int>(mpe::ErrorCode::InvalidState);
+            }
+
+            // The live engine, found by class rather than by name, because the concrete
+            // type is a game specific subclass.
+            mpe::unreal::ObjectInfo engine;
+            mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
+                if (object.name.rfind("Default__", 0) == 0) {
+                    return true;
+                }
+                if (object.class_name.find("GameEngine") == std::string::npos) {
+                    return true;
+                }
+                engine = object;
+                return false;
+            });
+            if (!engine.IsValid()) {
+                mpe::log::Write(mpe::log::Level::Warn, "Mod", "no live game engine object");
+                return -static_cast<int>(mpe::ErrorCode::NotFound);
+            }
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("engine: {} ({}) at 0x{:X}", engine.name,
+                                       engine.class_name, engine.address));
+
+            const mpe::Expected<mpe::unreal::PropertyInfo> definitions =
+                mpe::g_state->reflection->FindProperty(engine.class_address,
+                                                       "NetDriverDefinitions");
+            if (!definitions.ok()) {
+                mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                               std::format("NetDriverDefinitions not found: {}",
+                                           definitions.message()));
+            } else {
+                mpe::log::Write(mpe::log::Level::Info, "Mod",
+                               std::format("  NetDriverDefinitions = {}",
+                                           mpe::g_state->reflection->ReadValueText(
+                                               engine.address, definitions.value(), 3)));
+            }
+        }
+
+        // Whichever drivers exist as classes, and whichever are live right now.
+        int total = 0;
+        total += mpe::LogObjectsMatching("NetDriver", 32);
+        total += mpe::LogObjectsMatching("NetConnection", 32);
+        total += mpe::LogObjectsMatching("SocketSubsystem", 16);
         return total;
     }
     if (starts_with("pvp on")) {

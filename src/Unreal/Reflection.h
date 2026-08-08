@@ -68,19 +68,40 @@ inline constexpr std::size_t kObjectNamePrivateOffset = 0x18;
 inline constexpr std::size_t kMaxPropertiesPerStruct = 4096;
 inline constexpr std::size_t kMaxInheritanceDepth    = 64;
 
+/// EPropertyFlags bits this reader cares about. The full set is large; these are the
+/// ones that decide whether a field crosses the wire.
+inline constexpr std::uint64_t kPropertyFlagNet         = 0x0000000000000020ull;
+inline constexpr std::uint64_t kPropertyFlagRepNotify   = 0x0000000100000000ull;
+inline constexpr std::uint64_t kPropertyFlagTransient   = 0x0000000000002000ull;
+inline constexpr std::uint64_t kPropertyFlagConfig      = 0x0000000000004000ull;
+inline constexpr std::uint64_t kPropertyFlagEditorOnly  = 0x0000000000080000ull;
+inline constexpr std::uint64_t kPropertyFlagBlueprintVisible = 0x0000000000000004ull;
+
 /// One reflected field.
 struct PropertyInfo {
     std::string    name;
     std::string    type_name;
+    /// The type a container, object or struct property points at, once resolved.
+    std::string    inner_type_name;
+    /// RepNotifyFunc, the handler called on a client when the value arrives. Empty
+    /// when the property is not replicated with a notify.
+    std::string    rep_notify;
     std::uintptr_t address{0};
+    /// FStructProperty::Struct, FObjectPropertyBase::PropertyClass or
+    /// FArrayProperty::Inner, whichever applies. Zero when the type has no payload.
+    std::uintptr_t inner_address{0};
+    std::uint64_t  flags{0};
     std::int32_t   offset{0};
     std::int32_t   element_size{0};
     std::int32_t   array_dim{1};
+    std::uint16_t  rep_index{0};
 
     [[nodiscard]] std::int32_t TotalSize() const noexcept {
         return element_size * (array_dim > 0 ? array_dim : 1);
     }
     [[nodiscard]] bool IsBool() const noexcept { return type_name == "BoolProperty"; }
+    /// True when the engine replicates this field of its own accord.
+    [[nodiscard]] bool IsReplicated() const noexcept { return (flags & kPropertyFlagNet) != 0; }
 };
 
 /// One reflected struct or class.
@@ -103,15 +124,59 @@ struct ReflectionLayout {
     std::size_t properties_size_offset{kStructPropertiesSizeOffset};
     std::size_t super_struct_offset{kStructSuperOffset};
 
+    /// UStruct::Children, the UObject chain that holds a class's UFunctions.
+    std::size_t children_offset{0};
+    /// UField::Next, which links that chain. Distinct from FField::Next above.
+    std::size_t field_object_next_offset{0};
+
+    std::size_t array_dim_offset{0};
+    std::size_t property_flags_offset{0};
+    std::size_t rep_index_offset{0};
+    std::size_t rep_notify_offset{0};
+
     /// FStructProperty::Struct, the inner UScriptStruct a StructProperty refers to.
     /// Detected by looking for a pointer to a ScriptStruct we already located.
+    ///
+    /// FObjectPropertyBase::PropertyClass and FArrayProperty::Inner are the first member
+    /// past FProperty as well, so one offset serves all three.
     std::size_t struct_property_inner_offset{0};
     bool        struct_property_inner_detected{false};
 
     bool        detected{false};
+    /// True when the offsets were pinned against classes whose size the engine fixes,
+    /// rather than inferred from what looked plausible.
+    bool        anchored{false};
     std::size_t detected_chain_length{0};
 
     [[nodiscard]] std::string Describe() const;
+};
+
+/// Classes whose layout the engine itself fixes, used to pin offsets to certainty.
+///
+/// WHY THESE THREE
+///
+/// Every heuristic here answers "does this look like a property chain", and a heuristic
+/// that only has to look right has already been wrong once on this build: it settled on
+/// an int32 slot for PropertiesSize that was really the top half of the pointer beside
+/// it, which read 365 on one run and 650 on the next because that is where the heap
+/// happened to be.
+///
+/// UObject, UField and UStruct do not need a heuristic. UObject is 0x28 bytes and UField
+/// is 0x30 on any 64 bit build, UField derives from UObject and UStruct from UField, and
+/// all three are registered as ordinary UClass objects. So the slot holding PropertiesSize
+/// is the one reading 0x28 on the first and 0x30 on the second, and the slot holding
+/// SuperStruct is the one where the second points at the first. Two constraints on one
+/// offset is proof, not a guess.
+struct LayoutAnchors {
+    std::uintptr_t object_class{0};        ///< UClass "Object". PropertiesSize is 0x28.
+    std::uintptr_t field_class{0};         ///< UClass "Field".  PropertiesSize is 0x30.
+    std::uintptr_t struct_class{0};        ///< UClass "Struct". Super is Field.
+    std::uintptr_t class_with_functions{0};///< Any UClass known to own UFunctions.
+    std::uint32_t  function_name_index{0}; ///< FName index of "Function".
+
+    [[nodiscard]] bool HasSizeAnchors() const noexcept {
+        return object_class != 0 && field_class != 0;
+    }
 };
 
 /// Where a struct type is embedded inside an owning class or struct.
@@ -136,12 +201,39 @@ public:
     [[nodiscard]] const ReflectionLayout& Layout() const noexcept { return layout_; }
     void SetLayout(const ReflectionLayout& layout) { layout_ = layout; }
 
-    /// Determines the real offsets by inspecting a struct known to have fields.
+    /// Determines the real offsets by inspecting structs known to have fields.
     ///
     /// Pass several candidates: a struct with no fields of its own cannot reveal the
-    /// chain layout, so the first one that yields a chain wins.
+    /// chain layout, so the one that yields the strongest chain wins. Supplying anchors
+    /// turns the guesswork parts, SuperStruct and PropertiesSize, into measurements.
     [[nodiscard]] ReflectionLayout DetectLayout(
-        const std::vector<std::uintptr_t>& candidate_structs) const;
+        const std::vector<std::uintptr_t>& candidate_structs,
+        const LayoutAnchors&               anchors = {}) const;
+
+    /// Names of the UFunctions a class owns, read from the class itself.
+    ///
+    /// The alternative is a pass over the whole object array per class looking for
+    /// functions whose Outer matches, which is fifty thousand reads and took two seconds
+    /// each time. UStruct::Children is the list the engine keeps for exactly this.
+    [[nodiscard]] std::vector<std::string> ReadFunctionNames(std::uintptr_t struct_address) const;
+
+    /// One property rendered for the log, with its type, flags and replication.
+    [[nodiscard]] std::string DescribeProperty(const PropertyInfo& property) const;
+
+    /// Renders one field's live value as text.
+    ///
+    /// Offsets alone answer where a setting lives; this answers what it currently says,
+    /// which is the difference between knowing a tag asset has a mode list and knowing
+    /// which modes are in it. Structs and arrays recurse until depth runs out, so a
+    /// bounded amount of work happens however deeply nested the type is.
+    [[nodiscard]] std::string ReadValueText(std::uintptr_t      instance_address,
+                                            const PropertyInfo& property,
+                                            int                 depth = 2) const;
+
+    /// Every field of a live instance, one line each, ready for the log.
+    [[nodiscard]] std::vector<std::string> DumpInstance(std::uintptr_t struct_address,
+                                                        std::uintptr_t instance_address,
+                                                        int            depth = 2) const;
 
     [[nodiscard]] Expected<StructInfo> ReadStruct(std::uintptr_t struct_address) const;
     [[nodiscard]] std::vector<PropertyInfo> ReadProperties(std::uintptr_t struct_address) const;
