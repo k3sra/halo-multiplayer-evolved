@@ -353,7 +353,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.13";
+constexpr const char* kModVersion = "0.2.14";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -1931,10 +1931,22 @@ void MaintainGameThreadPump() {
         return;
     }
 
-    // Two seconds of complete silence. A pump on anything the game drives reports events
-    // many times a second; one that has said nothing for two seconds is on something the
-    // game is no longer driving.
-    if (now - s_last_change < std::chrono::seconds(2)) {
+    // How long silence has to last before the host is written off.
+    //
+    // Two different questions wear the same clock here. A host that has been delivering for
+    // a while and stops has probably just been destroyed by a level load, and two seconds
+    // avoids mistaking a slow frame for that. A host that was installed a moment ago and
+    // has said nothing since was simply the wrong choice, and waiting two seconds to learn
+    // that costs two seconds for every wrong guess: a load ran through thirty eight of them
+    // before settling, over a minute during which no command could reach the game thread.
+    //
+    // An object the game drives reports many events per frame, so three quarters of a
+    // second is already dozens of chances to speak. Auditioning is quick; eviction is not.
+    const bool auditioning = s_installed_at != std::chrono::steady_clock::time_point{} &&
+                             now - s_installed_at < std::chrono::seconds(3);
+    const auto patience =
+        auditioning ? std::chrono::milliseconds(750) : std::chrono::milliseconds(2000);
+    if (now - s_last_change < patience) {
         return;
     }
 
@@ -1953,8 +1965,9 @@ void MaintainGameThreadPump() {
     // host and a poor one. It receives ProcessEvent only when something calls a reflected
     // function on it, and in a loaded world almost nothing does. Being certain to exist is
     // not the same as being certain to be called, and only the second one makes a pump.
-    const std::uintptr_t previous = unreal::GameThreadPumpHost();
-    if (previous != 0 && now - s_installed_at >= std::chrono::seconds(3)) {
+    // Whatever was in place has now proved silent, whether it was auditioning or
+    // established, so it is recorded either way and never offered again this session.
+    if (const std::uintptr_t previous = unreal::GameThreadPumpHost(); previous != 0) {
         s_silent_hosts.insert(previous);
     }
 
