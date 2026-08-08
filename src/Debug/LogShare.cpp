@@ -175,6 +175,33 @@ std::uint32_t g_sequence = 0;
     return text;
 }
 
+/// Text reduced to what an HTTP header field value may legally contain.
+///
+/// Printable ASCII only, no control characters, no separators that would end the field or
+/// start a new one. Anything else becomes an underscore rather than being dropped, so a
+/// name written entirely in a script this cannot carry still produces a distinguishable
+/// label instead of an empty one.
+[[nodiscard]] std::string HeaderSafe(std::string_view text) {
+    constexpr std::size_t kMaxHeaderValue = 96;
+
+    std::string safe;
+    safe.reserve(std::min(text.size(), kMaxHeaderValue));
+    for (const char character : text) {
+        if (safe.size() >= kMaxHeaderValue) {
+            break;
+        }
+        const auto value = static_cast<unsigned char>(character);
+        const bool printable = value >= 0x20 && value < 0x7F;
+        const bool structural = character == '\r' || character == '\n' || character == ':' ||
+                                character == ',' || character == ';' || character == '"';
+        safe.push_back(printable && !structural ? character : '_');
+    }
+    if (safe.empty()) {
+        safe = "unnamed";
+    }
+    return safe;
+}
+
 [[nodiscard]] std::wstring Widen(std::string_view text) {
     if (text.empty()) {
         return {};
@@ -254,9 +281,21 @@ void Post(const std::string& body) {
 
     // Identity in the headers as well as the body, so a collector can file a report
     // without parsing it. The body stays human readable for anyone reading it directly.
-    const std::wstring headers =
-        L"Content-Type: text/plain; charset=utf-8\r\nX-MPE-Session: " + Widen(g_session_id) +
-        L"\r\nX-MPE-Label: " + Widen(Label()) + L"\r\n";
+    //
+    // The label is reduced to plain ASCII first, and that is not tidiness.
+    //
+    // An HTTP header field value is ASCII. A Steam persona name is not: it carries emoji,
+    // decorative brackets and scripts the game's own font cannot draw, and this label is
+    // built from one. Putting it in a header unaltered sent a malformed request from every
+    // machine whose owner had decorated their name, and the send simply failed, silently,
+    // for as long as they left the game running. It worked on the machine it was written
+    // on because that name happened to be spelled in ASCII.
+    //
+    // Nothing is lost by reducing it. The body already carries the label in full, in UTF-8,
+    // where it belongs.
+    const std::wstring headers = L"Content-Type: text/plain; charset=utf-8\r\nX-MPE-Session: " +
+                                 Widen(HeaderSafe(g_session_id)) + L"\r\nX-MPE-Label: " +
+                                 Widen(HeaderSafe(Label())) + L"\r\n";
     if (WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(-1),
                            const_cast<char*>(body.data()),
                            static_cast<DWORD>(body.size()),
