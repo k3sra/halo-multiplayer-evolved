@@ -2331,6 +2331,34 @@ void WatchForRealSession() {
     s_last      = census;
     MPE_LOG_INFO("SESSION WATCH: {}", census.Describe());
 
+    // The endpoint identity of every live player, on every sample.
+    //
+    // This used to be recorded only once a net driver existed, which is exactly backwards
+    // for the question being asked: the mod's own matches have no net driver, so the one
+    // case worth measuring produced nothing at all. Two players who cannot see each other
+    // is a question about these six numbers, and they are cheap enough to write down every
+    // time rather than only when something else has already gone right.
+    const auto module_base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+    objects->ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.class_name != "BlamNetworkPlayerStateComponent" ||
+            object.name.rfind("Default__", 0) == 0 ||
+            object.name.find("_GEN_VARIABLE") != std::string::npos) {
+            return true;
+        }
+        if (object.address > module_base && object.address < module_base + 0x20000000ull) {
+            return true; // A template inside the image, not a player.
+        }
+        const auto in_channel =
+            unreal::memory::Read<std::uint16_t>(object.address + 0xD8);
+        const auto out_of_band =
+            unreal::memory::Read<std::uint16_t>(object.address + 0xDA);
+        const auto generation = unreal::memory::Read<std::uint8_t>(object.address + 0xDC);
+        MPE_LOG_INFO("ENDPOINT: 0x{:X} in-channel {}, out-of-band {}, generation {}",
+                    object.address, in_channel.value_or(0xFFFF),
+                    out_of_band.value_or(0xFFFF), generation.value_or(0xFF));
+        return true;
+    });
+
     // A driver or a connection means a real session exists. That is the moment worth
     // recording in full, and it is recorded once rather than every ten seconds.
     const bool session_is_up = census.net_drivers > 0 || census.net_connections > 0;
