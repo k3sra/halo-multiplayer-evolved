@@ -975,20 +975,22 @@ void TickLoop() {
         PrepareLoadingOverlay();
         RegisterLoadingCancel();
 
-        // Once, as soon as there is an object array worth walking. The result is what the
-        // work on making players visible to each other is built from.
-        {
-            static bool s_surveyed = false;
-            if (!s_surveyed) {
-                std::optional<unreal::ObjectArray> objects;
-                std::optional<unreal::Reflection>  reflection;
-                if (TakeEngineView(objects, reflection) && objects->Count() > 20000) {
-                    s_surveyed = true;
-                    SurveyNetworkSurface(*objects);
-                    DumpClassSurface(*objects, *reflection);
-                }
-            }
-        }
+        // The survey and the class dump are no longer run on their own.
+        //
+        // Both walk fifty thousand objects and one of them reads a schema per class, and
+        // both existed to answer a question that has since been answered and written down
+        // in docs/06-COOP-SURFACE.md. They ran on every machine at every launch, competing
+        // for the processor with the very startup they were delaying.
+        //
+        // On the machine they were written on that cost was invisible: the multiplayer
+        // entry appeared 1.4 seconds after the menu. On a slower one it appeared after
+        // 17.5 seconds, and a player who has waited that long for a button has already
+        // decided the mod is broken. Diagnostics are worth their cost when somebody is
+        // reading them; they are worth nothing every other time, and this ran every other
+        // time.
+        //
+        // Still available on demand, as "net", "dump <class>" and "layout", which is where
+        // work like this belongs.
 
         // Twelve and a half times a second, which is enough for the dots to read as a cycle
         // and the sweep as motion. Sixty would be smoother and would cost sixty game thread
