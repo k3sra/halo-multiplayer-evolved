@@ -127,6 +127,32 @@ void RunJobGuarded(const std::shared_ptr<Job>& job) {
     return nullptr;
 }
 
+/// Cancels a job, but only if nobody has claimed it yet.
+///
+/// WHY THIS TAKES THE QUEUE LOCK
+///
+/// The waiter used to set cancelled on its own and then read claimed, while the pump reads
+/// cancelled inside the lock and sets claimed there. Between those two unsynchronised
+/// steps a job could be claimed after the waiter had decided it never would be, so the
+/// waiter reported a timeout for work that then ran and succeeded.
+///
+/// That is not a harmless inaccuracy. It was read as evidence twice: once as a pump that
+/// had stopped delivering when it was delivering, and once as an endpoint assignment that
+/// had failed when the value was already set. A dispatcher that lies about the outcome
+/// makes every measurement taken through it suspect.
+///
+/// Deciding under the same lock the pump claims under makes the two mutually exclusive:
+/// either this cancels it first and it can never run, or it was claimed first and the
+/// caller is told to wait for it.
+[[nodiscard]] bool CancelIfUnclaimed(const std::shared_ptr<Job>& job) {
+    std::lock_guard lock(g_queue_mutex);
+    if (job->claimed.load(std::memory_order_acquire)) {
+        return false;
+    }
+    job->cancelled.store(true, std::memory_order_release);
+    return true;
+}
+
 /// Runs everything queued. Called on the game thread.
 ///
 /// Bounded, because the queue is fed from a thread that never blocks and a frame that runs
@@ -430,8 +456,7 @@ Result RunOnGameThread(const std::function<void()>& job, unsigned timeout_millis
             // so returning would hand it a stack that is about to stop existing. Waiting a
             // while longer is unpleasant; returning is memory corruption, and that is the
             // trade every time.
-            pending->cancelled.store(true, std::memory_order_release);
-            if (!pending->claimed.load(std::memory_order_acquire)) {
+            if (CancelIfUnclaimed(pending)) {
                 outcome = Result::Fail(ErrorCode::Timeout,
                                        pumped ? "the pump widget stopped receiving events"
                                               : "the game thread never reached the dispatch "
