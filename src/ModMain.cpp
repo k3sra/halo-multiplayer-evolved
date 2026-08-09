@@ -95,6 +95,12 @@ constexpr auto kStartupPollInterval = std::chrono::milliseconds(250);
 /// seconds; a standalone tool never will, and pays this wait once.
 constexpr auto kSteamHostWait = std::chrono::seconds(45);
 
+/// Endpoint assignment, declared here because the lobby event sink below calls it the
+/// moment a match starts.
+void RequestEndpointAssignment();
+void ForgetEndpointAssignment();
+void MaintainEndpointAssignment();
+
 /// Logs lobby events. A UI layer registers its own sink; this one guarantees that
 /// everything is recorded even with no UI attached, which is what makes a bug
 /// report from a player useful.
@@ -102,6 +108,15 @@ class LoggingEventSink final : public lobby::ILobbyEventSink {
 public:
     void OnPhaseChanged(lobby::LobbyPhase previous, lobby::LobbyPhase current) override {
         MPE_LOG_INFO("lobby phase {} -> {}", lobby::ToString(previous), lobby::ToString(current));
+
+        // Entering a match is when a player needs an endpoint, and leaving one is when the
+        // next match is entitled to a fresh generation.
+        if (current == lobby::LobbyPhase::InMatch && previous != lobby::LobbyPhase::InMatch) {
+            RequestEndpointAssignment();
+        } else if (current == lobby::LobbyPhase::Idle ||
+                   current == lobby::LobbyPhase::Faulted) {
+            ForgetEndpointAssignment();
+        }
     }
 
     void OnSnapshotChanged(const lobby::LobbySnapshot& snapshot) override {
@@ -243,6 +258,9 @@ void ForgetFrontendUI();
 void MaintainGameThreadPump();
 void WatchForRealSession();
 void SurveyNetworkSurface(const unreal::ObjectArray& objects);
+[[nodiscard]] Result AssignBlamEndpoint(std::uint16_t in_channel,
+                                        std::uint16_t out_of_band,
+                                        std::uint8_t generation);
 struct NetworkCensus;
 [[nodiscard]] NetworkCensus TakeNetworkCensus(const unreal::ObjectArray& objects);
 [[nodiscard]] Result CallCoopFunction(std::string_view class_name, std::string_view function_name,
@@ -355,7 +373,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.19";
+constexpr const char* kModVersion = "0.2.20";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -923,6 +941,8 @@ void TickLoop() {
         // would notice the pump was gone at the one moment it can no longer do anything
         // about it, and would then be skipped for the entire life of the match.
         MaintainGameThreadPump();
+        // Retries until the world exists and the component with it.
+        MaintainEndpointAssignment();
         // Records the game's own co-op session if one ever comes up. Costs one
         // pass over the object array every ten seconds and says nothing unless
         // something changed.
@@ -2125,37 +2145,45 @@ void MaintainGameThreadPump() {
             return false;
         };
 
-        // Outliving a level beats being busy, and that ordering was learned the hard way.
+        // Being driven beats outliving a level, and that ordering was walked back once on
+        // evidence that turned out to be about something else.
         //
-        // Ranking head up display widgets first did find a host that delivers, and it put
-        // the pump on an object the engine destroys at every level transition. This mod
-        // works by pointing an object's virtual table at a copy of its own, and that is
-        // only safe while the object lives. Preferring the shortest lived objects in the
-        // process maximised exactly the window where something calls through a table
-        // belonging to memory that has been freed and reused.
+        // Two machines crashed entering co-op with seven frames of this mod on the stack,
+        // and the obvious suspect was the pump: it had just been moved onto head up display
+        // widgets, which a level load destroys. Ranking permanence first made the pump safe
+        // and useless, because a game instance or an engine subsystem receives ProcessEvent
+        // only when something calls a reflected function on it, and in a loaded world almost
+        // nothing does.
         //
-        // Two machines crashed together starting a co-op session with seven frames of this
-        // mod on the stack, which is what that fault looks like from outside.
+        // Then both crashes were symbolicated, and neither was the pump. One was
+        // SetLobbyStatus writing the status panel and one was CaptureServerName reading the
+        // server name box, both into widgets a level load had destroyed, and both are now
+        // behind a single liveness check. The pump host was never in either stack.
         //
-        // So permanence is ranked first again. A game instance, its subsystems, the
-        // viewport and the local player are all created once and released when the process
-        // exits: no travel rebuilds them, so no travel can leave the pump pointing at a
-        // corpse. They are quieter, and a pump that is occasionally slow is worth any
-        // amount of a pump that is occasionally fatal.
+        // So the ordering goes back to what actually works, with the reason written down so
+        // it is not reverted a third time on the next crash that merely looks like this one.
+        // A head up display widget is redrawn continuously from the player's own state and
+        // runs its Blueprint graphs every frame; permanence stays on the list beneath it, as
+        // the answer for when nothing is being drawn at all.
+        const auto mentions_frontend = [&]() { return mentions(kFrontEndOnly); };
+
         const bool permanent = type.find("GameInstance") != std::string::npos ||
                                type.find("GameViewportClient") != std::string::npos ||
-                               type == "LocalPlayer" || type.find("EngineSubsystem") != std::string::npos;
+                               type == "LocalPlayer" ||
+                               type.find("EngineSubsystem") != std::string::npos;
 
         int rank = 0;
-        if (permanent && type.find("Subsystem") == std::string::npos) {
-            rank = 8; // The instance itself, which the engine drives directly.
-        } else if (permanent) {
-            rank = 7; // A subsystem of it: equally permanent, slightly less driven.
-        } else if (blueprint && mentions(kInWorld)) {
-            rank = 3; // Busy, and destroyed by the next level load.
-        } else if (blueprint && type.rfind("WBP_", 0) == 0 && !mentions(kFrontEndOnly)) {
+        if (blueprint && mentions(kInWorld)) {
+            rank = 8; // Redrawn every frame while somebody is playing.
+        } else if (blueprint && type.rfind("WBP_", 0) == 0 && !mentions_frontend()) {
+            rank = 7;
+        } else if (blueprint && !mentions_frontend()) {
+            rank = 6;
+        } else if (blueprint) {
+            rank = 5;
+        } else if (permanent && type.find("Subsystem") == std::string::npos) {
             rank = 2;
-        } else if (blueprint && !mentions(kFrontEndOnly)) {
+        } else if (permanent) {
             rank = 1;
         } else {
             return true;
@@ -2463,6 +2491,178 @@ void WatchForRealSession() {
     MPE_LOG_WARN("coop: three seconds later the networking object graph is unchanged; the "
                 "call did nothing observable");
     return Result::Success();
+}
+
+/// Gives a player the Blam endpoint identity the simulation needs to know they exist.
+///
+/// WHY THIS IS THE MISSING PIECE
+///
+/// Two people load the same scenario on the same seed at the same moment and see an empty
+/// world. Recording the game's own co-op showed why, and it is one number repeated three
+/// times: every BlamNetworkPlayerStateComponent in a mod match reads
+///
+///   BlamNetworkInChannelEndpointId  0
+///   BlamNetworkOutOfBandEndpointId  0
+///   BlamEndpointGeneration          0
+///
+/// while a real co-op session reads 4 and 5, then 10 and 11 in the next session, always a
+/// consecutive pair from a counter that keeps climbing, generation 1, set on the local
+/// player's component only, and set before bSessionRunning becomes true.
+///
+/// UE replication carries that identity and the Blam engine carries the simulation. With no
+/// endpoint there is no peer for the simulation to address, which is exactly the symptom:
+/// each machine plays its own private copy of the map.
+///
+/// ServerSetBlamEndpointIds is a reflected NetServer RPC taking the pair and the generation
+/// in a five byte frame, so this needs no patching and no invention. What it does not do is
+/// make the numbers agree between machines: allocating them so that two players receive
+/// different pairs is the session's job, and this is the call that applies one.
+[[nodiscard]] Result AssignBlamEndpoint(std::uint16_t in_channel, std::uint16_t out_of_band,
+                                        std::uint8_t generation) {
+    std::optional<unreal::ObjectArray> objects;
+    std::optional<unreal::Reflection>  reflection;
+    if (!TakeEngineView(objects, reflection) || !objects.has_value()) {
+        return Result::Fail(ErrorCode::InvalidState, "the object array is not available");
+    }
+
+    const std::uintptr_t function = unreal::FindFunction(
+        *objects, "ServerSetBlamEndpointIds", "BlamNetworkPlayerStateComponent");
+    if (function == 0) {
+        return Result::Fail(ErrorCode::NotFound, "ServerSetBlamEndpointIds is not reflected");
+    }
+
+    // The live components, not the templates.
+    //
+    // Several of these exist and most are not a player. The class default object and the
+    // _GEN_VARIABLE template both live in the executable's own address range, and calling
+    // an RPC on either would set a field on something nothing plays from.
+    const auto module_base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+    std::vector<std::uintptr_t> live;
+    objects->ForEach([&](const unreal::ObjectInfo& object) {
+        if (object.class_name != "BlamNetworkPlayerStateComponent" ||
+            object.name.rfind("Default__", 0) == 0 ||
+            object.name.find("_GEN_VARIABLE") != std::string::npos) {
+            return true;
+        }
+        if (object.address > module_base && object.address < module_base + 0x20000000ull) {
+            return true; // Inside the image: a template, not an instance.
+        }
+        live.push_back(object.address);
+        return true;
+    });
+
+    if (live.empty()) {
+        return Result::Fail(ErrorCode::NotFound,
+                            "no live BlamNetworkPlayerStateComponent; a match has to be "
+                            "running before a player can be given an endpoint");
+    }
+
+    // The frame the function declares: two sixteen bit ids and a byte, five bytes in all.
+    struct alignas(8) Frame {
+        std::uint16_t in_channel;
+        std::uint16_t out_of_band;
+        std::uint8_t  generation;
+        std::uint8_t  padding[3];
+    };
+    static_assert(offsetof(Frame, out_of_band) == 2, "the pair must be adjacent");
+    static_assert(offsetof(Frame, generation) == 4, "generation follows the pair");
+
+    int applied = 0;
+    for (const std::uintptr_t component : live) {
+        Frame        frame{in_channel, out_of_band, generation, {0, 0, 0}};
+        Result       called = Result::Fail(ErrorCode::InvalidState, "the job did not run");
+        const Result posted = unreal::RunOnGameThread(
+            [&]() { called = unreal::CallFunction(component, function, &frame); }, 10000u);
+        if (!posted.ok()) {
+            return posted;
+        }
+        if (!called.ok()) {
+            MPE_LOG_WARN("endpoint: {} refused the call: {}", component, called.message());
+            continue;
+        }
+        ++applied;
+        MPE_LOG_INFO("endpoint: asked 0x{:X} to take in-channel {}, out-of-band {}, "
+                    "generation {}",
+                    component, in_channel, out_of_band, generation);
+    }
+
+    if (applied == 0) {
+        return Result::Fail(ErrorCode::InvalidState, "no component accepted the call");
+    }
+    return Result::Success();
+}
+
+/// Whether this match still owes the local player an endpoint, and which one.
+///
+/// Set when the match starts and cleared when it ends, because the assignment cannot be
+/// made at that moment: the world is still loading, the player state component does not
+/// exist yet, and the route onto the game thread is being re-established after the level
+/// change. The tick retries until it takes.
+std::atomic<bool> g_endpoint_wanted{false};
+
+void RequestEndpointAssignment() {
+    g_endpoint_wanted.store(true, std::memory_order_release);
+}
+
+void ForgetEndpointAssignment() {
+    g_endpoint_wanted.store(false, std::memory_order_release);
+}
+
+/// Gives the local player the endpoint pair its roster slot entitles it to.
+///
+/// WHY THE SLOT DECIDES, AND NOTHING IS SENT
+///
+/// Two players must not receive the same pair, so somebody has to allocate. The host could
+/// hand out pairs in the launch message, which means a protocol change, a new field, and
+/// two builds that disagree about it for as long as anybody is on the older one.
+///
+/// The roster already solves it. Every machine knows every player's slot and they agree on
+/// it, because the host assigns slots and broadcasts them; that is what the roster is. So
+/// each machine derives its own pair from its own slot and no two can collide without the
+/// roster itself being wrong, which would break far more than this.
+///
+/// The pairs start at 4 because that is where the game's own co-op started, and step by two
+/// because in-channel and out-of-band are always consecutive.
+void MaintainEndpointAssignment() {
+    if (!g_endpoint_wanted.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    static std::chrono::steady_clock::time_point s_last_try{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_last_try < std::chrono::seconds(2)) {
+        return;
+    }
+    s_last_try = now;
+
+    int slot = -1;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            return;
+        }
+        for (const lobby::PlayerSlot& player : g_state->manager->Snapshot().players) {
+            if (player.is_local) {
+                slot = player.slot;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        return; // No roster yet, so no slot to derive from.
+    }
+
+    const auto in_channel  = static_cast<std::uint16_t>(4 + slot * 2);
+    const auto out_of_band = static_cast<std::uint16_t>(5 + slot * 2);
+
+    if (const Result assigned = AssignBlamEndpoint(in_channel, out_of_band, 1); assigned.ok()) {
+        g_endpoint_wanted.store(false, std::memory_order_release);
+        MPE_LOG_INFO("endpoint: slot {} took in-channel {} and out-of-band {}; this player "
+                    "now has an identity the simulation can address",
+                    slot, in_channel, out_of_band);
+    } else {
+        MPE_LOG_DEBUG("endpoint: not yet ({}); will try again", assigned.message());
+    }
 }
 
 /// Writes down the game's own networking surface, once.
@@ -6922,6 +7122,17 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         // menu does, which is why they are preferred over anything hand rolled.
         const std::string verb = command.substr(std::strlen("mp "));
 
+        // Handled before the block below, and outside it, because that block runs its body
+        // on the game thread while holding the state lock. OnStartMatch takes that lock
+        // itself, and taking it twice on one thread is not a deadlock that waits, it is a
+        // std::system_error saying a deadlock would occur. The guard around game thread
+        // jobs caught it and the game survived, which is exactly why it would have been
+        // easy to miss: the command simply did nothing.
+        if (verb.rfind("start", 0) == 0) {
+            mpe::OnStartMatch();
+            return 1;
+        }
+
         mpe::Result outcome = mpe::Result::Success();
         int        players = 0;
 
@@ -6943,7 +7154,7 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
                                                        "GetNumSquadMembers", players);
             } else {
                 outcome = mpe::Result::Fail(mpe::ErrorCode::InvalidArgument,
-                                           "use: mp open | mp close | mp players");
+                                           "use: mp open | mp close | mp start | mp players");
             }
         });
 
@@ -7266,6 +7477,69 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
             }
         }
         return total;
+    }
+    if (starts_with("endpoint")) {
+        // Reads or sets the Blam endpoint identity on every live player state component.
+        //
+        // "endpoint show" is the diff against a real co-op session: in a mod match every
+        // component reads zero, and in the game's own session the local one reads a
+        // consecutive pair with generation 1. "endpoint set" applies one.
+        const std::string argument =
+            command.size() > 8 ? command.substr(8) : std::string{};
+
+        if (argument.find("set") != std::string::npos) {
+            unsigned in_channel = 0;
+            unsigned out_of_band = 0;
+            unsigned generation = 1;
+            const std::size_t at = argument.find("set") + 3;
+            if (std::sscanf(argument.c_str() + at, "%u %u %u", &in_channel, &out_of_band,
+                            &generation) < 2) {
+                mpe::log::Write(mpe::log::Level::Warn, "Mod",
+                               "usage: endpoint set <in-channel> <out-of-band> [generation]");
+                return -static_cast<int>(mpe::ErrorCode::InvalidArgument);
+            }
+            const mpe::Result assigned = mpe::AssignBlamEndpoint(
+                static_cast<std::uint16_t>(in_channel),
+                static_cast<std::uint16_t>(out_of_band),
+                static_cast<std::uint8_t>(generation));
+            if (!assigned.ok()) {
+                mpe::log::Write(mpe::log::Level::Error, "Mod",
+                               std::format("endpoint: {}", assigned.message()));
+                return -static_cast<int>(mpe::ErrorCode::InvalidState);
+            }
+            return 1;
+        }
+
+        std::lock_guard lock(mpe::g_state_mutex);
+        if (!mpe::g_state || !mpe::g_state->objects.has_value() ||
+            !mpe::g_state->reflection.has_value()) {
+            return -static_cast<int>(mpe::ErrorCode::InvalidState);
+        }
+        int seen = 0;
+        mpe::g_state->objects->ForEach([&](const mpe::unreal::ObjectInfo& object) {
+            if (object.class_name != "BlamNetworkPlayerStateComponent") {
+                return true;
+            }
+            ++seen;
+            mpe::log::Write(mpe::log::Level::Info, "Mod",
+                           std::format("--- {} at 0x{:X} ---", object.name, object.address));
+            const std::uintptr_t klass =
+                object.class_address != 0 ? object.class_address
+                                          : mpe::g_state->objects->ClassOf(object.address);
+            for (const mpe::unreal::PropertyInfo& property :
+                 mpe::g_state->reflection->ReadAllProperties(klass)) {
+                if (property.name.find("Endpoint") == std::string::npos) {
+                    continue;
+                }
+                mpe::log::Write(
+                    mpe::log::Level::Info, "Mod",
+                    std::format("    {} = {}", property.name,
+                                mpe::g_state->reflection->ReadValueText(object.address,
+                                                                        property, 0)));
+            }
+            return true;
+        });
+        return seen;
     }
     if (starts_with("coop ")) {
         // Drives the game's own co-op session rather than a reimplementation of one.
