@@ -2572,7 +2572,14 @@ void WatchForRealSession() {
         Frame        frame{in_channel, out_of_band, generation, {0, 0, 0}};
         Result       called = Result::Fail(ErrorCode::InvalidState, "the job did not run");
         const Result posted = unreal::RunOnGameThread(
-            [&]() { called = unreal::CallFunction(component, function, &frame); }, 10000u);
+            // Long enough to outlive the pump changing hosts.
+            //
+            // A level load destroys whichever widget was pumping, and the watchdog spends a
+            // few seconds auditioning replacements. Ten seconds used to be survivable only
+            // because a job abandoned at the deadline ran anyway, through a race that has
+            // since been closed: cancelling is final now, so the deadline has to cover the
+            // gap rather than rely on being ignored.
+            [&]() { called = unreal::CallFunction(component, function, &frame); }, 30000u);
         if (!posted.ok()) {
             return posted;
         }
