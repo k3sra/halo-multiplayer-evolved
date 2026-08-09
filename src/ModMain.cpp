@@ -354,7 +354,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.16";
+constexpr const char* kModVersion = "0.2.17";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -975,20 +975,22 @@ void TickLoop() {
         PrepareLoadingOverlay();
         RegisterLoadingCancel();
 
-        // Once, as soon as there is an object array worth walking. The result is what the
-        // work on making players visible to each other is built from.
-        {
-            static bool s_surveyed = false;
-            if (!s_surveyed) {
-                std::optional<unreal::ObjectArray> objects;
-                std::optional<unreal::Reflection>  reflection;
-                if (TakeEngineView(objects, reflection) && objects->Count() > 20000) {
-                    s_surveyed = true;
-                    SurveyNetworkSurface(*objects);
-                    DumpClassSurface(*objects, *reflection);
-                }
-            }
-        }
+        // The survey and the class dump are no longer run on their own.
+        //
+        // Both walk fifty thousand objects and one of them reads a schema per class, and
+        // both existed to answer a question that has since been answered and written down
+        // in docs/06-COOP-SURFACE.md. They ran on every machine at every launch, competing
+        // for the processor with the very startup they were delaying.
+        //
+        // On the machine they were written on that cost was invisible: the multiplayer
+        // entry appeared 1.4 seconds after the menu. On a slower one it appeared after
+        // 17.5 seconds, and a player who has waited that long for a button has already
+        // decided the mod is broken. Diagnostics are worth their cost when somebody is
+        // reading them; they are worth nothing every other time, and this ran every other
+        // time.
+        //
+        // Still available on demand, as "net", "dump <class>" and "layout", which is where
+        // work like this belongs.
 
         // Twelve and a half times a second, which is enough for the dots to read as a cycle
         // and the sweep as motion. Sixty would be smoother and would cost sixty game thread
@@ -3723,6 +3725,38 @@ void RefreshLobbyStatus() {
     if (!unreal::BindLobbyMenu(g_live_menu, ui).ok()) {
         return;
     }
+
+    // The panel is only written while the widgets it writes to still exist.
+    //
+    // This is the crash two people hit entering a co-op session, resolved from the dump
+    // rather than guessed at: OnGameThreadHit, RunPendingJobs, RunJobGuarded,
+    // SetLobbyStatus, SetTextLiveOn, CallFunction, and then a jump to an address that was
+    // code once. Entering co-op is a level load, a level load destroys the front end, and
+    // this writes the panel every tick regardless.
+    //
+    // The lobby already had this guard. The status overlay did not, because it is hosted
+    // separately so that it can stay on screen with the menu as well as the lobby, and
+    // being hosted separately is exactly what left it out of the check that covers
+    // everything else.
+    //
+    // Asking the object array whether the widget is still a live object is the same test
+    // used for the front end itself, and it is the only honest one available: a pointer to
+    // a destroyed UObject looks perfectly valid right up until it is called.
+    {
+        std::optional<unreal::ObjectArray> objects;
+        std::optional<unreal::Reflection>  reflection;
+        const std::uintptr_t widget = unreal::StatusOverlayWidget();
+        if (widget != 0 && TakeEngineView(objects, reflection) && objects.has_value() &&
+            objects->ClassOf(widget) == 0) {
+            MPE_LOG_INFO("the status panel's widgets were destroyed, most likely by a level "
+                        "load; dropping them rather than writing into freed memory");
+            unreal::ForgetStatusOverlay();
+            unreal::ForgetLobbyUI();
+            g_live_menu = 0;
+            return;
+        }
+    }
+
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyStatus(ui, status); }, kUiJobTimeoutMs);
 
     // Done last, and outside the state lock, because both of these take it themselves.
