@@ -95,6 +95,12 @@ constexpr auto kStartupPollInterval = std::chrono::milliseconds(250);
 /// seconds; a standalone tool never will, and pays this wait once.
 constexpr auto kSteamHostWait = std::chrono::seconds(45);
 
+/// Endpoint assignment, declared here because the lobby event sink below calls it the
+/// moment a match starts.
+void RequestEndpointAssignment();
+void ForgetEndpointAssignment();
+void MaintainEndpointAssignment();
+
 /// Logs lobby events. A UI layer registers its own sink; this one guarantees that
 /// everything is recorded even with no UI attached, which is what makes a bug
 /// report from a player useful.
@@ -102,6 +108,15 @@ class LoggingEventSink final : public lobby::ILobbyEventSink {
 public:
     void OnPhaseChanged(lobby::LobbyPhase previous, lobby::LobbyPhase current) override {
         MPE_LOG_INFO("lobby phase {} -> {}", lobby::ToString(previous), lobby::ToString(current));
+
+        // Entering a match is when a player needs an endpoint, and leaving one is when the
+        // next match is entitled to a fresh generation.
+        if (current == lobby::LobbyPhase::InMatch && previous != lobby::LobbyPhase::InMatch) {
+            RequestEndpointAssignment();
+        } else if (current == lobby::LobbyPhase::Idle ||
+                   current == lobby::LobbyPhase::Faulted) {
+            ForgetEndpointAssignment();
+        }
     }
 
     void OnSnapshotChanged(const lobby::LobbySnapshot& snapshot) override {
@@ -926,6 +941,8 @@ void TickLoop() {
         // would notice the pump was gone at the one moment it can no longer do anything
         // about it, and would then be skipped for the entire life of the match.
         MaintainGameThreadPump();
+        // Retries until the world exists and the component with it.
+        MaintainEndpointAssignment();
         // Records the game's own co-op session if one ever comes up. Costs one
         // pass over the object array every ten seconds and says nothing unless
         // something changed.
@@ -2573,6 +2590,79 @@ void WatchForRealSession() {
         return Result::Fail(ErrorCode::InvalidState, "no component accepted the call");
     }
     return Result::Success();
+}
+
+/// Whether this match still owes the local player an endpoint, and which one.
+///
+/// Set when the match starts and cleared when it ends, because the assignment cannot be
+/// made at that moment: the world is still loading, the player state component does not
+/// exist yet, and the route onto the game thread is being re-established after the level
+/// change. The tick retries until it takes.
+std::atomic<bool> g_endpoint_wanted{false};
+
+void RequestEndpointAssignment() {
+    g_endpoint_wanted.store(true, std::memory_order_release);
+}
+
+void ForgetEndpointAssignment() {
+    g_endpoint_wanted.store(false, std::memory_order_release);
+}
+
+/// Gives the local player the endpoint pair its roster slot entitles it to.
+///
+/// WHY THE SLOT DECIDES, AND NOTHING IS SENT
+///
+/// Two players must not receive the same pair, so somebody has to allocate. The host could
+/// hand out pairs in the launch message, which means a protocol change, a new field, and
+/// two builds that disagree about it for as long as anybody is on the older one.
+///
+/// The roster already solves it. Every machine knows every player's slot and they agree on
+/// it, because the host assigns slots and broadcasts them; that is what the roster is. So
+/// each machine derives its own pair from its own slot and no two can collide without the
+/// roster itself being wrong, which would break far more than this.
+///
+/// The pairs start at 4 because that is where the game's own co-op started, and step by two
+/// because in-channel and out-of-band are always consecutive.
+void MaintainEndpointAssignment() {
+    if (!g_endpoint_wanted.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    static std::chrono::steady_clock::time_point s_last_try{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_last_try < std::chrono::seconds(2)) {
+        return;
+    }
+    s_last_try = now;
+
+    int slot = -1;
+    {
+        std::lock_guard lock(g_state_mutex);
+        if (!g_state || !g_state->manager) {
+            return;
+        }
+        for (const lobby::PlayerSlot& player : g_state->manager->Snapshot().players) {
+            if (player.is_local) {
+                slot = player.slot;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        return; // No roster yet, so no slot to derive from.
+    }
+
+    const auto in_channel  = static_cast<std::uint16_t>(4 + slot * 2);
+    const auto out_of_band = static_cast<std::uint16_t>(5 + slot * 2);
+
+    if (const Result assigned = AssignBlamEndpoint(in_channel, out_of_band, 1); assigned.ok()) {
+        g_endpoint_wanted.store(false, std::memory_order_release);
+        MPE_LOG_INFO("endpoint: slot {} took in-channel {} and out-of-band {}; this player "
+                    "now has an identity the simulation can address",
+                    slot, in_channel, out_of_band);
+    } else {
+        MPE_LOG_DEBUG("endpoint: not yet ({}); will try again", assigned.message());
+    }
 }
 
 /// Writes down the game's own networking surface, once.
@@ -7032,6 +7122,17 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
         // menu does, which is why they are preferred over anything hand rolled.
         const std::string verb = command.substr(std::strlen("mp "));
 
+        // Handled before the block below, and outside it, because that block runs its body
+        // on the game thread while holding the state lock. OnStartMatch takes that lock
+        // itself, and taking it twice on one thread is not a deadlock that waits, it is a
+        // std::system_error saying a deadlock would occur. The guard around game thread
+        // jobs caught it and the game survived, which is exactly why it would have been
+        // easy to miss: the command simply did nothing.
+        if (verb.rfind("start", 0) == 0) {
+            mpe::OnStartMatch();
+            return 1;
+        }
+
         mpe::Result outcome = mpe::Result::Success();
         int        players = 0;
 
@@ -7053,7 +7154,7 @@ __declspec(dllexport) int MPE_Command(const char* command_line) {
                                                        "GetNumSquadMembers", players);
             } else {
                 outcome = mpe::Result::Fail(mpe::ErrorCode::InvalidArgument,
-                                           "use: mp open | mp close | mp players");
+                                           "use: mp open | mp close | mp start | mp players");
             }
         });
 
