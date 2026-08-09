@@ -1,7 +1,7 @@
 ﻿<div align="center">
 
-<!-- Logo goes here. Drop it at docs/logo.png and it appears automatically. -->
-<img src="docs/logo.png" alt="Halo Multiplayer Evolved" width="420" onerror="this.style.display='none'">
+<!-- The banner is docs/logo.png. Replacing that file is all it takes to change it. -->
+<img src="docs/logo.png" alt="Halo Multiplayer Evolved" width="720" onerror="this.style.display='none'">
 
 # Halo Multiplayer Evolved
 
