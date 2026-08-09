@@ -1361,8 +1361,51 @@ Result LobbyManager::HandleHandshakeRequest(PeerHandle peer, ByteReader& reader)
     if (!is_host_) {
         return reject(DisconnectReason::Kicked, "this machine is not hosting");
     }
-    if (FindPlayer(body.platform_id) != nullptr) {
-        return reject(DisconnectReason::ProtocolViolation, "already in this lobby");
+    // A greeting from somebody already on the roster is answered, not punished.
+    //
+    // The client repeats its handshake every two seconds until it is admitted, because a
+    // single greeting that goes missing otherwise costs the whole join. That resend was
+    // added with a note saying the host accepts a repeat from a peer it already knows and
+    // replies again. The host did no such thing: it called the repeat a protocol violation
+    // and disconnected them.
+    //
+    // So a join failed exactly when the first accept was slow or lost, which is the case
+    // the resend exists for. The host added the player, the roster showed them arriving,
+    // and the client was thrown out with "already in this lobby" a moment later, having
+    // done nothing but ask twice.
+    //
+    // The identity is authenticated by the transport a few lines above, so a second
+    // greeting bearing a known platform id is that player and nobody else. It is either
+    // the resend or a reconnection on a fresh connection, and both want the same answer:
+    // adopt whichever connection is current, and say yes again.
+    if (PlayerSlot* const existing = FindPlayer(body.platform_id); existing != nullptr) {
+        const bool same_connection = existing->peer == peer;
+        if (!same_connection && existing->peer != PeerHandle::Invalid) {
+            transport_.Disconnect(existing->peer, DisconnectReason::Kicked,
+                                  "replaced by a newer connection from the same player");
+        }
+        existing->peer = peer;
+
+        std::vector<std::byte> repeat;
+        PacketBuilder          repeat_builder(repeat, MessageType::HandshakeAccept,
+                                              Channel::Control);
+        HandshakeAcceptBody    accept;
+        accept.assigned_slot  = existing->slot;
+        accept.assigned_team  = existing->team;
+        accept.host_tick_rate = 60;
+        accept.host_phase     = static_cast<std::uint8_t>(ToProtocolPhase(phase_));
+        accept.Write(repeat_builder.Body());
+        MPE_TRY(SendTo(peer, MessageType::HandshakeAccept, repeat, SendMode::Reliable));
+
+        MPE_LOG_INFO("{} greeted us again on {} connection; admitted them a second time as "
+                    "slot {}",
+                    existing->display_name, same_connection ? "the same" : "a new",
+                    existing->slot);
+
+        BroadcastSettings();
+        BroadcastRoster();
+        MarkDirty();
+        return Result::Success();
     }
 
     PlayerSlot player;
