@@ -355,7 +355,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.18";
+constexpr const char* kModVersion = "0.2.19";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -1525,6 +1525,9 @@ int LogObjectsMatching(std::string_view fragment, std::size_t limit) {
 /// Both globals are instead read from instructions that reference them, which needs only the
 /// static image and so can run immediately. Each result is still verified, and a failure
 /// falls back to the original search rather than proceeding on a guess.
+/// An object array address found by pattern but not yet confirmable, kept for a retry.
+std::atomic<std::uintptr_t> g_fast_array_candidate{0};
+
 [[nodiscard]] bool TryFastReflection() {
     // lea rcx, [rip+pool] ; xor edx, edx ; mov [rip+x], rdi
     const std::uintptr_t pool_address = ResolveGlobalByReference(
@@ -1553,7 +1556,22 @@ int LogObjectsMatching(std::string_view fragment, std::size_t limit) {
     Expected<unreal::ObjectArray> objects =
         unreal::ObjectArray::FromAddress(*g_state->names, array_address);
     if (!objects.ok()) {
-        MPE_LOG_WARN("fast object array rejected: {}", objects.error().message);
+        // Rejected now does not mean wrong.
+        //
+        // This runs as early as it can, which is often before the engine has put anything
+        // in the array, and an array with nothing in it scores as not being an array. On
+        // one machine the pattern found the right address, the validator refused it, and
+        // the fallback search then spent a hundred and thirty four seconds and forty six
+        // thousand candidate slots arriving at the very same address and accepting it.
+        //
+        // Keeping the candidate turns that into a retry once the engine has loaded. The
+        // address is correct from the first instruction that references it; only the
+        // contents were not ready.
+        g_fast_array_candidate.store(array_address, std::memory_order_release);
+        MPE_LOG_INFO("the object array is not populated yet, so 0x{:X} could not be "
+                    "confirmed; it will be re-checked once the game has loaded rather "
+                    "than searched for again",
+                    array_address);
         g_state->names.reset();
         return false;
     }
@@ -5284,7 +5302,24 @@ void ResolveUnrealObjects() {
     Expected<unreal::ObjectArray> array =
         Error{ErrorCode::NotFound, "no remembered location"};
 
-    if (std::ifstream cached(cache_path); cached) {
+    // The address the early pass found and could not confirm, re-checked now that the
+    // engine has loaded. This is the whole of the fix for a two minute startup: the answer
+    // was known from the first second and only its contents were not ready.
+    if (const std::uintptr_t candidate = g_fast_array_candidate.load(std::memory_order_acquire);
+        candidate != 0) {
+        array = unreal::ObjectArray::FromAddress(*names, candidate);
+        if (array.ok()) {
+            MPE_LOG_INFO("object array confirmed at 0x{:X}, the address found before the "
+                        "game had loaded; no search was needed",
+                        candidate);
+        } else {
+            MPE_LOG_INFO("0x{:X} still does not describe the object array ({}); searching",
+                        candidate, array.message());
+        }
+    }
+
+    if (!array.ok()) {
+        if (std::ifstream cached(cache_path); cached) {
         std::string text;
         std::getline(cached, text);
         std::uintptr_t offset = 0;
@@ -5304,6 +5339,7 @@ void ResolveUnrealObjects() {
                             "searching for it properly",
                             array.message());
             }
+        }
         }
     }
 
