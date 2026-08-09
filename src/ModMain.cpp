@@ -5236,7 +5236,55 @@ void ResolveUnrealObjects() {
         names = &*g_state->names;
     }
 
-    Expected<unreal::ObjectArray> array = unreal::ObjectArray::Locate(*names);
+    // Where the object array was last time, remembered between launches.
+    //
+    // Finding it means inspecting forty six thousand candidate slots, and on a slow machine
+    // that took sixty six seconds during which the multiplayer entry could not be placed.
+    // Measured on two machines in one session: 1.4 seconds to the button on one, 17.5 on the
+    // other. A player who waits that long has concluded the mod is broken, and the wait is
+    // spent rediscovering an answer that has not changed since the last launch.
+    //
+    // What is stored is the offset from the executable's base rather than the address.
+    // Windows relocates the image on every launch, so an absolute address is right exactly
+    // once. The offset is a property of the build.
+    //
+    // Keyed by the game build, so a game update invalidates it rather than sending the
+    // reader somewhere plausible in a binary that has changed underneath it. And the guess
+    // is never trusted: FromAddress scores a candidate exactly as the search does, so a
+    // stale or wrong offset is rejected and the full search still runs.
+    const std::filesystem::path cache_path =
+        DataDirectory() / "symbols" / std::format("objectarray-{}.txt", GameBuildString());
+    const auto module_base = reinterpret_cast<std::uintptr_t>(::GetModuleHandleW(nullptr));
+
+    Expected<unreal::ObjectArray> array =
+        Error{ErrorCode::NotFound, "no remembered location"};
+
+    if (std::ifstream cached(cache_path); cached) {
+        std::string text;
+        std::getline(cached, text);
+        std::uintptr_t offset = 0;
+        try {
+            offset = static_cast<std::uintptr_t>(std::stoull(text, nullptr, 16));
+        } catch (const std::exception&) {
+            offset = 0;
+        }
+        if (offset != 0) {
+            array = unreal::ObjectArray::FromAddress(*names, module_base + offset);
+            if (array.ok()) {
+                MPE_LOG_INFO("object array found where it was last launch, at +0x{:X}; the "
+                            "search was skipped",
+                            offset);
+            } else {
+                MPE_LOG_INFO("the remembered object array location no longer holds ({}); "
+                            "searching for it properly",
+                            array.message());
+            }
+        }
+    }
+
+    if (!array.ok()) {
+        array = unreal::ObjectArray::Locate(*names);
+    }
     if (!array.ok()) {
         MPE_LOG_ERROR("GUObjectArray unavailable: {}", array.message());
         MPE_LOG_ERROR("live UE objects cannot be reached, so the game engine variant cannot be "
@@ -5244,6 +5292,16 @@ void ResolveUnrealObjects() {
         return;
     }
     unreal::ObjectArray objects = std::move(array).value();
+
+    // Written after every successful location, so a build that has moved corrects itself on
+    // the launch after the one that noticed.
+    if (objects.Address() > module_base) {
+        std::error_code ignored;
+        std::filesystem::create_directories(cache_path.parent_path(), ignored);
+        if (std::ofstream out(cache_path, std::ios::trunc); out) {
+            out << std::format("{:X}\n", objects.Address() - module_base);
+        }
+    }
 
     // Wait for the game to register the types we need.
     //
