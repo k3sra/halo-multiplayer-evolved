@@ -81,9 +81,6 @@ collection instead of a stock capsule.
 
 **[Get them on SteamGridDB](https://www.steamgriddb.com/collection/31727)**
 
-Nothing to install and nothing to do with the mod. Steam picks the artwork up on its own
-once you set it, and it survives the mod being updated or removed.
-
 ### Is this safe for my game?
 
 It never modifies your game files. If anything it needs is missing it simply does
