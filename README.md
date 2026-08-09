@@ -73,6 +73,17 @@ says so in the top left so you cannot miss it.
 If an update ever goes wrong, the previous version is kept next to it as
 `MultiplayerEvolved.dll.backup`, so nothing is lost.
 
+### Custom artwork for your library
+
+**[Aeavah](https://github.com/aeavah)** made a set of covers, heroes and logos for this
+game, and they are worth having: the Steam library entry looks like the rest of your
+collection instead of a stock capsule.
+
+**[Get them on SteamGridDB](https://www.steamgriddb.com/collection/31727)**
+
+Nothing to install and nothing to do with the mod. Steam picks the artwork up on its own
+once you set it, and it survives the mod being updated or removed.
+
 ### Is this safe for my game?
 
 It never modifies your game files. If anything it needs is missing it simply does
@@ -201,6 +212,10 @@ calls every Steam function the mod uses. Needs Steam running and the game closed
 ---
 
 ## Credits
+
+Library artwork, the covers, heroes and logos on
+**[SteamGridDB](https://www.steamgriddb.com/collection/31727)**, by
+**[Aeavah](https://github.com/aeavah)**.
 
 Built on findings shared by
 **[devnull9090](https://github.com/devnull9090)** and the
