@@ -1910,14 +1910,32 @@ void MaintainGameThreadPump() {
     /// Hosts that were installed and then produced nothing. Never tried twice.
     static std::set<std::uintptr_t> s_silent_hosts;
 
-    // Nothing to watch until there has been a pump.
+    // Nothing to watch until there has *ever* been a pump.
     //
     // This ran from the first tick, which is minutes before the engine is far enough along
     // for a pump to exist at all, so it spent the whole of startup announcing that a pump
     // it had never seen had gone quiet. Every one of those warnings also asked for a log
     // report, which turned a false alarm into a stream of them.
-    if (!unreal::GameThreadPumpActive()) {
+    //
+    // But the test used to be "is there a pump right now", and that turned this watchdog
+    // off at the only moment it was needed. Replacing a host is two steps: forget the old
+    // one, install a new one. When the second step fails there is no pump, so the next pass
+    // returned here and never tried again. A machine that lost its pump that way stayed
+    // without one, and the first thing the player noticed was START MATCH failing with
+    // "there is no game thread pump, so nothing would ever run this".
+    //
+    // Remembering that a pump once existed keeps the recovery running through exactly the
+    // window where recovery is the whole job.
+    static bool s_ever_had_pump = false;
+    if (unreal::GameThreadPumpActive()) {
+        s_ever_had_pump = true;
+    } else if (!s_ever_had_pump) {
         return;
+    } else {
+        // No pump at all. Nothing will drive the count, so waiting for silence is waiting
+        // forever: go straight to choosing a host.
+        s_last_change  = std::chrono::steady_clock::time_point{};
+        s_installed_at = std::chrono::steady_clock::time_point{};
     }
 
     const auto          now   = std::chrono::steady_clock::now();
@@ -2035,18 +2053,38 @@ void MaintainGameThreadPump() {
             return false;
         };
 
+        // Outliving a level beats being busy, and that ordering was learned the hard way.
+        //
+        // Ranking head up display widgets first did find a host that delivers, and it put
+        // the pump on an object the engine destroys at every level transition. This mod
+        // works by pointing an object's virtual table at a copy of its own, and that is
+        // only safe while the object lives. Preferring the shortest lived objects in the
+        // process maximised exactly the window where something calls through a table
+        // belonging to memory that has been freed and reused.
+        //
+        // Two machines crashed together starting a co-op session with seven frames of this
+        // mod on the stack, which is what that fault looks like from outside.
+        //
+        // So permanence is ranked first again. A game instance, its subsystems, the
+        // viewport and the local player are all created once and released when the process
+        // exits: no travel rebuilds them, so no travel can leave the pump pointing at a
+        // corpse. They are quieter, and a pump that is occasionally slow is worth any
+        // amount of a pump that is occasionally fatal.
+        const bool permanent = type.find("GameInstance") != std::string::npos ||
+                               type.find("GameViewportClient") != std::string::npos ||
+                               type == "LocalPlayer" || type.find("EngineSubsystem") != std::string::npos;
+
         int rank = 0;
-        if (blueprint && mentions(kInWorld)) {
-            rank = 6; // Redrawn every frame while somebody is playing.
+        if (permanent && type.find("Subsystem") == std::string::npos) {
+            rank = 8; // The instance itself, which the engine drives directly.
+        } else if (permanent) {
+            rank = 7; // A subsystem of it: equally permanent, slightly less driven.
+        } else if (blueprint && mentions(kInWorld)) {
+            rank = 3; // Busy, and destroyed by the next level load.
         } else if (blueprint && type.rfind("WBP_", 0) == 0 && !mentions(kFrontEndOnly)) {
-            rank = 5;
+            rank = 2;
         } else if (blueprint && !mentions(kFrontEndOnly)) {
-            rank = 4;
-        } else if (blueprint) {
-            rank = 3;
-        } else if (type.find("GameInstance") != std::string::npos &&
-                   type.find("Subsystem") == std::string::npos) {
-            rank = 1; // Permanent, safe, and usually silent. The last resort, not the first.
+            rank = 1;
         } else {
             return true;
         }
@@ -2236,10 +2274,34 @@ void WatchForRealSession() {
         if (klass == 0) {
             return true;
         }
-        // Depth two, because the endpoint ids sit directly on the component and the
-        // player id is one struct in. Going deeper turns a readable record into a wall.
-        for (const std::string& line : reflection->DumpInstance(klass, object.address, 2)) {
-            MPE_LOG_INFO("    {}", line);
+        // Scalars only, and no following of pointers.
+        //
+        // This originally read every field to a depth of two, which means walking into
+        // structs and arrays: reading a container's data pointer and its count, then
+        // iterating. On a net driver during a live session those are being rewritten by
+        // the game thread while this reads them, so the count and the pointer need not
+        // agree with each other for even an instant. That is a read of an address computed
+        // from two halves of different truths, and no amount of guarding the individual
+        // reads makes the arithmetic between them sound.
+        //
+        // What this test actually needs is the endpoint identity, and every part of it is
+        // a plain integer sitting directly on the component. Depth zero reads those and
+        // renders anything with a payload as its type name, which is all the detail that
+        // was ever safe to take from a moving object.
+        for (const unreal::PropertyInfo& property : reflection->ReadAllProperties(klass)) {
+            const bool scalar = property.type_name.find("Property") != std::string::npos &&
+                                property.type_name != "ArrayProperty" &&
+                                property.type_name != "MapProperty" &&
+                                property.type_name != "SetProperty" &&
+                                property.type_name != "StrProperty" &&
+                                property.type_name != "TextProperty" &&
+                                property.type_name != "StructProperty";
+            if (!scalar) {
+                continue;
+            }
+            MPE_LOG_INFO("    +0x{:<5X} {:<44} {:<20} = {}", property.offset, property.name,
+                        property.type_name,
+                        reflection->ReadValueText(object.address, property, 0));
         }
         return true;
     });
