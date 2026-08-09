@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 <!-- Logo goes here. Drop it at docs/logo.png and it appears automatically. -->
 <img src="docs/logo.png" alt="Halo Multiplayer Evolved" width="420" onerror="this.style.display='none'">
@@ -7,7 +7,7 @@
 
 **The multiplayer Halo: Campaign Evolved should have shipped with.**
 
-[![Version](https://img.shields.io/badge/version-0.2.16-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
+[![Version](https://img.shields.io/badge/version-0.2.17-00b4d8?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Download](https://img.shields.io/badge/download-latest%20release-2ea44f?style=for-the-badge)](https://github.com/k3sra/halo-multiplayer-evolved/releases/latest)
 [![Licence](https://img.shields.io/badge/licence-MIT-blue?style=for-the-badge)](LICENSE)
 
