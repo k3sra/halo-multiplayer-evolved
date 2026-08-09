@@ -238,6 +238,7 @@ void PrepareLobby();
 void PrepareStatusOverlay();
 void PrepareLoadingOverlay();
 [[nodiscard]] bool FrontendWasDestroyed();
+[[nodiscard]] bool DropFrontendIfDestroyed();
 void ForgetFrontendUI();
 void MaintainGameThreadPump();
 void WatchForRealSession();
@@ -354,7 +355,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.17";
+constexpr const char* kModVersion = "0.2.18";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -1770,7 +1771,7 @@ void SaveServerName(const std::string& name) {
 /// asking it at the moment the name matters is both simpler and always current. Reading is
 /// also what enforces the length limit, because that is where the field is corrected.
 void CaptureServerName() {
-    if (!g_lobby_ui_ready) {
+    if (!g_lobby_ui_ready || DropFrontendIfDestroyed()) {
         return;
     }
     // A guest's field holds the host's name, put there by the authority pass. Reading it
@@ -1848,6 +1849,57 @@ void LogMachineIdentity() {
 ///
 /// This asks only about a front end that was there and has gone, which is the only case that
 /// requires anything to be dropped.
+/// True when the front end's widgets are gone, having dropped every handle to them.
+///
+/// WHY THERE IS ONE OF THESE AND NOT A GUARD PER CALL SITE
+///
+/// Three separate crashes have now had the same shape: a level load destroys the front end,
+/// something on the tick keeps reading or writing those widgets, and the call lands in
+/// memory that belonged to a widget a moment ago. Each was fixed where it was found. Each
+/// fix was correct and none of them stopped the next one, because the fault is not in any
+/// of those call sites, it is that touching a destroyed widget was possible at all.
+///
+///   ReadServerName, reading the server name box
+///   SetLobbyStatus, writing the status panel
+///   ReadServerName again, from CaptureServerName, after the first fix
+///
+/// So the question is asked in one place and every widget path asks it. A new path that
+/// forgets is a new bug, but a path that remembers is now one call rather than a block of
+/// reasoning copied and adapted, which is what made it easy to leave one out.
+///
+/// Asking the object array whether the widget is still a live object is the only honest
+/// test available: a pointer to a destroyed UObject looks perfectly valid right up until
+/// something calls through it.
+[[nodiscard]] bool DropFrontendIfDestroyed() {
+    const std::uintptr_t menu   = g_live_menu;
+    const std::uintptr_t status = unreal::StatusOverlayWidget();
+    if (menu == 0 && status == 0) {
+        return false; // Nothing has been built yet, so nothing can be stale.
+    }
+
+    std::optional<unreal::ObjectArray> objects;
+    std::optional<unreal::Reflection>  reflection;
+    if (!TakeEngineView(objects, reflection) || !objects.has_value()) {
+        // Without the object array the question cannot be answered. Refusing to touch the
+        // widgets is the safe answer to a question with no answer.
+        return true;
+    }
+
+    const bool menu_dead   = menu != 0 && objects->ClassOf(menu) == 0;
+    const bool status_dead = status != 0 && objects->ClassOf(status) == 0;
+    if (!menu_dead && !status_dead) {
+        return false;
+    }
+
+    MPE_LOG_INFO("the front end's widgets were destroyed, most likely by a level load; "
+                "dropping every handle rather than reading or writing freed memory");
+    unreal::ForgetStatusOverlay();
+    unreal::ForgetLobbyUI();
+    g_live_menu       = 0;
+    g_lobby_ui_ready  = false;
+    return true;
+}
+
 [[nodiscard]] bool FrontendWasDestroyed() {
     if (g_live_menu == 0) {
         return false; // Nothing has been claimed yet, so nothing can have been lost.
@@ -3726,35 +3778,8 @@ void RefreshLobbyStatus() {
         return;
     }
 
-    // The panel is only written while the widgets it writes to still exist.
-    //
-    // This is the crash two people hit entering a co-op session, resolved from the dump
-    // rather than guessed at: OnGameThreadHit, RunPendingJobs, RunJobGuarded,
-    // SetLobbyStatus, SetTextLiveOn, CallFunction, and then a jump to an address that was
-    // code once. Entering co-op is a level load, a level load destroys the front end, and
-    // this writes the panel every tick regardless.
-    //
-    // The lobby already had this guard. The status overlay did not, because it is hosted
-    // separately so that it can stay on screen with the menu as well as the lobby, and
-    // being hosted separately is exactly what left it out of the check that covers
-    // everything else.
-    //
-    // Asking the object array whether the widget is still a live object is the same test
-    // used for the front end itself, and it is the only honest one available: a pointer to
-    // a destroyed UObject looks perfectly valid right up until it is called.
-    {
-        std::optional<unreal::ObjectArray> objects;
-        std::optional<unreal::Reflection>  reflection;
-        const std::uintptr_t widget = unreal::StatusOverlayWidget();
-        if (widget != 0 && TakeEngineView(objects, reflection) && objects.has_value() &&
-            objects->ClassOf(widget) == 0) {
-            MPE_LOG_INFO("the status panel's widgets were destroyed, most likely by a level "
-                        "load; dropping them rather than writing into freed memory");
-            unreal::ForgetStatusOverlay();
-            unreal::ForgetLobbyUI();
-            g_live_menu = 0;
-            return;
-        }
+    if (DropFrontendIfDestroyed()) {
+        return;
     }
 
     (void)unreal::RunOnGameThread([&]() { unreal::SetLobbyStatus(ui, status); }, kUiJobTimeoutMs);
