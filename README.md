@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <!-- The banner is docs/logo.png. Replacing that file is all it takes to change it. -->
 <img src="docs/logo.png" alt="Halo Multiplayer Evolved" width="720" onerror="this.style.display='none'">
@@ -15,7 +15,7 @@
 ![Game](https://img.shields.io/badge/game-Halo%3A%20Campaign%20Evolved-5865f2?style=flat-square)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=cplusplus&logoColor=white)
 ![Steam](https://img.shields.io/badge/network-Steam%20Relay-000000?style=flat-square&logo=steam&logoColor=white)
-![No port forwarding](https://img.shields.io/badge/port%20forwarding-not%20needed-success?style=flat-square)
+
 
 </div>
 
