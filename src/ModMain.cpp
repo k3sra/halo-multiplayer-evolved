@@ -373,7 +373,7 @@ int                         g_friend_page = 0;
 
 /// This build's version, compared against the newest GitHub release to decide whether the
 /// status panel should tell the player to update.
-constexpr const char* kModVersion = "0.2.22";
+constexpr const char* kModVersion = "0.2.23";
 
 /// The newest version seen on GitHub, empty until a check has succeeded.
 ///
@@ -883,56 +883,6 @@ void ResolveEngineBinding() {
     return {};
 }
 
-/// True once the game has begun closing.
-///
-/// WHY THE WINDOW IS THE SIGNAL
-///
-/// Everyone who quits this game gets a crash: steam_api64 at the top of the stack and five
-/// frames of this mod beneath it. The cause is ownership. The game owns Steam and shuts it
-/// down on the way out, this mod never does, and nothing tells the mod that it happened. So
-/// the tick keeps running, keeps calling through interface pointers Steam has already
-/// released, and the first call after the shutdown faults.
-///
-/// It is intermittent because it is a race between the quit and the tick, which is exactly
-/// why it survived so long: it looked like bad luck rather than a missing rule.
-///
-/// The game's main window is destroyed at the start of shutdown, well before Steam is
-/// released, and asking whether a window still exists is a syscall with no lock and no
-/// allocation. That makes it usable from the tick, and it catches Alt+F4 and the quit
-/// button identically because both destroy the same window.
-[[nodiscard]] bool GameIsClosing() {
-    struct Search {
-        DWORD process{0};
-        HWND  window{nullptr};
-    };
-    static HWND s_window = nullptr;
-
-    if (s_window == nullptr) {
-        Search search{::GetCurrentProcessId(), nullptr};
-        ::EnumWindows(
-            [](HWND window, LPARAM parameter) -> BOOL {
-                auto& found = *reinterpret_cast<Search*>(parameter);
-                DWORD owner = 0;
-                ::GetWindowThreadProcessId(window, &owner);
-                if (owner != found.process || ::IsWindowVisible(window) == FALSE) {
-                    return TRUE;
-                }
-                RECT bounds{};
-                if (::GetClientRect(window, &bounds) == FALSE ||
-                    bounds.right - bounds.left < 320) {
-                    return TRUE; // A console or a tool window, not the game.
-                }
-                found.window = window;
-                return FALSE;
-            },
-            reinterpret_cast<LPARAM>(&search));
-        s_window = search.window;
-        return false; // Never report closing on the pass that found it.
-    }
-
-    return ::IsWindow(s_window) == FALSE;
-}
-
 void TickLoop() {
     auto next_tick = std::chrono::steady_clock::now();
     auto last_tick = next_tick;
@@ -940,13 +890,6 @@ void TickLoop() {
     while (g_running.load(std::memory_order_acquire)) {
         next_tick += kTickInterval;
 
-        // Stop before the game takes Steam away from underneath us.
-        if (GameIsClosing()) {
-            MPE_LOG_INFO("the game's window is gone, so it is shutting down; stopping the "
-                        "tick before anything else reaches for Steam");
-            g_running.store(false, std::memory_order_release);
-            break;
-        }
 
         {
             std::lock_guard lock(g_state_mutex);
